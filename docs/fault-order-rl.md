@@ -29,41 +29,30 @@ chmod +x scripts/setup_linux.sh scripts/run_linux.sh
 python3 PODEM/setup.py build_ext --inplace
 ```
 
-只验证环境和数据：
+训练脚本默认运行 100 轮并写入 `runs/shared_scorer`：
 
 ```bash
-./scripts/run_linux.sh validate
-```
-
-先跑 1 轮两个电路的 smoke：
-
-```bash
-./scripts/run_linux.sh smoke
-```
-
-正式训练默认运行 100 轮并写入 `runs/shared_scorer`：
-
-```bash
-./scripts/run_linux.sh train
+./scripts/run_linux.sh
 ```
 
 也可以指定轮数和输出目录：
 
 ```bash
-./scripts/run_linux.sh train 200 runs/experiment-200
+./scripts/run_linux.sh 200 runs/experiment-200
 ```
 
 断点续训；可选的第二个参数表示总目标轮数：
 
 ```bash
-./scripts/run_linux.sh resume runs/shared_scorer/latest.pt
-./scripts/run_linux.sh resume runs/shared_scorer/latest.pt 200
+python3 -m fault_order_rl train \
+  --resume runs/shared_scorer/latest.pt --rounds 200
 ```
 
 重新评估 best 并导出排名：
 
 ```bash
-./scripts/run_linux.sh evaluate runs/shared_scorer/best.pt
+python3 -m fault_order_rl evaluate \
+  --checkpoint runs/shared_scorer/best.pt
 ```
 
 `configs/all_benchmarks.json` 包含 16 个内置二值电路；`smoke_benchmarks.json`

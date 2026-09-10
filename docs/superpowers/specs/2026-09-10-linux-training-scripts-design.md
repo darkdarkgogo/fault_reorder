@@ -11,18 +11,15 @@ CUDA/PyTorch 安装源。训练所需的 16 组 fault embedding 和 pybind11 头
 
 `scripts/setup_linux.sh` 从任意工作目录定位仓库根目录，然后只执行
 `python3 PODEM/setup.py build_ext --inplace`。构建器使用仓库内的 pybind11 头文件；
-脚本不执行环境探测、pip、联网或数据生成。数据校验由 `run_linux.sh validate` 或
-训练入口完成，因此错误直接来自实际失败的组件。
+脚本不执行环境探测、pip、联网或数据生成。数据校验由训练入口完成，因此错误
+直接来自实际失败的组件。
 
-`scripts/run_linux.sh` 从任意工作目录定位仓库根目录，并提供 `validate`、`smoke`、
-`train`、`resume` 和 `evaluate` 子命令。`smoke` 默认跑 1 轮两个电路；`train`
-默认跑 100 轮全部 16 个电路；恢复参数中的轮数表示训练后的总目标轮数。脚本用
-`exec` 启动训练程序，以便终端信号直接交给 Python 并由现有 checkpoint 逻辑处理。
+`scripts/run_linux.sh` 从任意工作目录定位仓库根目录并直接训练全部 16 个电路。
+第一个可选参数是轮数，默认 100；第二个可选参数是输出目录，默认
+`runs/shared_scorer`。脚本用 `exec` 启动 Python，使终端信号直接交给训练程序。
 
-两个脚本默认调用当前 `PATH` 中的 `python3`，也允许通过 `PYTHON_BIN` 指定同一
-环境中的其他解释器路径。包含 `/` 的相对解释器路径会在切换到仓库根目录前转换
-为绝对路径。参数错误、缺少解释器、编译失败、模块导入失败和数据校验失败都立即
-返回非零状态。
+两个脚本固定调用当前 `PATH` 中的 `python3`。编译或训练失败时直接返回 Python
+命令的原始错误和非零状态。
 
 ## 编译产物
 
@@ -37,5 +34,4 @@ CUDA/PyTorch 安装源。训练所需的 16 组 fault embedding 和 pybind11 头
 ## 验证
 
 对两个脚本执行 Bash 语法检查，检查帮助和参数路由，并运行 Python CLI 回归测试。
-Linux 上的最终验收命令为 `./scripts/setup_linux.sh` 和
-`./scripts/run_linux.sh smoke`；完整训练由用户在 Linux 上显式启动。
+Linux 上的最终命令为 `./scripts/setup_linux.sh` 和 `./scripts/run_linux.sh`。
