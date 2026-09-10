@@ -1,6 +1,12 @@
-import pybind11
+from pathlib import Path
+import os
+
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+
+PODEM_DIR = Path(__file__).resolve().parent
+os.chdir(PODEM_DIR)
 
 
 CORE_SOURCES = [
@@ -32,10 +38,15 @@ class BuildExt(build_ext):
         super().build_extensions()
 
 
+pybind11_include = PODEM_DIR.parent / "third_party" / "pybind11" / "include"
+if not (pybind11_include / "pybind11" / "pybind11.h").is_file():
+    raise RuntimeError("vendored pybind11 headers are missing: " + str(pybind11_include))
+
+
 extension = Extension(
     "cpp_podem",
-    [f"src/{source}" for source in CORE_SOURCES],
-    include_dirs=["src", pybind11.get_include()],
+    [str(PODEM_DIR / "src" / source) for source in CORE_SOURCES],
+    include_dirs=[str(PODEM_DIR / "src"), str(pybind11_include)],
     language="c++",
 )
 

@@ -5,9 +5,9 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/setup_linux.sh [manifest]
 
-Install dependencies into the currently active Python environment, build the
-native cpp_podem extension, and validate the training data. The manifest
-defaults to configs/all_benchmarks.json.
+Check the currently active offline Python environment, build the native
+cpp_podem extension with the bundled pybind11 headers, and validate the bundled
+training data. The manifest defaults to configs/all_benchmarks.json.
 
 Environment:
   PYTHON_BIN   Python command or path to use (default: python)
@@ -56,11 +56,20 @@ if sys.version_info < (3, 9):
 header = Path(sysconfig.get_path("include")) / "Python.h"
 if not header.is_file():
     raise SystemExit("error: Python development headers not found: " + str(header))
+try:
+    import numpy
+    import setuptools
+    import torch
+except ImportError as exc:
+    raise SystemExit(
+        "error: the active offline environment is missing " + str(exc.name)
+        + "; activate the prepared d2l environment"
+    )
 print("Using Python", sys.version.split()[0], "from", sys.executable)
+print("Using NumPy", numpy.__version__, "and PyTorch", torch.__version__)
 PY
 
 cd "$repo_root"
-"$python_bin" -m pip install -r requirements-fault-order.txt
 
 pushd PODEM >/dev/null
 "$python_bin" setup.py build_ext --inplace

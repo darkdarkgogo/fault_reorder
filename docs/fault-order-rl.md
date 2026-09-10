@@ -6,8 +6,10 @@
 
 ## 本机运行
 
-Linux 脚本使用当前激活环境中的 `python`，不会创建 Conda 环境或调用 sudo。
-主机需要预先安装 C++ 编译器和 Python 开发头文件。Ubuntu/Debian 可以执行：
+Linux 脚本使用当前激活环境中的 `python`，不会联网、执行 `pip install`、创建
+Conda 环境或调用 sudo。仓库已经包含训练 embedding 和 pybind11 头文件；激活的
+环境需要已有 PyTorch、NumPy 和 setuptools。主机还需要 C++ 编译器和 Python
+开发头文件。Ubuntu/Debian 可以在有安装源的系统准备阶段执行：
 
 ```bash
 sudo apt update
@@ -17,13 +19,14 @@ sudo apt install build-essential python3-dev
 然后激活准备好的环境，再运行安装脚本：
 
 ```bash
-conda activate fault-order
+conda activate d2l
 chmod +x scripts/setup_linux.sh scripts/run_linux.sh
 ./scripts/setup_linux.sh
 ```
 
-安装脚本会安装依赖、编译当前 Python 对应的 Linux `cpp_podem*.so`，并校验
-全部 16 个电路。使用非默认解释器或 manifest 时：
+安装脚本只检查已有环境、用仓库内的 pybind11 头文件编译当前 Python 对应的
+Linux `cpp_podem*.so`，并校验仓库随附的全部 16 个电路和 embedding。使用非默认
+解释器或 manifest 时：
 
 ```bash
 PYTHON_BIN=/path/to/python ./scripts/setup_linux.sh path/to/manifest.json
@@ -67,9 +70,9 @@ PYTHON_BIN=/path/to/python ./scripts/setup_linux.sh path/to/manifest.json
 ```
 
 `configs/all_benchmarks.json` 包含 16 个内置二值电路；`smoke_benchmarks.json`
-只包含 c432 和 c499。路径均相对于 manifest 所在目录。缺少 embedding 时先执行
-准备脚本，不会以随机特征替代。准备脚本不覆盖已有导出目录；不完整或过期的
-导出会报错，应使用新目录并更新 manifest。
+只包含 c432 和 c499。路径均相对于 manifest 所在目录，并指向仓库中的
+`training_data/fault-order-embeddings`。服务器无需 DeepGate2 源码、预训练权重或
+联网下载。缺少这些文件说明仓库没有更新完整，应重新执行 `git pull origin main`。
 
 物理 XOR/EQV 门需要先展开为 PODEM 支持的门；内置二值电路已经使用这种形式。
 逻辑 XOR 输入 fault 仍通过 V3 map 保留。直接把未展开的 XOR 门交给有序
