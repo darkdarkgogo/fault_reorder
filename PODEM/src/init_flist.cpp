@@ -10,6 +10,7 @@
 /**********************************************************************/
 
 #include "atpg.h"
+#include "path_io.h"
 #include <cctype>
 #include <cstdint>
 #include <stdexcept>
@@ -23,7 +24,7 @@ void require_fault_map(bool condition, const string &message) {
 }
 
 string fnv1a_file_hash(const string &path) {
-  ifstream input(path.c_str(), ios::binary);
+  ifstream input = open_atpg_input(path, ios::in | ios::binary);
   require_fault_map(input.good(), "Cannot hash BENCH file: " + path);
   uint64_t value = UINT64_C(14695981039346656037);
   char byte;
@@ -276,8 +277,41 @@ vector<ATPG::FaultCatalogEntry> ATPG::get_fault_catalog() const {
   return result;
 }
 
+void ATPG::reorder_stuck_at_faults(
+    const vector<string> &ordered_fault_ids) {
+  unordered_map<string, fptr> faults_by_id;
+  size_t catalog_size = 0;
+  for (fptr fault : flist_undetect) {
+    const string identifier = fault_identifier(fault);
+    require_fault_map(faults_by_id.emplace(identifier, fault).second,
+                      "Duplicate fault ID in catalog: " + identifier);
+    ++catalog_size;
+  }
+
+  require_fault_map(ordered_fault_ids.size() == catalog_size,
+                    "Fault order must contain exactly " +
+                        to_string(catalog_size) + " IDs; received " +
+                        to_string(ordered_fault_ids.size()));
+
+  unordered_set<string> seen;
+  forward_list<fptr> reordered;
+  auto tail = reordered.before_begin();
+  for (const string &identifier : ordered_fault_ids) {
+    require_fault_map(seen.insert(identifier).second,
+                      "Duplicate fault ID in order: " + identifier);
+    const auto found = faults_by_id.find(identifier);
+    require_fault_map(found != faults_by_id.end(),
+                      "Unknown fault ID in order: " + identifier);
+    tail = reordered.insert_after(tail, found->second);
+  }
+
+  require_fault_map(seen.size() == catalog_size,
+                    "Fault order is missing one or more catalog IDs");
+  flist_undetect = move(reordered);
+}
+
 void ATPG::load_mapped_fault_list() {
-  ifstream input(fault_map_path.c_str());
+  ifstream input = open_atpg_input(fault_map_path);
   require_fault_map(input.good(), "Cannot open fault map: " + fault_map_path);
 
   string token;

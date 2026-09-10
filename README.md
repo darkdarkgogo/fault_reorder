@@ -1,4 +1,7 @@
 # PoDemFan_N-detect_ATPG_Test_Compression
+
+Shared fault-order reinforcement learning: see [training, resume and evaluation commands](docs/fault-order-rl.md).
+
 2023 VLSI Testing Final Project
 
 In all three directories `FAN_PODEM_PARALLEL`, `FANV2_PODEMV1`, `PODEM`

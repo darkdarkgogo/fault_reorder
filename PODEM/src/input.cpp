@@ -6,6 +6,7 @@
 /**********************************************************************/
 
 #include "atpg.h"
+#include "path_io.h"
 #include <cctype>
 #include <unordered_set>
 
@@ -245,10 +246,9 @@ void ATPG::input(const string &infile) {
 void ATPG::input(const string &infile) {
   string line;
   filename = infile;
-  ifstream file(filename, std::ifstream::in);
+  ifstream file = open_atpg_input(filename);
   if (!file) {
-    fprintf(stderr, "Cannot open BENCH file %s\n", filename.c_str());
-    exit(EXIT_FAILURE);
+    throw runtime_error("Cannot open BENCH file " + filename);
   }
 
   unordered_set<string> declared_inputs, gate_outputs, referenced_wires, declared_outputs;

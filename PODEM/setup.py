@@ -43,7 +43,7 @@ extension = Extension(
 setup(
     name="cpp-podem-catalog",
     version="0.1.0",
-    description="PODEM stuck-at fault catalog bridge",
+    description="PODEM stuck-at fault catalog and ordered ATPG bridge",
     python_requires=">=3.9",
     ext_modules=[extension],
     cmdclass={"build_ext": BuildExt},

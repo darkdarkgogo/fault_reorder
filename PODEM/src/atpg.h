@@ -73,6 +73,17 @@ public:
 		int fault_type;
 		int eqv_fault_num;
 	};
+	struct AtpgRunResult
+	{
+		int pattern_count{};
+		int detected_collapsed_faults{};
+		int detected_equivalent_faults{};
+		int uncollapsed_faults{};
+		int aborted_faults{};
+		int redundant_faults{};
+		int podem_calls{};
+		int total_backtracks{};
+	};
 
 	ATPG();
 
@@ -110,6 +121,7 @@ public:
 	void set_fault_map_path(const string &path) { fault_map_path = path; }
 	vector<FaultCatalogEntry> get_fault_catalog() const;
 	int get_uncollapsed_fault_count() const { return num_of_gate_fault; }
+	void reorder_stuck_at_faults(const vector<string> &ordered_fault_ids);
 
 	/*defined in tdfsim.cpp*/
 	void generate_tdfault_list();
@@ -124,6 +136,8 @@ public:
 	void random_order_fault_sim();
 	/* defined in atpg.cpp */
 	void test();
+	void configure_ordered_stuck_at(int backtrack_limit, int seed);
+	AtpgRunResult run_stuck_at(bool print_report = false);
 	vector<int> cc0, cc1, co;
 
 private:

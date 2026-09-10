@@ -7,6 +7,105 @@
 
 #include "atpg.h"
 
+void ATPG::configure_ordered_stuck_at(int configured_backtrack_limit,
+		int configured_seed)
+{
+	SAF_atpg = true;
+	fsim_only = false;
+	tdfsim_only = false;
+	total_attempt_num = 1;
+	backtrack_limit = configured_backtrack_limit;
+	seed = configured_seed;
+	fault_order_by_scoap = false;
+	dynamic_test_compression = false;
+	static_test_compression = false;
+}
+
+ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
+{
+	if (!SAF_atpg || fsim_only || tdfsim_only || total_attempt_num != 1)
+		throw runtime_error("Ordered ATPG requires one-attempt stuck-at generation mode");
+
+	// Backtrace supports AND/OR/NAND/NOR/NOT/BUF, not physical XOR/EQV.
+	// Reject these before a sampled order can reach an undefined backtrace path.
+	for (wptr wire : sort_wlist)
+	{
+		if (!wire->inode.empty() &&
+			(wire->inode.front()->type == XOR || wire->inode.front()->type == EQV))
+			throw runtime_error("Stuck-at PODEM requires physical XOR/EQV gates to be expanded before ordering");
+	}
+
+	srand(seed);
+	int current_detect_num = 0;
+	int total_detect_num = 0;
+	int total_no_of_backtracks = 0;
+	int current_backtracks = 0;
+	int no_of_aborted_faults = 0;
+	int no_of_redundant_faults = 0;
+	int no_of_calls = 0;
+	fptr fault_under_test = flist_undetect.empty() ? nullptr : flist_undetect.front();
+
+	while (fault_under_test != nullptr)
+	{
+		switch (podem(fault_under_test, current_backtracks))
+		{
+			case TRUE:
+			{
+				string vec;
+				for (wptr w : cktin)
+					vec.push_back(itoc(w->value));
+				fault_sim_a_vector(vec, current_detect_num);
+				total_detect_num += current_detect_num;
+				in_vector_no++;
+				break;
+			}
+			case FALSE:
+				fault_under_test->detect = REDUNDANT;
+				no_of_redundant_faults++;
+				break;
+			case MAYBE:
+				no_of_aborted_faults++;
+				break;
+		}
+		fault_under_test->test_tried = true;
+		fault_under_test = nullptr;
+		for (fptr candidate : flist_undetect)
+		{
+			if (!candidate->test_tried)
+			{
+				fault_under_test = candidate;
+				break;
+			}
+		}
+		total_no_of_backtracks += current_backtracks;
+		no_of_calls++;
+	}
+
+	AtpgRunResult result;
+	result.pattern_count = in_vector_no;
+	result.detected_equivalent_faults = total_detect_num;
+	result.uncollapsed_faults = num_of_gate_fault;
+	result.aborted_faults = no_of_aborted_faults;
+	result.redundant_faults = no_of_redundant_faults;
+	result.podem_calls = no_of_calls;
+	result.total_backtracks = total_no_of_backtracks;
+	for (const auto &owned_fault : flist)
+	{
+		if (owned_fault->detect == TRUE)
+			result.detected_collapsed_faults++;
+	}
+
+	if (print_report)
+	{
+		display_undetect();
+		fprintf(stdout, "\n#number of aborted faults = %d\n", no_of_aborted_faults);
+		fprintf(stdout, "\n#number of redundant faults = %d\n", no_of_redundant_faults);
+		fprintf(stdout, "\n#number of calling podem1 = %d\n", no_of_calls);
+		fprintf(stdout, "\n#total number of backtracks = %d\n", total_no_of_backtracks);
+	}
+	return result;
+}
+
 void ATPG::test()
 {
 	string vec;
@@ -58,65 +157,7 @@ void ATPG::test()
 	/* SAF test generation mode */
 	if (SAF_atpg)
 	{
-		while (fault_under_test != nullptr)
-		{
-			switch (podem(fault_under_test, current_backtracks))
-			{
-				case TRUE:
-					/* form a vector */
-					vec.clear();
-					for (wptr w : cktin)
-					{
-						vec.push_back(itoc(w->value));
-					}
-					/*by defect, we want only one pattern per fault */
-					/*run a fault simulation, drop ALL detected faults */
-					if (total_attempt_num == 1)
-					{
-						fault_sim_a_vector(vec, current_detect_num);
-						total_detect_num += current_detect_num;
-					}
-					/* If we want mutiple petterns per fault,
-					 * NO fault simulation.  drop ONLY the fault under test */
-					else
-					{
-						fault_under_test->detect = TRUE;
-						/* drop fault_under_test */
-						flist_undetect.remove(fault_under_test);
-					}
-					in_vector_no++;
-					break;
-				case FALSE:
-					fault_under_test->detect = REDUNDANT;
-					no_of_redundant_faults++;
-					break;
-
-				case MAYBE:
-					no_of_aborted_faults++;
-					break;
-			}
-			fault_under_test->test_tried = true;
-			fault_under_test = nullptr;
-			for (fptr fptr_ele : flist_undetect)
-			{
-				if (!fptr_ele->test_tried)
-				{
-					fault_under_test = fptr_ele;
-					break;
-				}
-			}
-			total_no_of_backtracks += current_backtracks; // accumulate number of backtracks
-			no_of_calls++;
-		}
-		display_undetect();
-		fprintf(stdout, "\n");
-		fprintf(stdout, "#number of aborted faults = %d\n", no_of_aborted_faults);
-		fprintf(stdout, "\n");
-		fprintf(stdout, "#number of redundant faults = %d\n", no_of_redundant_faults);
-		fprintf(stdout, "\n");
-		fprintf(stdout, "#number of calling podem1 = %d\n", no_of_calls);
-		fprintf(stdout, "\n");
-		fprintf(stdout, "#total number of backtracks = %d\n", total_no_of_backtracks);
+		run_stuck_at(true);
 		return;
 	}
 

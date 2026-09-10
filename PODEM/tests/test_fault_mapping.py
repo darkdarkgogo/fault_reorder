@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import cpp_podem
 from convert_binary_bench import catalog_cpp_podem, convert_binary_bench
 
 
@@ -211,6 +212,53 @@ class FaultMappingTests(unittest.TestCase):
                     RuntimeError, "Invalid V3 logical XOR marker"
                 ):
                     catalog_cpp_podem(binary, malformed)
+
+    def test_ordered_atpg_returns_metrics_for_exact_permutations(self):
+        _, binary, fault_map, _, catalog = self.convert("\n".join([
+            "INPUT(a)",
+            "INPUT(b)",
+            "INPUT(c)",
+            "OUTPUT(y)",
+            "y = AND(a,b,c)",
+            "",
+        ]))
+        fault_ids = [str(fault["fault_id"]) for fault in catalog["faults"]]
+        expected_keys = {
+            "pattern_count", "detected_collapsed_faults",
+            "detected_equivalent_faults", "uncollapsed_faults",
+            "aborted_faults", "redundant_faults", "podem_calls",
+            "total_backtracks",
+        }
+
+        native = cpp_podem.run_stuck_at_ordered(
+            str(binary), str(fault_map), fault_ids
+        )
+        reversed_run = cpp_podem.run_stuck_at_ordered(
+            str(binary), str(fault_map), list(reversed(fault_ids))
+        )
+
+        self.assertEqual(set(native), expected_keys)
+        self.assertEqual(native["uncollapsed_faults"], catalog["uncollapsed_total"])
+        self.assertGreater(native["pattern_count"], 0)
+        self.assertGreater(native["detected_equivalent_faults"], 0)
+        self.assertEqual(set(reversed_run), expected_keys)
+
+    def test_ordered_atpg_rejects_invalid_permutations(self):
+        _, binary, fault_map, _, catalog = self.convert(
+            "INPUT(a)\nOUTPUT(y)\ny = BUF(a)\n"
+        )
+        fault_ids = [str(fault["fault_id"]) for fault in catalog["faults"]]
+        cases = (
+            (fault_ids[:-1], "exactly"),
+            (fault_ids[:-1] + [fault_ids[0]], "Duplicate"),
+            (fault_ids[:-1] + ["__smartatpg_bin_fake:GO:sa0"], "Unknown"),
+        )
+        for ordered, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    cpp_podem.run_stuck_at_ordered(
+                        str(binary), str(fault_map), ordered
+                    )
 
 
 if __name__ == "__main__":

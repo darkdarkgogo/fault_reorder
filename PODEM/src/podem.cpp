@@ -556,6 +556,7 @@ ATPG::nptr ATPG::find_propagate_gate(const int &level)
 			}
 		}
 	}
+	return nullptr;
 } /* end of find_propagate_gate */
 
 /* DFS search for X-path , Fig 8.6
