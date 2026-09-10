@@ -6,31 +6,64 @@
 
 ## 本机运行
 
-在 `reorderATPG` 目录执行；本机使用 `d2l`（Python 3.9 / PyTorch 1.11）。
+Linux 脚本使用当前激活环境中的 `python`，不会创建 Conda 环境或调用 sudo。
+主机需要预先安装 C++ 编译器和 Python 开发头文件。Ubuntu/Debian 可以执行：
 
-```powershell
-conda activate d2l
-python -m pip install -r requirements-fault-order.txt
+```bash
+sudo apt update
+sudo apt install build-essential python3-dev
+```
 
-# 首次使用或修改 C++ 后，在 PODEM 目录重建与当前 Python 对应的扩展
-Push-Location PODEM
-python setup.py build_ext --inplace
-Pop-Location
+然后激活准备好的环境，再运行安装脚本：
 
-# 导出全部 16 个电路的官方预训练 embedding；已有文件仍须通过最后的校验
-python scripts/prepare_fault_order_data.py --manifest configs/all_benchmarks.json
-python -m fault_order_rl validate --manifest configs/all_benchmarks.json
+```bash
+conda activate fault-order
+chmod +x scripts/setup_linux.sh scripts/run_linux.sh
+./scripts/setup_linux.sh
+```
 
-# 两个真实电路的短验证
-python -m fault_order_rl train --manifest configs/smoke_benchmarks.json --rounds 2 --evaluate-every 1 --output runs/smoke
+安装脚本会安装依赖、编译当前 Python 对应的 Linux `cpp_podem*.so`，并校验
+全部 16 个电路。使用非默认解释器或 manifest 时：
 
-# 完整训练；rounds 表示总目标轮数，不是追加轮数
-python -m fault_order_rl train --manifest configs/all_benchmarks.json --rounds 100 --output runs/shared_scorer
-python -m fault_order_rl train --resume runs/shared_scorer/latest.pt
+```bash
+PYTHON_BIN=/path/to/python ./scripts/setup_linux.sh path/to/manifest.json
+```
 
-# 延长总目标，但不改变原有温度衰减周期和其余配置
-python -m fault_order_rl train --resume runs/shared_scorer/latest.pt --rounds 200
-python -m fault_order_rl evaluate --checkpoint runs/shared_scorer/best.pt
+只验证环境和数据：
+
+```bash
+./scripts/run_linux.sh validate
+```
+
+先跑 1 轮两个电路的 smoke：
+
+```bash
+./scripts/run_linux.sh smoke
+```
+
+正式训练默认运行 100 轮并写入 `runs/shared_scorer`：
+
+```bash
+./scripts/run_linux.sh train
+```
+
+也可以指定轮数和输出目录：
+
+```bash
+./scripts/run_linux.sh train 200 runs/experiment-200
+```
+
+断点续训；可选的第二个参数表示总目标轮数：
+
+```bash
+./scripts/run_linux.sh resume runs/shared_scorer/latest.pt
+./scripts/run_linux.sh resume runs/shared_scorer/latest.pt 200
+```
+
+重新评估 best 并导出排名：
+
+```bash
+./scripts/run_linux.sh evaluate runs/shared_scorer/best.pt
 ```
 
 `configs/all_benchmarks.json` 包含 16 个内置二值电路；`smoke_benchmarks.json`
