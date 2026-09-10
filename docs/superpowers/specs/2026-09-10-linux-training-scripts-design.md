@@ -9,11 +9,10 @@ CUDA/PyTorch 安装源。训练所需的 16 组 fault embedding 和 pybind11 头
 
 ## 脚本
 
-`scripts/setup_linux.sh` 从任意工作目录定位仓库根目录，检查 Python 3.9+、
-PyTorch、NumPy、setuptools、Python 开发头和 C++ 编译器，使用仓库内的 pybind11
-头文件编译当前平台的 `cpp_podem` 扩展，验证扩展可导入，最后对指定 manifest
-执行数据校验。脚本不执行 pip。manifest 默认是 `configs/all_benchmarks.json`，
-可用第一个位置参数覆盖。
+`scripts/setup_linux.sh` 从任意工作目录定位仓库根目录，然后只执行
+`python3 PODEM/setup.py build_ext --inplace`。构建器使用仓库内的 pybind11 头文件；
+脚本不执行环境探测、pip、联网或数据生成。数据校验由 `run_linux.sh validate` 或
+训练入口完成，因此错误直接来自实际失败的组件。
 
 `scripts/run_linux.sh` 从任意工作目录定位仓库根目录，并提供 `validate`、`smoke`、
 `train`、`resume` 和 `evaluate` 子命令。`smoke` 默认跑 1 轮两个电路；`train`

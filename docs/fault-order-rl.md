@@ -6,32 +6,27 @@
 
 ## 本机运行
 
-Linux 脚本默认使用 `PATH` 中的 `python3`，不会联网、执行 `pip install`、创建
-Conda 环境或调用 sudo，也不要求 d2l 环境。仓库已经包含训练 embedding 和
-pybind11 头文件；选中的 Python 需要已有 PyTorch、NumPy 和 setuptools。主机还
-需要 C++ 编译器和该 Python 对应的开发头文件。Ubuntu/Debian 可以在有安装源的
-系统准备阶段执行：
+Linux 脚本使用 `PATH` 中的 `python3`，不会联网、执行 `pip install`、创建 Conda
+环境或调用 sudo。仓库已经包含训练 embedding 和 pybind11 头文件。服务器需要
+已有 PyTorch、NumPy、setuptools、C++ 编译器和 Python 开发头文件。
 
 ```bash
 sudo apt update
 sudo apt install build-essential python3-dev
 ```
 
-确认服务器上的 Python 可以导入依赖，再运行安装脚本：
+运行一次构建脚本：
 
 ```bash
-python3 -c 'import torch, numpy, setuptools; print(torch.__version__)'
 chmod +x scripts/setup_linux.sh scripts/run_linux.sh
 ./scripts/setup_linux.sh
 ```
 
-安装脚本只检查已有环境、用仓库内的 pybind11 头文件编译当前 Python 对应的
-Linux `cpp_podem*.so`，并校验仓库随附的全部 16 个电路和 embedding。使用非默认
-解释器或 manifest 时：
+这个脚本只执行下面这一条 Python 构建命令，生成当前 Python 3 对应的 Linux
+`cpp_podem*.so`：
 
 ```bash
-PYTHON_BIN=/software/public/python/3.10.6/bin/python3 \
-  ./scripts/setup_linux.sh path/to/manifest.json
+python3 PODEM/setup.py build_ext --inplace
 ```
 
 只验证环境和数据：
