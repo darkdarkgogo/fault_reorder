@@ -35,7 +35,12 @@ def main(argv=None):
             circuits = load_all_circuits(manifest, PodemEnvironment(manifest.module_dir))
             print(json.dumps({"validated": len(circuits), "faults": {c.name: c.fault_count for c in circuits}}, indent=2))
         elif args.command == "train":
-            supplied = {name: getattr(args, name) for name in vars(defaults) if getattr(args, name) is not None}
+            argument_values = vars(args)
+            supplied = {
+                name: argument_values[name]
+                for name in vars(defaults)
+                if name in argument_values and argument_values[name] is not None
+            }
             if args.resume:
                 if args.output is not None or set(supplied) - {"rounds"}:
                     raise ValueError("resume preserves saved configuration/output; only --rounds may extend the target")

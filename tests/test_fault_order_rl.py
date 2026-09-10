@@ -252,6 +252,27 @@ def test_training_seed_does_not_change_fixed_solver_protocol(mock_training, tmp_
     assert calls == [(3000, 14)]
 
 
+def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch):
+    from fault_order_rl import __main__ as cli
+    captured = {}
+    fake = SimpleNamespace(train=lambda: {
+        'round': 0, 'totals': {'pattern_count': 1}, 'pattern_reduction': 0,
+    })
+
+    def create(manifest, config, output):
+        captured['config'] = config
+        return fake
+
+    monkeypatch.setattr(cli.Trainer, 'create', create)
+    result = cli.main([
+        'train', '--manifest', str(tmp_path/'manifest.json'),
+        '--rounds', '1', '--output', str(tmp_path/'run'),
+    ])
+    assert result == 0
+    assert captured['config'].rounds == 1
+    assert captured['config'].backtrack_limit == 3000
+
+
 def test_physical_xor_is_rejected_instead_of_crashing(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT/'PODEM/scripts'))
     from convert_binary_bench import convert_binary_bench
