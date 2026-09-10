@@ -10,7 +10,7 @@ cpp_podem extension with the bundled pybind11 headers, and validate the bundled
 training data. The manifest defaults to configs/all_benchmarks.json.
 
 Environment:
-  PYTHON_BIN   Python command or path to use (default: python)
+  PYTHON_BIN   Python command or path to use (default: python3)
 EOF
 }
 
@@ -24,7 +24,7 @@ if (( $# > 1 )); then
 fi
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-python_bin="${PYTHON_BIN:-python}"
+python_bin="${PYTHON_BIN:-python3}"
 manifest="${1:-configs/all_benchmarks.json}"
 
 if [[ $(uname -s) != "Linux" ]]; then
@@ -62,8 +62,8 @@ try:
     import torch
 except ImportError as exc:
     raise SystemExit(
-        "error: the active offline environment is missing " + str(exc.name)
-        + "; activate the prepared d2l environment"
+        "error: the selected Python is missing " + str(exc.name)
+        + "; set PYTHON_BIN to an offline Python that contains NumPy and PyTorch"
     )
 print("Using Python", sys.version.split()[0], "from", sys.executable)
 print("Using NumPy", numpy.__version__, "and PyTorch", torch.__version__)

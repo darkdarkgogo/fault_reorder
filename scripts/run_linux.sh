@@ -17,12 +17,12 @@ Defaults:
   evaluate           runs/shared_scorer/best.pt
 
 Environment:
-  PYTHON_BIN          Python command or path to use (default: python)
+  PYTHON_BIN          Python command or path to use (default: python3)
 EOF
 }
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-python_bin="${PYTHON_BIN:-python}"
+python_bin="${PYTHON_BIN:-python3}"
 command_name="${1:-help}"
 if (( $# > 0 )); then
   shift
