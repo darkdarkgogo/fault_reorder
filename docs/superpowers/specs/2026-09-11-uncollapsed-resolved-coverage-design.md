@@ -3,7 +3,9 @@
 ## 目标
 
 故障排序训练的覆盖门槛统一使用非折叠故障口径，并把 PODEM 已证明为
-redundant 的故障计入覆盖。pattern count 只能在不降低该覆盖率的候选之间比较。
+redundant 的故障计入覆盖。每个电路的门槛固定为原始 catalog 顺序的覆盖数；
+pattern count 只能在逐电路不低于原始覆盖率的候选之间比较，并且是 best 选择的
+首要优化目标。
 
 本次修改后重新开始训练；旧 `latest.pt` 和 `best.pt` 不做迁移。
 
@@ -58,28 +60,26 @@ covered_equivalent_faults <= uncollapsed_faults
 ## 训练状态与奖励
 
 每个电路的状态字段从 `required_detected_equivalent_faults` 改为
-`required_covered_equivalent_faults`，初始值来自原始 catalog 顺序的
-`covered_equivalent_faults`。
+`native_covered_equivalent_faults`，其值来自原始 catalog 顺序的
+`covered_equivalent_faults`，训练期间保持不变。
 
 episode 有效条件改为：
 
 ```text
 metrics.covered_equivalent_faults >=
-    state.required_covered_equivalent_faults
+    state.native_covered_equivalent_faults
 ```
 
 有效 episode 的 pattern reward、无效 episode 的惩罚以及 EMA 算法保持不变。
-随机采样 episode 不修改覆盖门槛。
-
-定期确定性评估若得到更高的 `covered_equivalent_faults`，才提高对应电路的门槛。
-提高门槛与保存产生该结果的候选模型发生在同一次事务轮次内，保证新门槛始终有
-可复现的 checkpoint 支撑。
+随机采样 episode 和定期确定性评估都不修改覆盖门槛。某次评估高于原始覆盖率
+不会使后续候选必须保持这个偶然提高值。
 
 ## Best 选择与报告
 
-best eligibility 要求每个电路的 `covered_equivalent_faults` 都达到当前门槛。
-合格候选仍优先最小化总 pattern count；后续排序条件中的覆盖项改为最大化总
-`covered_equivalent_faults`，再比较 PODEM calls、backtracks 和 round。
+best eligibility 要求每个电路的 `covered_equivalent_faults` 都达到该电路固定的
+原始覆盖门槛。合格候选首先最小化总 pattern count；pattern count 相同时，才
+最大化总 `covered_equivalent_faults`，再比较 PODEM calls、backtracks 和 round。
+一个覆盖更多但 pattern count 也更多的候选不能替换已有 best。
 
 `evaluation/summary.json` 保留 detected、redundant collapsed 和其他原始指标，
 并新增每个电路及 totals 的：
@@ -96,7 +96,7 @@ fault_coverage
 表示：
 
 ```text
-max(0, required_covered_equivalent_faults - covered_equivalent_faults)
+max(0, native_covered_equivalent_faults - covered_equivalent_faults)
 ```
 
 字段名保持不变，但文档明确其单位为 uncollapsed faults。
@@ -104,8 +104,9 @@ max(0, required_covered_equivalent_faults - covered_equivalent_faults)
 ## Checkpoint 与恢复
 
 checkpoint schema 版本升级。旧 checkpoint 缺少
-`redundant_equivalent_faults`、新的训练门槛和新 PODEM digest，恢复时明确拒绝，
-不进行猜测或隐式迁移。用户需要重新构建 `cpp_podem` 并从 round 0 重新训练。
+`redundant_equivalent_faults`、新的固定原始覆盖门槛和新 PODEM digest，恢复时
+明确拒绝，不进行猜测或隐式迁移。用户需要重新构建 `cpp_podem` 并从 round 0
+重新训练。
 
 新 checkpoint 保存新的 native metrics、state 门槛、每轮 report 和 best report，
 从新 `latest.pt` 恢复仍需保持模型、optimizer、RNG、baseline 和 best 的精确一致性。
@@ -116,8 +117,8 @@ checkpoint schema 版本升级。旧 checkpoint 缺少
    按 `eqv_fault_num` 而不是 collapsed 条目数累加。
 2. environment 测试验证新字段、派生覆盖数、总数上界以及旧 extension 的明确错误。
 3. reward 测试覆盖 detected 与 redundant 互相变化但总 uncollapsed 覆盖不变的情况。
-4. eligibility、best invalidation 和 coverage shortfall 测试全部使用
-   `covered_equivalent_faults`。
+4. eligibility、best 选择和 coverage shortfall 测试全部使用
+   `covered_equivalent_faults`，并确认训练结果不会提高原始覆盖门槛。
 5. checkpoint 测试确认旧 schema 被拒绝，新 schema 可以精确恢复。
 6. 真实小电路端到端测试确认每个结果满足
    `covered_equivalent_faults <= uncollapsed_faults`，并能训练、恢复和导出 best。
