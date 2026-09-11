@@ -112,7 +112,8 @@ int ATPG::podem(const fptr fault, int &current_backtracks)
 					{
 						display_fault(fault);
 					}
-					display_io();
+					if (print_test_vectors)
+						display_io();
 				}
 				attempt_num++; // increase pattern count for this fault
 
@@ -183,7 +184,8 @@ int ATPG::podem(const fptr fault, int &current_backtracks)
 						break; // random fill U
 				}
 			}
-			display_io();
+			if (print_test_vectors)
+				display_io();
 		}
 		else
 			fprintf(stdout, "\n"); // do not random fill when multiple patterns per fault

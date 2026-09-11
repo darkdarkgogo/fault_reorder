@@ -19,6 +19,7 @@ void ATPG::configure_ordered_stuck_at(int configured_backtrack_limit,
 	fault_order_by_scoap = false;
 	dynamic_test_compression = false;
 	static_test_compression = false;
+	print_test_vectors = false;
 }
 
 ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)

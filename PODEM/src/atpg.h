@@ -287,6 +287,7 @@ private:
 	bool dynamic_test_compression = false;
 	bool static_test_compression = false;
 	bool fault_order_by_scoap = false;
+	bool print_test_vectors = true;
 	int flow = 1;	 // 0: original, 1: n=1->n=8
 	int seed = 14; // -1: increase, other: specify fixed
 	int stctime = -5;
