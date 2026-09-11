@@ -49,16 +49,20 @@ def test_sampling_and_deterministic_ties():
 
 def test_reward_and_coverage_penalty_do_not_mutate_previous_state():
     state = dict(native_pattern_count=20, previous_pattern_count=18,
-                 required_detected_equivalent_faults=100, reward_ema=2.)
-    new, reward = reward_transition(state, dict(pattern_count=15, detected_equivalent_faults=101), .9)
+                 native_covered_equivalent_faults=100, reward_ema=2.)
+    new, reward = reward_transition(
+        state, dict(pattern_count=15, detected_equivalent_faults=95,
+                    redundant_equivalent_faults=5, covered_equivalent_faults=100), .9)
     assert reward == dict(raw_reward=3, advantage=.05, coverage_valid=True)
     assert new["previous_pattern_count"] == 15
-    assert new["required_detected_equivalent_faults"] == 100
+    assert new["native_covered_equivalent_faults"] == 100
     assert new["reward_ema"] == pytest.approx(2.1)
-    invalid, penalty = reward_transition(state, dict(pattern_count=2, detected_equivalent_faults=99), .9)
+    invalid, penalty = reward_transition(
+        state, dict(pattern_count=2, detected_equivalent_faults=98,
+                    redundant_equivalent_faults=1, covered_equivalent_faults=99), .9)
     assert penalty == dict(raw_reward=-20, advantage=-1.1, coverage_valid=False)
     assert invalid["previous_pattern_count"] == 18
-    assert invalid["required_detected_equivalent_faults"] == 100
+    assert invalid["native_covered_equivalent_faults"] == 100
     assert state["reward_ema"] == 2.
 
 
@@ -72,7 +76,9 @@ class FakeEnvironment:
         score = sum((i + 1) * int(identifier[1:]) for i, identifier in enumerate(ids))
         return dict(pattern_count=3 + score % 7, detected_equivalent_faults=len(ids),
                     detected_collapsed_faults=len(ids), uncollapsed_faults=len(ids),
-                    aborted_faults=0, redundant_faults=0, podem_calls=len(ids), total_backtracks=score)
+                    aborted_faults=0, redundant_faults=0,
+                    redundant_equivalent_faults=0, covered_equivalent_faults=len(ids),
+                    fault_coverage=1.0, podem_calls=len(ids), total_backtracks=score)
 
 
 @pytest.fixture
@@ -95,6 +101,13 @@ def mock_training(tmp_path, monkeypatch):
 def assert_model_equal(a, b):
     for key in a:
         assert torch.equal(a[key], b[key]), key
+
+
+def test_checkpoint_schema_one_requires_restart(tmp_path):
+    checkpoint = tmp_path/'old.pt'
+    save_checkpoint(checkpoint, {'version': 1})
+    with pytest.raises(ValueError, match='detected-only coverage; restart training'):
+        load_checkpoint(checkpoint)
 
 
 def test_shared_update_and_exact_resume(mock_training, tmp_path):
@@ -165,19 +178,33 @@ def test_resume_rejects_changed_manifest(mock_training, tmp_path):
         Trainer.resume(tmp_path/'run/latest.pt', environment=env)
 
 
-def test_old_best_is_invalidated_when_detection_requirement_rises():
-    report = dict(round=0, circuits={'c': dict(detected_equivalent_faults=9)},
-                  totals=dict(pattern_count=2, detected_equivalent_faults=9, podem_calls=3, total_backtracks=1))
-    states = {'c': dict(required_detected_equivalent_faults=10)}
+def test_best_requires_native_coverage_for_each_circuit():
+    report = dict(round=0, circuits={'c': dict(covered_equivalent_faults=9)},
+                  totals=dict(pattern_count=2, covered_equivalent_faults=9,
+                              podem_calls=3, total_backtracks=1))
+    states = {'c': dict(native_covered_equivalent_faults=10)}
     assert not eligible(report, states)
     assert Trainer._choose_best({'report': report}, FaultScorer(), report, states) is None
+
+
+def test_best_prioritizes_pattern_count_after_native_coverage():
+    states = {'c': dict(native_covered_equivalent_faults=10)}
+    model = FaultScorer()
+    fewer_patterns = dict(round=1, circuits={'c': dict(covered_equivalent_faults=10)},
+                          totals=dict(pattern_count=4, covered_equivalent_faults=10,
+                                      podem_calls=5, total_backtracks=7))
+    more_coverage = dict(round=2, circuits={'c': dict(covered_equivalent_faults=11)},
+                         totals=dict(pattern_count=5, covered_equivalent_faults=11,
+                                     podem_calls=4, total_backtracks=6))
+    best = Trainer._choose_best(None, model, fewer_patterns, states)
+    assert Trainer._choose_best(best, model, more_coverage, states) is best
 
 
 def test_completed_training_falls_back_to_latest_when_no_best(mock_training, tmp_path):
     manifest, env = mock_training
     trainer = Trainer.create(manifest, TrainConfig(rounds=1), tmp_path/'run', env)
     for state in trainer.states.values():
-        state['required_detected_equivalent_faults'] += 1
+        state['native_covered_equivalent_faults'] += 1
     trainer.best = None
     trainer.round = trainer.config.rounds
     save_checkpoint(tmp_path/'run/latest.pt', trainer._payload())
@@ -217,7 +244,7 @@ def test_existing_pretrained_artifact_and_bench_provenance(tmp_path):
         load_circuit_data(replace(spec, bench_path=changed), catalog)
 
 
-@pytest.mark.parametrize('field,value', [('learning_rate', float('nan')), ('temperature_min', 2.), ('rounds', 0), ('backtrack_limit', 30)])
+@pytest.mark.parametrize('field,value', [('learning_rate', float('nan')), ('temperature_min', 2.), ('rounds', 0), ('backtrack_limit', 3000)])
 def test_bad_training_config(field, value):
     with pytest.raises(ValueError):
         replace(TrainConfig(), **{field: value}).validate()
@@ -227,6 +254,51 @@ def test_missing_solver_file_is_python_error(tmp_path):
     env = PodemEnvironment(ROOT/'PODEM')
     with pytest.raises(ValueError, match='missing'):
         env.catalog(tmp_path/'absent.bench', tmp_path/'absent.map')
+
+
+def test_environment_derives_uncollapsed_resolved_coverage(tmp_path, monkeypatch):
+    from fault_order_rl import environment as module
+    bench = tmp_path/'tiny.bench'
+    faultmap = tmp_path/'tiny.faultmap'
+    bench.write_text('INPUT(a)\nOUTPUT(a)\n')
+    faultmap.write_text('map\n')
+    calls = []
+
+    class Binding:
+        @staticmethod
+        def run_stuck_at_ordered(bench_path, faultmap_path, ids, limit, seed):
+            calls.append((bench_path, faultmap_path, ids, limit, seed))
+            return dict(pattern_count=2, detected_collapsed_faults=2,
+                        detected_equivalent_faults=4, uncollapsed_faults=7,
+                        aborted_faults=0, redundant_faults=1,
+                        redundant_equivalent_faults=3, podem_calls=3,
+                        total_backtracks=8)
+
+    monkeypatch.setattr(module, 'load_cpp_podem', lambda module_dir: Binding())
+    result = PodemEnvironment(tmp_path).run(bench, faultmap, ['a', 'b', 'c'])
+    assert result['covered_equivalent_faults'] == 7
+    assert result['fault_coverage'] == 1.0
+    assert calls[0][3:] == (5000, 14)
+
+
+def test_environment_rejects_binding_without_equivalent_redundant_count(tmp_path, monkeypatch):
+    from fault_order_rl import environment as module
+    bench = tmp_path/'tiny.bench'
+    faultmap = tmp_path/'tiny.faultmap'
+    bench.write_text('INPUT(a)\nOUTPUT(a)\n')
+    faultmap.write_text('map\n')
+
+    class OldBinding:
+        @staticmethod
+        def run_stuck_at_ordered(*args):
+            return dict(pattern_count=1, detected_collapsed_faults=1,
+                        detected_equivalent_faults=1, uncollapsed_faults=1,
+                        aborted_faults=0, redundant_faults=0, podem_calls=1,
+                        total_backtracks=0)
+
+    monkeypatch.setattr(module, 'load_cpp_podem', lambda module_dir: OldBinding())
+    with pytest.raises(RuntimeError, match='redundant_equivalent_faults'):
+        PodemEnvironment(tmp_path).run(bench, faultmap, ['a'])
 
 
 def test_real_mapped_circuit_training_resume_and_export(tmp_path, monkeypatch):
@@ -265,7 +337,7 @@ def test_real_mapped_circuit_training_resume_and_export(tmp_path, monkeypatch):
     resumed.step()
     report = evaluate_checkpoint(tmp_path/'real-run/best.pt', tmp_path/'real-eval')
     assert report['eligible']
-    assert report['totals']['detected_equivalent_faults'] >= native['detected_equivalent_faults']
+    assert report['totals']['covered_equivalent_faults'] >= native['covered_equivalent_faults']
 
 
 def test_training_seed_does_not_change_fixed_solver_protocol(mock_training, tmp_path, monkeypatch):
@@ -277,7 +349,7 @@ def test_training_seed_does_not_change_fixed_solver_protocol(mock_training, tmp_
         return env
     monkeypatch.setattr(module, 'PodemEnvironment', factory)
     Trainer(manifest, TrainConfig(seed=93), tmp_path/'seed-test')
-    assert calls == [(3000, 14)]
+    assert calls == [(5000, 14)]
 
 
 def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch, capsys):
@@ -298,7 +370,7 @@ def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch,
     ])
     assert result == 0
     assert captured['config'].rounds == 1
-    assert captured['config'].backtrack_limit == 3000
+    assert captured['config'].backtrack_limit == 5000
     assert json.loads(capsys.readouterr().out)['checkpoint_kind'] == 'best'
 
 

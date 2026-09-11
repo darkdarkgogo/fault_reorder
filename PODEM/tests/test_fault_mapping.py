@@ -226,7 +226,8 @@ class FaultMappingTests(unittest.TestCase):
         expected_keys = {
             "pattern_count", "detected_collapsed_faults",
             "detected_equivalent_faults", "uncollapsed_faults",
-            "aborted_faults", "redundant_faults", "podem_calls",
+            "aborted_faults", "redundant_faults",
+            "redundant_equivalent_faults", "podem_calls",
             "total_backtracks",
         }
 
@@ -241,7 +242,27 @@ class FaultMappingTests(unittest.TestCase):
         self.assertEqual(native["uncollapsed_faults"], catalog["uncollapsed_total"])
         self.assertGreater(native["pattern_count"], 0)
         self.assertGreater(native["detected_equivalent_faults"], 0)
+        self.assertGreaterEqual(
+            native["redundant_equivalent_faults"], native["redundant_faults"]
+        )
+        self.assertLessEqual(
+            native["detected_equivalent_faults"]
+            + native["redundant_equivalent_faults"],
+            native["uncollapsed_faults"],
+        )
         self.assertEqual(set(reversed_run), expected_keys)
+
+    def test_redundant_equivalent_count_uses_uncollapsed_weights(self):
+        binary = ROOT / "sample_circuits" / "c1908_binary.bench"
+        fault_map = binary.with_suffix(".faultmap")
+        catalog = cpp_podem.catalog_stuck_at(str(binary), str(fault_map))
+        fault_ids = [str(fault["fault_id"]) for fault in catalog["faults"]]
+        metrics = cpp_podem.run_stuck_at_ordered(
+            str(binary), str(fault_map), fault_ids, 5000, 14
+        )
+
+        self.assertEqual(metrics["redundant_faults"], 36)
+        self.assertEqual(metrics["redundant_equivalent_faults"], 88)
 
     def test_ordered_atpg_rejects_invalid_permutations(self):
         _, binary, fault_map, _, catalog = self.convert(

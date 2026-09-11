@@ -72,6 +72,7 @@ py::dict run_stuck_at_ordered(const std::string &circuit_path,
   result["uncollapsed_faults"] = summary.uncollapsed_faults;
   result["aborted_faults"] = summary.aborted_faults;
   result["redundant_faults"] = summary.redundant_faults;
+  result["redundant_equivalent_faults"] = summary.redundant_equivalent_faults;
   result["podem_calls"] = summary.podem_calls;
   result["total_backtracks"] = summary.total_backtracks;
   return result;

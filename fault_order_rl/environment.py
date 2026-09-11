@@ -12,6 +12,7 @@ RESULT_FIELDS = (
     "uncollapsed_faults",
     "aborted_faults",
     "redundant_faults",
+    "redundant_equivalent_faults",
     "podem_calls",
     "total_backtracks",
 )
@@ -36,7 +37,7 @@ def load_cpp_podem(module_dir=None):
 
 
 class PodemEnvironment:
-    def __init__(self, module_dir=None, backtrack_limit=3000, seed=14):
+    def __init__(self, module_dir=None, backtrack_limit=5000, seed=14):
         if backtrack_limit <= 0:
             raise ValueError("backtrack_limit must be positive")
         self.module = load_cpp_podem(module_dir)
@@ -70,6 +71,14 @@ class PodemEnvironment:
             raise RuntimeError("PODEM detected count exceeds the fault total")
         if result["detected_collapsed_faults"] > len(ordered_fault_ids):
             raise RuntimeError("PODEM collapsed detection count exceeds the catalog")
+        if result["redundant_faults"] > len(ordered_fault_ids):
+            raise RuntimeError("PODEM collapsed redundant count exceeds the catalog")
+        covered = (result["detected_equivalent_faults"]
+                   + result["redundant_equivalent_faults"])
+        if covered > result["uncollapsed_faults"]:
+            raise RuntimeError("PODEM covered count exceeds the fault total")
+        result["covered_equivalent_faults"] = covered
+        result["fault_coverage"] = covered / result["uncollapsed_faults"]
         return result
 
     @staticmethod

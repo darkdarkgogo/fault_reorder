@@ -70,19 +70,19 @@ PODEM 会报错，避免旧 backtrace 实现的未定义行为。
 ## 奖励与模型选择
 
 - 有效 episode 的原始奖励为 `previous_pattern_count - current_pattern_count`。
-- 检测等价故障数少于当前要求时，奖励为负的
+- 非折叠已解决故障数少于原始顺序时，奖励为负的
   `max(native_pattern_count, previous_pattern_count, current_pattern_count, 1)`，
-  并保留之前的 pattern baseline 和检测要求。
+  并保留之前的 pattern baseline。已解决故障数等于 detected equivalent fault 与
+  redundant equivalent fault 之和。
 - advantage 使用更新前的 reward EMA，并除以 native pattern 数。每个电路的
   排序 log probability 除以自身 fault 数，然后对电路等权平均。
 - 评估采用分数降序和稳定行号破同分，不加入探索噪声。best 必须在每个电路上
-  满足当前检测要求，再比较总 pattern 数、检测数、PODEM 调用数和回溯数。
-- 确定性评估观察到的更高检测数会提高门槛；随机 episode 不提高门槛，避免一次
-  难以复现的随机排序使 best 失效。
+  达到原始顺序的非折叠覆盖数，再依次比较总 pattern 数、总覆盖数、PODEM 调用数
+  和回溯数。训练期间不提高原始覆盖门槛。
 - 没有合格模型时，`best.pt` 明确标记不可用；训练命令仍会评估 `latest.pt`，并
   输出 `coverage_eligible: false`、`coverage_shortfall`、pattern 数和减少量。
 
-PODEM 固定 seed=14、backtrack limit=3000、每 fault 尝试一次；STC、DTC、SCOAP
+PODEM 固定 seed=14、backtrack limit=5000、每 fault 尝试一次；STC、DTC、SCOAP
 和 TDF 不启用。默认 Adam 学习率为 1e-4，梯度裁剪为 1，EMA 衰减为 0.9，
 温度在 100 轮内由 1 衰减至 0.1。`--seed` 只控制模型和采样 RNG；PODEM 的
 backtrack limit 不通过训练命令修改。用 `train --help` 查看配置项。scorer 和
@@ -109,6 +109,8 @@ embedding 使用 CPU，单线程和确定性运算，便于精确恢复；不微
 恢复检查 manifest、BENCH、fault map、embedding、PODEM 二进制和 PyTorch 版本；
 不兼容时拒绝继续。只加载本包生成的可信本地 checkpoint，因为其中保存了
 Python/NumPy 的 RNG 对象。新训练要求空输出目录；恢复只允许调整总目标轮数。
+本次覆盖定义升级后的 checkpoint schema 为 v2，旧 checkpoint 必须丢弃并从
+round 0 重新训练。
 
 程序启动时的 `validate` 不运行 ATPG；新训练额外执行全部原始顺序 baseline
 和初始确定性评估。结束时优先对 best 做全新评估；best 不可用时评估 latest，

@@ -32,7 +32,7 @@ class TrainConfig:
     temperature_rounds: int = 100
     evaluate_every: int = 10
     seed: int = 14
-    backtrack_limit: int = 3000
+    backtrack_limit: int = 5000
     threads: int = 1
 
     def validate(self):
@@ -48,8 +48,8 @@ class TrainConfig:
             raise ValueError("temperature_min exceeds temperature_start")
         if not 0 <= self.seed < 2**31:
             raise ValueError("seed must be in [0, 2**31)")
-        if self.backtrack_limit != 3000:
-            raise ValueError("the fault-order experiment requires backtrack_limit=3000")
+        if self.backtrack_limit != 5000:
+            raise ValueError("the fault-order experiment requires backtrack_limit=5000")
 
     def temperature(self, round_number):
         fraction = min(max(round_number - 1, 0) / max(self.temperature_rounds - 1, 1), 1)
@@ -60,8 +60,8 @@ def reward_transition(state, metrics, ema_decay):
     """Return new state; never mutate a baseline during episode collection."""
     new = dict(state)
     patterns = metrics["pattern_count"]
-    detected = metrics["detected_equivalent_faults"]
-    valid = detected >= state["required_detected_equivalent_faults"]
+    covered = metrics["covered_equivalent_faults"]
+    valid = covered >= state["native_covered_equivalent_faults"]
     if valid:
         reward = state["previous_pattern_count"] - patterns
         new["previous_pattern_count"] = patterns
@@ -74,14 +74,15 @@ def reward_transition(state, metrics, ema_decay):
 
 def eligible(report, states):
     return report is not None and all(
-        report["circuits"][name]["detected_equivalent_faults"] >= state["required_detected_equivalent_faults"]
+        report["circuits"][name]["covered_equivalent_faults"]
+        >= state["native_covered_equivalent_faults"]
         for name, state in states.items()
     )
 
 
 def evaluation_key(report):
     totals = report["totals"]
-    return (totals["pattern_count"], -totals["detected_equivalent_faults"],
+    return (totals["pattern_count"], -totals["covered_equivalent_faults"],
             totals["podem_calls"], totals["total_backtracks"], report["round"])
 
 
@@ -96,7 +97,7 @@ class Trainer:
         self.config = config
         self.manifest = load_manifest(manifest)
         self.environment = environment or PodemEnvironment(
-            self.manifest.module_dir, 3000, 14)
+            self.manifest.module_dir, config.backtrack_limit, 14)
         self.circuits = load_all_circuits(self.manifest, self.environment)
         self.output = Path(output).resolve()
         self.provenance = {c.name: c.artifact_digest for c in self.circuits}
@@ -132,12 +133,11 @@ class Trainer:
             self.states[circuit.name] = {
                 "native_pattern_count": metrics["pattern_count"],
                 "previous_pattern_count": metrics["pattern_count"],
-                "required_detected_equivalent_faults": metrics["detected_equivalent_faults"],
+                "native_covered_equivalent_faults": metrics["covered_equivalent_faults"],
                 "reward_ema": 0.0,
             }
             records.append(self._record("baseline", circuit.name, 0, metrics, elapsed))
         report, _ = self.evaluate_model(self.model, 0, self.states)
-        self._raise_requirements(self.states, report)
         self.best = self._choose_best(None, self.model, report, self.states)
         records.append({"kind": "evaluation", "report": report})
         self._write_round(0, records, {})
@@ -207,16 +207,14 @@ class Trainer:
                                          "scores": scores.numpy(), "ranks": ranks, "permutation": order}
         totals = {key: sum(result[key] for result in results.values()) for key in
                   ("pattern_count", "detected_equivalent_faults", "detected_collapsed_faults",
-                   "uncollapsed_faults", "podem_calls", "total_backtracks", "aborted_faults", "redundant_faults")}
+                   "redundant_equivalent_faults", "covered_equivalent_faults",
+                   "uncollapsed_faults", "podem_calls", "total_backtracks",
+                   "aborted_faults", "redundant_faults")}
+        totals["fault_coverage"] = (
+            totals["covered_equivalent_faults"] / totals["uncollapsed_faults"])
         report = {"round": round_number, "circuits": results, "totals": totals}
         report["eligible"] = eligible(report, states)
         return report, exports
-
-    @staticmethod
-    def _raise_requirements(states, report):
-        for name, metrics in report["circuits"].items():
-            states[name]["required_detected_equivalent_faults"] = max(
-                states[name]["required_detected_equivalent_faults"], metrics["detected_equivalent_faults"])
 
     @staticmethod
     def _choose_best(best, model, report, states):
@@ -270,7 +268,6 @@ class Trainer:
                 best = None
             if number % self.config.evaluate_every == 0 or number == self.config.rounds:
                 report, _ = self.evaluate_model(candidate, number, states)
-                self._raise_requirements(states, report)
                 best = self._choose_best(best, candidate, report, states)
                 records.append({"kind": "evaluation", "report": report})
             records.append({"kind": "update", "round": number, "gradient_norm": float(grad_norm),
@@ -289,7 +286,7 @@ class Trainer:
         return records
 
     def _payload(self, model=None, optimizer=None, round_number=None, states=None, **overrides):
-        return {"version": 1, "kind": "latest", "run_id": self.run_id,
+        return {"version": 2, "kind": "latest", "run_id": self.run_id,
                 "manifest_path": str(self.manifest.path), "manifest_digest": self.manifest.digest,
                 "artifacts": self.provenance, "solver_digest": self.solver_digest,
                 "torch_version": str(torch.__version__), "config": asdict(self.config),
@@ -349,8 +346,8 @@ def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind
     report["native_pattern_total"] = sum(m["pattern_count"] for m in native_metrics.values())
     report["pattern_reduction"] = report["native_pattern_total"] - report["totals"]["pattern_count"]
     shortfalls = {
-        name: max(0, state["required_detected_equivalent_faults"]
-                  - report["circuits"][name]["detected_equivalent_faults"])
+        name: max(0, state["native_covered_equivalent_faults"]
+                  - report["circuits"][name]["covered_equivalent_faults"])
         for name, state in states.items()
     }
     report["coverage_eligible"] = report["eligible"]

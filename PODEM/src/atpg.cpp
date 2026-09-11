@@ -43,6 +43,7 @@ ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
 	int current_backtracks = 0;
 	int no_of_aborted_faults = 0;
 	int no_of_redundant_faults = 0;
+	int no_of_redundant_equivalent_faults = 0;
 	int no_of_calls = 0;
 	fptr fault_under_test = flist_undetect.empty() ? nullptr : flist_undetect.front();
 
@@ -63,6 +64,7 @@ ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
 			case FALSE:
 				fault_under_test->detect = REDUNDANT;
 				no_of_redundant_faults++;
+				no_of_redundant_equivalent_faults += fault_under_test->eqv_fault_num;
 				break;
 			case MAYBE:
 				no_of_aborted_faults++;
@@ -88,6 +90,7 @@ ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
 	result.uncollapsed_faults = num_of_gate_fault;
 	result.aborted_faults = no_of_aborted_faults;
 	result.redundant_faults = no_of_redundant_faults;
+	result.redundant_equivalent_faults = no_of_redundant_equivalent_faults;
 	result.podem_calls = no_of_calls;
 	result.total_backtracks = total_no_of_backtracks;
 	for (const auto &owned_fault : flist)

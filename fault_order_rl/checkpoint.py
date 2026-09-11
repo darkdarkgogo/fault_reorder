@@ -48,7 +48,11 @@ def load_checkpoint(path):
     if "weights_only" in inspect.signature(torch.load).parameters:
         options["weights_only"] = False
     state = torch.load(str(path), **options)
-    if not isinstance(state, dict) or state.get("version") != 1:
+    if isinstance(state, dict) and state.get("version") == 1:
+        raise ValueError(
+            "checkpoint schema 1 uses detected-only coverage; restart training"
+        )
+    if not isinstance(state, dict) or state.get("version") != 2:
         raise ValueError("unsupported fault-order checkpoint")
     return state
 

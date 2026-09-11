@@ -81,6 +81,7 @@ public:
 		int uncollapsed_faults{};
 		int aborted_faults{};
 		int redundant_faults{};
+		int redundant_equivalent_faults{};
 		int podem_calls{};
 		int total_backtracks{};
 	};
