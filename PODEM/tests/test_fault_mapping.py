@@ -234,10 +234,14 @@ class FaultMappingTests(unittest.TestCase):
         native = cpp_podem.run_stuck_at_ordered(
             str(binary), str(fault_map), fault_ids
         )
+        explicit_native = cpp_podem.run_stuck_at_ordered(
+            str(binary), str(fault_map), fault_ids, 5000, 14
+        )
         reversed_run = cpp_podem.run_stuck_at_ordered(
             str(binary), str(fault_map), list(reversed(fault_ids))
         )
 
+        self.assertEqual(native, explicit_native)
         self.assertEqual(set(native), expected_keys)
         self.assertEqual(native["uncollapsed_faults"], catalog["uncollapsed_total"])
         self.assertGreater(native["pattern_count"], 0)

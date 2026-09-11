@@ -81,6 +81,8 @@ PODEM 会报错，避免旧 backtrace 实现的未定义行为。
   和回溯数。训练期间不提高原始覆盖门槛。
 - 没有合格模型时，`best.pt` 明确标记不可用；训练命令仍会评估 `latest.pt`，并
   输出 `coverage_eligible: false`、`coverage_shortfall`、pattern 数和减少量。
+  `coverage_shortfall` 的单位是 uncollapsed fault，等于各电路相对其原始覆盖数的
+  缺口之和。
 
 PODEM 固定 seed=14、backtrack limit=5000、每 fault 尝试一次；STC、DTC、SCOAP
 和 TDF 不启用。默认 Adam 学习率为 1e-4，梯度裁剪为 1，EMA 衰减为 0.9，
@@ -96,7 +98,7 @@ embedding 使用 CPU，单线程和确定性运算，便于精确恢复；不微
   `round-000000` 记录原始顺序 baseline 及未训练模型评估。
 - `rounds/round-NNNNNN.npz`：按电路名保存采样排序的 catalog 行号，行号从 0 开始。
 - `evaluation/summary.json`：重新运行 best 得到的指标和原始顺序对比；没有合格
-  best 时保存 latest 的确定性评估，并记录 coverage 缺口。
+  best 时保存 latest 的确定性评估，并以 uncollapsed fault 数记录 coverage 缺口。
 - `evaluation/<circuit>.ranking.npz`：catalog 顺序的 `fault_ids`、`scores`、从 1
   开始的 `ranks`，以及从 0 开始的排序行号 `permutation`。
 

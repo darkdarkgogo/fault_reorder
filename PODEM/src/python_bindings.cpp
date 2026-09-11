@@ -86,6 +86,6 @@ PYBIND11_MODULE(cpp_podem, module) {
              py::arg("circuit_path"), py::arg("fault_map_path") = "");
   module.def("run_stuck_at_ordered", &run_stuck_at_ordered,
              py::arg("circuit_path"), py::arg("fault_map_path"),
-             py::arg("ordered_fault_ids"), py::arg("backtrack_limit") = 3000,
+             py::arg("ordered_fault_ids"), py::arg("backtrack_limit") = 5000,
              py::arg("seed") = 14);
 }
