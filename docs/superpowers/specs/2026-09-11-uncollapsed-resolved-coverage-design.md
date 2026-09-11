@@ -9,6 +9,9 @@ pattern count 只能在逐电路不低于原始覆盖率的候选之间比较，
 
 本次修改后重新开始训练；旧 `latest.pt` 和 `best.pt` 不做迁移。
 
+有序 PODEM 的 backtrack limit 从 3000 提高并固定为 5000。新训练、训练 episode、
+确定性评估和 checkpoint 恢复全部使用相同数值。
+
 ## 指标定义
 
 每个 collapsed fault 已有 `eqv_fault_num`，表示它代表的 uncollapsed fault 数量。
@@ -56,6 +59,16 @@ covered_equivalent_faults <= uncollapsed_faults
 ```
 
 缺少新字段表示 PODEM extension 尚未重新构建，应返回明确错误。
+
+## 固定 PODEM 协议
+
+`TrainConfig.backtrack_limit` 的默认值和唯一允许值改为 5000；内部创建
+`PodemEnvironment` 时也显式传入 5000。训练 CLI 继续不暴露该参数，避免不同 run
+使用不同搜索预算却被当作同一实验比较。PODEM seed 继续固定为 14，每个 fault
+仍只尝试一次。
+
+checkpoint 保存 `backtrack_limit=5000`。恢复时除既有的 artifact、solver digest
+和 PyTorch 版本检查外，还通过 config 校验拒绝其他 backtrack limit。
 
 ## 训练状态与奖励
 
@@ -122,10 +135,13 @@ checkpoint schema 版本升级。旧 checkpoint 缺少
 5. checkpoint 测试确认旧 schema 被拒绝，新 schema 可以精确恢复。
 6. 真实小电路端到端测试确认每个结果满足
    `covered_equivalent_faults <= uncollapsed_faults`，并能训练、恢复和导出 best。
+7. solver protocol 测试确认训练与评估固定使用 backtrack limit 5000、seed 14，且
+   CLI 不接受 backtrack limit 覆盖。
 
 ## 不在范围内
 
-- 不改变 PODEM backtrack limit、seed、fault dropping 或 redundant 判定算法。
+- 除把固定 backtrack limit 从 3000 提高到 5000 外，不改变 PODEM seed、fault
+  dropping 或 redundant 判定算法。
 - 不把 aborted fault 计入覆盖。
 - 不迁移旧 checkpoint，也不复用旧 best。
 - 不删除 collapsed 指标；它们继续用于诊断，但不参与覆盖门槛。
