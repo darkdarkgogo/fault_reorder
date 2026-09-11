@@ -65,7 +65,6 @@ def reward_transition(state, metrics, ema_decay):
     if valid:
         reward = state["previous_pattern_count"] - patterns
         new["previous_pattern_count"] = patterns
-        new["required_detected_equivalent_faults"] = detected
     else:
         reward = -max(state["native_pattern_count"], state["previous_pattern_count"], patterns, 1)
     advantage = (reward - state["reward_ema"]) / max(state["native_pattern_count"], 1)
@@ -332,8 +331,39 @@ class Trainer:
             print("round {}/{}: patterns={}, reward={}".format(
                 self.round, self.config.rounds, sum(r["pattern_count"] for r in episodes),
                 sum(r["raw_reward"] for r in episodes)), flush=True)
-        return evaluate_checkpoint(self.output / "best.pt", self.output / "evaluation",
-                                   environment=self.environment)
+        if self.best is not None:
+            return evaluate_checkpoint(self.output / "best.pt", self.output / "evaluation",
+                                       environment=self.environment)
+        report, exports = self.evaluate_model(self.model, self.round, self.states)
+        report = _complete_report(report, self.output / "latest.pt", self.native_metrics,
+                                  self.states, "latest")
+        _write_evaluation(self.output / "evaluation", report, exports)
+        return report
+
+
+def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind):
+    report["checkpoint"] = str(checkpoint)
+    report["checkpoint_sha256"] = _sha256(checkpoint)
+    report["checkpoint_kind"] = checkpoint_kind
+    report["native_metrics"] = native_metrics
+    report["native_pattern_total"] = sum(m["pattern_count"] for m in native_metrics.values())
+    report["pattern_reduction"] = report["native_pattern_total"] - report["totals"]["pattern_count"]
+    shortfalls = {
+        name: max(0, state["required_detected_equivalent_faults"]
+                  - report["circuits"][name]["detected_equivalent_faults"])
+        for name, state in states.items()
+    }
+    report["coverage_eligible"] = report["eligible"]
+    report["coverage_shortfall"] = sum(shortfalls.values())
+    report["coverage_shortfall_by_circuit"] = shortfalls
+    return report
+
+
+def _write_evaluation(output, report, exports):
+    output = Path(output)
+    for name, arrays in exports.items():
+        write_npz(output / (name + ".ranking.npz"), **arrays)
+    write_json(output / "summary.json", report)
 
 
 def evaluate_checkpoint(checkpoint, output, environment=None):
@@ -368,15 +398,8 @@ def evaluate_checkpoint(checkpoint, output, environment=None):
             expected = saved["evaluation"]["circuits"][name]
             if any(metrics[key] != expected[key] for key in expected if key != "seconds"):
                 raise RuntimeError("fresh best evaluation differs from saved deterministic metrics")
-        report["checkpoint"] = str(checkpoint)
-        report["checkpoint_sha256"] = _sha256(checkpoint)
-        report["native_metrics"] = saved["native_metrics"]
-        report["native_pattern_total"] = sum(m["pattern_count"] for m in saved["native_metrics"].values())
-        report["pattern_reduction"] = report["native_pattern_total"] - report["totals"]["pattern_count"]
-        output = Path(output)
-        for name, arrays in exports.items():
-            write_npz(output / (name + ".ranking.npz"), **arrays)
-        write_json(output / "summary.json", report)
+        report = _complete_report(report, checkpoint, saved["native_metrics"], saved["states"], "best")
+        _write_evaluation(output, report, exports)
         return report
     finally:
         restore_rng(rng)

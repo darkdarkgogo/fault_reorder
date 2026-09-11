@@ -50,7 +50,11 @@ def main(argv=None):
                     raise ValueError("new training requires --output")
                 trainer = Trainer.create(args.manifest, TrainConfig(**supplied), args.output)
             report = trainer.train()
-            print(json.dumps({"best_round": report["round"], "patterns": report["totals"]["pattern_count"],
+            print(json.dumps({"checkpoint_kind": report.get("checkpoint_kind", "best"),
+                              "round": report["round"],
+                              "coverage_eligible": report.get("coverage_eligible", report.get("eligible")),
+                              "coverage_shortfall": report.get("coverage_shortfall", 0),
+                              "patterns": report["totals"]["pattern_count"],
                               "pattern_reduction": report["pattern_reduction"]}, indent=2))
         else:
             output = args.output or args.checkpoint.resolve().parent / "evaluation"

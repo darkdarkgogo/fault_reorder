@@ -17,6 +17,8 @@ CUDA/PyTorch 安装源。训练所需的 16 组 fault embedding 和 pybind11 头
 `scripts/run_linux.sh` 从任意工作目录定位仓库根目录并直接训练全部 16 个电路。
 第一个可选参数是轮数，默认 100；第二个可选参数是输出目录，默认
 `runs/shared_scorer`。脚本用 `exec` 启动 Python，使终端信号直接交给训练程序。
+如果输出目录中已有 `latest.pt`，脚本自动切换为 resume；用户重复执行同一条命令
+即可续训，已达到目标轮数时直接完成最终评估。
 
 两个脚本固定调用当前 `PATH` 中的 `python3`。编译或训练失败时直接返回 Python
 命令的原始错误和非零状态。

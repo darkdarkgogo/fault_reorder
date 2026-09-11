@@ -168,8 +168,9 @@ advantage = (raw_reward - reward_ema) / max(native_pattern_count, 1)
 probability 传播。
 
 每个电路还保存 `required_detected_equivalent_faults`。它从原始顺序运行结果
-初始化；如果后续运行检测到更多 fault，则提高该值。如果某个 episode 检测到的
-fault 少于此要求，则该 episode 无效，并获得以下惩罚：
+初始化；确定性模型评估检测到更多 fault 时才提高该值。随机 episode 不能提高
+这个门槛，否则一次难以复现的随机排序可能使所有确定性 best checkpoint 失效。
+如果某个 episode 检测到的 fault 少于当前要求，则该 episode 无效，并获得以下惩罚：
 
 ```text
 raw_reward = -max(native_pattern_count,
@@ -178,8 +179,8 @@ raw_reward = -max(native_pattern_count,
                   1)
 ```
 
-无效 episode 不更新 `previous_pattern_count` 或 required detection count，防止
-learner 通过牺牲 coverage 来减少 pattern count。
+episode 不更新 required detection count；无效 episode 也不更新
+`previous_pattern_count`，防止 learner 通过牺牲 coverage 来减少 pattern count。
 
 每轮的 REINFORCE 目标为：
 
@@ -225,8 +226,10 @@ solver worker，因为预计主要耗时来自 ATPG，而不是 scorer inference
 3. total backtrack 更少。
 4. 训练轮次更早。
 
-同时保留 `latest` 和 `best` checkpoint。最终报告必须来自对 `best` 进行的一次
-全新确定性评估，不能直接采用带探索噪声的训练 episode 结果。
+同时保留 `latest` 和 `best` checkpoint。最终报告优先来自对 `best` 进行的一次
+全新确定性评估，不能直接采用带探索噪声的训练 episode 结果。如果训练结束时
+没有 coverage 合格的 best，则对 `latest` 做确定性评估并输出 coverage 缺口，
+训练命令正常结束，`best.pt` 仍保持不可用标记。
 
 ## 文件、配置与恢复
 

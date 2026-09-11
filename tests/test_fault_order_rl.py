@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from fault_order_rl.checkpoint import capture_rng, load_checkpoint
+from fault_order_rl.checkpoint import capture_rng, load_checkpoint, save_checkpoint
 from fault_order_rl.data import CircuitData, CircuitSpec, _sha256, load_circuit_data
 from fault_order_rl.environment import PodemEnvironment
 from fault_order_rl.model import FaultScorer
@@ -53,7 +53,7 @@ def test_reward_and_coverage_penalty_do_not_mutate_previous_state():
     new, reward = reward_transition(state, dict(pattern_count=15, detected_equivalent_faults=101), .9)
     assert reward == dict(raw_reward=3, advantage=.05, coverage_valid=True)
     assert new["previous_pattern_count"] == 15
-    assert new["required_detected_equivalent_faults"] == 101
+    assert new["required_detected_equivalent_faults"] == 100
     assert new["reward_ema"] == pytest.approx(2.1)
     invalid, penalty = reward_transition(state, dict(pattern_count=2, detected_equivalent_faults=99), .9)
     assert penalty == dict(raw_reward=-20, advantage=-1.1, coverage_valid=False)
@@ -173,6 +173,34 @@ def test_old_best_is_invalidated_when_detection_requirement_rises():
     assert Trainer._choose_best({'report': report}, FaultScorer(), report, states) is None
 
 
+def test_completed_training_falls_back_to_latest_when_no_best(mock_training, tmp_path):
+    manifest, env = mock_training
+    trainer = Trainer.create(manifest, TrainConfig(rounds=1), tmp_path/'run', env)
+    for state in trainer.states.values():
+        state['required_detected_equivalent_faults'] += 1
+    trainer.best = None
+    trainer.round = trainer.config.rounds
+    save_checkpoint(tmp_path/'run/latest.pt', trainer._payload())
+    trainer._publish_best()
+    resumed = Trainer.resume(tmp_path/'run/latest.pt', environment=env)
+    report = resumed.train()
+    assert report['checkpoint_kind'] == 'latest'
+    assert not report['coverage_eligible']
+    assert report['coverage_shortfall'] == len(trainer.states)
+    assert report['pattern_reduction'] == (
+        report['native_pattern_total'] - report['totals']['pattern_count'])
+    assert (tmp_path/'run/evaluation/summary.json').is_file()
+    assert not load_checkpoint(tmp_path/'run/best.pt')['available']
+    for name in trainer.states:
+        assert (tmp_path/'run/evaluation'/(name+'.ranking.npz')).is_file()
+
+
+def test_linux_run_script_auto_resumes_existing_output():
+    script = (ROOT/'scripts/run_linux.sh').read_text(encoding='utf-8')
+    assert '[[ -f "$output/latest.pt" ]]' in script
+    assert '--resume "$output/latest.pt"' in script
+
+
 def test_existing_pretrained_artifact_and_bench_provenance(tmp_path):
     directory = ROOT.parent/'artifacts/c432-v3-embeddings'
     if not directory.exists():
@@ -252,7 +280,7 @@ def test_training_seed_does_not_change_fixed_solver_protocol(mock_training, tmp_
     assert calls == [(3000, 14)]
 
 
-def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch):
+def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch, capsys):
     from fault_order_rl import __main__ as cli
     captured = {}
     fake = SimpleNamespace(train=lambda: {
@@ -271,6 +299,7 @@ def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch)
     assert result == 0
     assert captured['config'].rounds == 1
     assert captured['config'].backtrack_limit == 3000
+    assert json.loads(capsys.readouterr().out)['checkpoint_kind'] == 'best'
 
 
 def test_physical_xor_is_rejected_instead_of_crashing(tmp_path, monkeypatch):
