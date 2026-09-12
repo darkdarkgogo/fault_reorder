@@ -73,9 +73,21 @@ DeepGate2 源码和 checkpoint 导出 fault embedding。已有且校验通过的
 
 ## 训练与跨 manifest 评估
 
-训练命令继续使用现有 `Trainer`，输入
-`configs/deeptpi_itc22_train_512.json`。一轮仍表示 512 个训练电路各执行一次
-episode，best checkpoint 只根据训练 manifest 的确定性评估产生。
+训练命令输入 `configs/deeptpi_itc22_train_512.json`。一轮仍表示 512 个训练电路
+各执行一次 episode，但不再等全部电路完成后只更新一次。每轮开始时使用 checkpoint
+中保存的训练 RNG 对 512 个电路做可复现打乱，再顺序划分为 32 个 mini-batch；
+每个 mini-batch 包含 16 个电路并执行一次 optimizer step，因此每轮共更新 32 次。
+
+同一 mini-batch 的 16 个 episode 必须使用 optimizer step 前同一份 scorer 参数。
+收集完这 16 个电路的结果后，对各电路按自身 fault 数归一化的 loss contribution
+取平均，再执行梯度裁剪和参数更新。这样保持 batch 内电路等权，同时避免 NPZ 中
+按电路系列集中排列造成固定同类 batch。最后不足 16 个电路的 batch 也允许训练，
+但当前固定的 512 个电路可被 16 整除。
+
+checkpoint 仍只在完整一轮 512 个电路全部成功后原子提交；若进程在轮中失败，恢复
+时从上一完整轮重新执行，并由恢复后的 RNG 产生相同的电路顺序和采样。轮次 JSONL
+为每条 episode 记录 `batch_index`，并为每次更新记录 batch loss、梯度范数和 16 个
+电路名。best checkpoint 只根据训练 manifest 的确定性评估产生。
 
 扩展 `evaluate` 命令，允许显式传入测试 manifest：
 
@@ -153,8 +165,10 @@ NPZ 和 metrics JSON，并更新 `status.json` 中的完成/未完成列表。�
 ## 测试与验收
 
 单元测试覆盖 NPZ 选择顺序、512 上限、9 个测试电路、图到 BENCH 门映射、非法图
-拒绝、manifest split 隔离、跨 manifest checkpoint 加载和逐电路减少量计算。CSV
-测试必须包含正减少、零减少、负减少和 coverage 不合格四种情况。
+拒绝、manifest split 隔离、跨 manifest checkpoint 加载和逐电路减少量计算。训练
+测试验证 512 个电路产生 32 次更新、batch 内参数冻结、固定 RNG 的电路顺序与恢复
+一致，以及 batch loss 对 16 个电路等权。CSV 测试必须包含正减少、零减少、负减少
+和 coverage 不合格四种情况。
 
 集成测试使用少量电路完成 source BENCH、binary BENCH、fault map、embedding、
 manifest validation、一次训练和测试 manifest 评估。完整数据验收要求：
@@ -162,7 +176,8 @@ manifest validation、一次训练和测试 manifest 评估。完整数据验收
 1. train manifest 恰好有 512 个唯一电路，test manifest 恰好有 9 个唯一电路，
    两者名称无交集。
 2. 521 个电路的 BENCH、fault map、binding、embedding 和 metadata 全部通过校验。
-3. 1 轮训练只访问训练 manifest，测试结果不影响 best checkpoint。
+3. 1 轮训练只访问训练 manifest，恰好执行 32 次 mini-batch 更新，测试结果不影响
+   best checkpoint。
 4. 测试报告为每个已完成电路给出 native/model pattern count、减少量和 coverage。
 5. 完整评估成功时 CSV 恰好包含 9 行电路数据，并与 summary 数值一致。
 
