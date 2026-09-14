@@ -4,64 +4,92 @@
 采样排序，再调用有序 stuck-at PODEM。所有电路共享一个 scorer；一轮包含 manifest
 中每个电路各一次 episode，并进行一次等电路权重的 REINFORCE 更新。
 
+anchor-preserving 新数据使用双路径 manifest：`bench` 指向原始 BENCH，供 PODEM
+生成 catalog 和执行排序；`aig_bench` 与 `aigmap` 只用于校验 DeepGate2 embedding
+来源。这类条目不写 `faultmap`：Python wrapper 会把空字符串传给 C++，使 ATPG
+直接使用原始网表 fault。最小真实训练示例：
+
+```powershell
+C:\Users\acer\.conda\envs\d2l\python.exe -m fault_order_rl train `
+  --manifest configs\anchor_smoke_train.json `
+  --output runs\anchor-smoke --rounds 1 --evaluate-every 1 --threads 1
+```
+
 ## 本机运行
 
 Linux 脚本使用 `PATH` 中的 `python3`，不会联网、执行 `pip install`、创建 Conda
 环境或调用 sudo。仓库已经包含训练 embedding 和 pybind11 头文件。服务器需要
 已有 PyTorch、NumPy、setuptools、C++ 编译器和 Python 开发头文件。
 
-```bash
-sudo apt update
-sudo apt install build-essential python3-dev
-```
-
 运行一次构建脚本：
 
 ```bash
-chmod +x scripts/setup_linux.sh scripts/run_linux.sh
-./scripts/setup_linux.sh
+./scripts/setup_anchor_linux.sh
 ```
 
-这个脚本只执行下面这一条 Python 构建命令，生成当前 Python 3 对应的 Linux
-`cpp_podem*.so`：
+脚本先检查 Python 3.9+、`c++`、Python 开发头文件、NumPy、setuptools 和
+PyTorch，然后生成当前 Python 对应的 Linux `cpp_podem*.so`。它只使用服务器
+当前已经提供的工具和 Python 环境；缺少依赖时明确报错，不尝试获取 root 权限或
+联网安装。
 
 ```bash
 python3 PODEM/setup.py build_ext --inplace
 ```
 
-训练脚本默认运行 100 轮并写入 `runs/shared_scorer`：
+训练脚本默认在 1024 个 anchor-preserving 训练电路上运行 100 轮，并写入
+`runs/anchor_train_1024`：
 
 ```bash
-./scripts/run_linux.sh
+./scripts/run_anchor_linux.sh
 ```
 
 如果输出目录已经有 `latest.pt`，同一条命令会自动从它恢复。训练已经达到目标
 轮数时不会重复训练，只执行最终评估并打印结果。
 
-也可以指定轮数和输出目录：
+四个位置参数依次是总轮数、输出目录、PyTorch CPU 线程数和新训练使用的 circuit
+batch size：
 
 ```bash
-./scripts/run_linux.sh 200 runs/experiment-200
+./scripts/run_anchor_linux.sh 200 runs/anchor-200 1 16
 ```
+
+续训时 checkpoint 中保存的线程数和 batch size 不允许改变，脚本只使用前两个参数
+定位 checkpoint 并延长目标轮数。
 
 断点续训；可选的第二个参数表示总目标轮数：
 
 ```bash
 python3 -m fault_order_rl train \
-  --resume runs/shared_scorer/latest.pt --rounds 200
+  --resume runs/anchor_train_1024/latest.pt --rounds 200
 ```
 
-重新评估 best 并导出排名：
+默认使用 6 个 validation 电路重新评估 best 并导出排名：
 
 ```bash
-python3 -m fault_order_rl evaluate \
-  --checkpoint runs/shared_scorer/best.pt
+./scripts/evaluate_anchor_linux.sh runs/anchor_train_1024
 ```
 
-`configs/all_benchmarks.json` 包含 16 个内置二值电路；`smoke_benchmarks.json`
-只包含 c432 和 c499。路径均相对于 manifest 所在目录，并指向仓库中的
-`training_data/fault-order-embeddings`。服务器无需 DeepGate2 源码、预训练权重或
-联网下载。缺少这些文件说明仓库没有更新完整，应重新执行 `git pull origin main`。
+第二个参数可以指定整体验证或单电路 manifest，第三个参数可以指定输出目录：
+
+```bash
+./scripts/evaluate_anchor_linux.sh \
+  runs/anchor_train_1024 \
+  configs/anchor_validation_single/b12_C.json \
+  runs/anchor_train_1024/evaluation-b12
+```
+
+`configs/anchor_train_1024.json` 包含 1024 个训练电路；
+`configs/anchor_validation_6.json` 包含 6 个验证电路；
+`configs/anchor_smoke_train.json` 用于快速检查链路。路径均相对于 manifest 所在
+目录。服务器无需 DeepGate2 源码、预训练权重或联网下载。
+
+完整校验不会信任生成机器的 Windows 绝对路径，而是以当前仓库文件位置和内容哈希
+为准；fault ID、anchor、embedding row、数量和向量数值仍严格核对：
+
+```bash
+python3 scripts/generate_anchor_aig.py --check-only
+python3 -m fault_order_rl validate --manifest configs/anchor_train_1024.json
+```
 
 物理 XOR/EQV 门需要先展开为 PODEM 支持的门；内置二值电路已经使用这种形式。
 逻辑 XOR 输入 fault 仍通过 V3 map 保留。直接把未展开的 XOR 门交给有序

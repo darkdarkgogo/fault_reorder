@@ -16,6 +16,7 @@ DEFAULT_CHECKPOINT = DEFAULT_SOURCE / "deepgate" / "pretrained" / "model.pth"
 OFFICIAL_REVISION = "173db7529cefc97f7b9b2b3fa97ec1bd5773754d"
 OFFICIAL_CHECKPOINT_SHA256 = "9bc4a0c1f8fc57cc3aa0498dd8737af561ca71c26ca5332288d12a91a308f4d5"
 OFFICIAL_SOURCE_SHA256 = "b88833d4bf6979909e33f92b76fb0101e66a6dcdc12ec3b539d0b4a3fa19312c"
+_MODEL_CACHE = {}
 
 
 def source_digest(source):
@@ -89,23 +90,27 @@ def infer_gate_embeddings(graph, checkpoint=DEFAULT_CHECKPOINT, source=DEFAULT_S
         np.random.seed(seed)
         torch.set_num_threads(1)
         torch.use_deterministic_algorithms(True)
-        model = model_module.Model()
-        # Upstream load() silently replaces missing or mismatched tensors with
-        # random values. This export requires the complete official checkpoint.
-        try:
-            saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        except TypeError:  # PyTorch before 2.0, including the project's d2l env.
-            saved = torch.load(checkpoint, map_location="cpu")
-        if not isinstance(saved, dict) or not isinstance(saved.get("state_dict"), dict):
-            raise ValueError("Checkpoint must contain a state_dict")
-        state = {}
-        for key, tensor in saved["state_dict"].items():
-            key = key[7:] if key.startswith("module.") else key
-            if key in state:
-                raise ValueError(f"Duplicate checkpoint parameter {key}")
-            state[key] = tensor
-        model.load_state_dict(state, strict=True)
-        model.eval()
+        cache_key = (str(checkpoint), str(source), checkpoint_sha, current_source_sha)
+        model = _MODEL_CACHE.get(cache_key)
+        if model is None:
+            model = model_module.Model()
+            # Upstream load() silently replaces missing or mismatched tensors with
+            # random values. This export requires the complete official checkpoint.
+            try:
+                saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            except TypeError:  # PyTorch before 2.0, including the project's d2l env.
+                saved = torch.load(checkpoint, map_location="cpu")
+            if not isinstance(saved, dict) or not isinstance(saved.get("state_dict"), dict):
+                raise ValueError("Checkpoint must contain a state_dict")
+            state = {}
+            for key, tensor in saved["state_dict"].items():
+                key = key[7:] if key.startswith("module.") else key
+                if key in state:
+                    raise ValueError(f"Duplicate checkpoint parameter {key}")
+                state[key] = tensor
+            model.load_state_dict(state, strict=True)
+            model.eval()
+            _MODEL_CACHE[cache_key] = model
         kinds = {"INPUT": 0, "AND": 1, "NOT": 2}
         nodes = graph["nodes"]
         edge_index = torch.tensor(graph["edges"], dtype=torch.long).reshape(-1, 2).T.contiguous()

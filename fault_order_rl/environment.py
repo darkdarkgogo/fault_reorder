@@ -47,7 +47,7 @@ class PodemEnvironment:
     def catalog(self, bench_path, faultmap_path):
         self._check_files(bench_path, faultmap_path)
         return dict(
-            self.module.catalog_stuck_at(str(bench_path), str(faultmap_path))
+            self.module.catalog_stuck_at(str(bench_path), self._faultmap_argument(faultmap_path))
         )
 
     def run(self, bench_path, faultmap_path, ordered_fault_ids):
@@ -55,7 +55,7 @@ class PodemEnvironment:
         raw = dict(
             self.module.run_stuck_at_ordered(
                 str(bench_path),
-                str(faultmap_path),
+                self._faultmap_argument(faultmap_path),
                 list(ordered_fault_ids),
                 self.backtrack_limit,
                 self.seed,
@@ -83,6 +83,12 @@ class PodemEnvironment:
 
     @staticmethod
     def _check_files(bench_path, faultmap_path):
-        for path in (bench_path, faultmap_path):
+        for path in (bench_path,):
             if not Path(path).is_file():
                 raise ValueError("missing PODEM input: {}".format(path))
+        if faultmap_path is not None and not Path(faultmap_path).is_file():
+            raise ValueError("missing PODEM input: {}".format(faultmap_path))
+
+    @staticmethod
+    def _faultmap_argument(faultmap_path):
+        return "" if faultmap_path is None else str(faultmap_path)

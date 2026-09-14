@@ -1,7 +1,9 @@
 """CPU listwise REINFORCE with transactional rounds and coverage guards."""
 
 import copy
+import csv
 from dataclasses import asdict, dataclass
+import io
 import json
 import math
 from pathlib import Path
@@ -34,6 +36,8 @@ class TrainConfig:
     seed: int = 14
     backtrack_limit: int = 5000
     threads: int = 1
+    # Zero preserves the historical full-manifest update behavior.
+    batch_size: int = 0
 
     def validate(self):
         for key in ("rounds", "temperature_rounds", "evaluate_every", "backtrack_limit", "threads"):
@@ -48,6 +52,8 @@ class TrainConfig:
             raise ValueError("temperature_min exceeds temperature_start")
         if not 0 <= self.seed < 2**31:
             raise ValueError("seed must be in [0, 2**31)")
+        if not isinstance(self.batch_size, int) or self.batch_size < 0:
+            raise ValueError("batch_size must be a non-negative integer")
         if self.backtrack_limit != 5000:
             raise ValueError("the fault-order experiment requires backtrack_limit=5000")
 
@@ -216,6 +222,13 @@ class Trainer:
         report["eligible"] = eligible(report, states)
         return report, exports
 
+    def _round_batches(self):
+        indices = list(range(len(self.circuits)))
+        if self.config.batch_size:
+            random.shuffle(indices)
+        size = self.config.batch_size or len(indices)
+        return [indices[start:start + size] for start in range(0, len(indices), size)]
+
     @staticmethod
     def _choose_best(best, model, report, states):
         if best is not None and not eligible(best["report"], states):
@@ -233,36 +246,51 @@ class Trainer:
             temperature = self.config.temperature(number)
             states = copy.deepcopy(self.states)
             records, orders = [], {}
-            # No retained autograd graph during solver calls; this model remains
-            # unchanged until every circuit has contributed to a single update.
-            with torch.no_grad():
-                for circuit in self.circuits:
-                    order, _ = sample_permutation(self.model(circuit.embeddings), temperature)
-                    orders[circuit.name] = order.numpy()
-                    metrics, elapsed = self._run(circuit, orders[circuit.name])
-                    states[circuit.name], reward = reward_transition(
-                        states[circuit.name], metrics, self.config.ema_decay)
-                    records.append(dict(self._record("episode", circuit.name, number, metrics, elapsed),
-                                        temperature=temperature, **reward))
             candidate = copy.deepcopy(self.model)
             optimizer = self._optimizer(candidate)
             optimizer.load_state_dict(copy.deepcopy(self.optimizer.state_dict()))
-            optimizer.zero_grad()
-            for circuit, record in zip(self.circuits, records):
-                logits = centered_logits(candidate(circuit.embeddings), temperature)
-                log_prob = plackett_luce_log_prob(logits, torch.from_numpy(orders[circuit.name]))
-                loss = -record["advantage"] * log_prob / circuit.fault_count / len(self.circuits)
-                if not torch.isfinite(loss):
-                    raise RuntimeError("non-finite policy loss")
-                record["loss_contribution"] = float(loss.detach())
-                record["log_probability"] = float(log_prob.detach())
-                loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(candidate.parameters(), self.config.gradient_clip)
-            if not torch.isfinite(grad_norm):
-                raise RuntimeError("non-finite policy gradient")
-            optimizer.step()
-            if not all(torch.isfinite(p).all() for p in candidate.parameters()):
-                raise RuntimeError("non-finite model after optimizer update")
+            candidate.train()
+            for batch_index, circuit_indices in enumerate(self._round_batches()):
+                batch = [self.circuits[index] for index in circuit_indices]
+                batch_records = []
+                # Every episode in this batch sees the same parameter snapshot.
+                with torch.no_grad():
+                    for circuit in batch:
+                        order, _ = sample_permutation(candidate(circuit.embeddings), temperature)
+                        orders[circuit.name] = order.numpy()
+                        metrics, elapsed = self._run(circuit, orders[circuit.name])
+                        states[circuit.name], reward = reward_transition(
+                            states[circuit.name], metrics, self.config.ema_decay)
+                        batch_records.append(dict(
+                            self._record("episode", circuit.name, number, metrics, elapsed),
+                            temperature=temperature, batch_index=batch_index, **reward))
+                optimizer.zero_grad()
+                for circuit, record in zip(batch, batch_records):
+                    logits = centered_logits(candidate(circuit.embeddings), temperature)
+                    log_prob = plackett_luce_log_prob(
+                        logits, torch.from_numpy(orders[circuit.name]))
+                    loss = -record["advantage"] * log_prob / circuit.fault_count / len(batch)
+                    if not torch.isfinite(loss):
+                        raise RuntimeError("non-finite policy loss")
+                    record["loss_contribution"] = float(loss.detach())
+                    record["log_probability"] = float(log_prob.detach())
+                    loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    candidate.parameters(), self.config.gradient_clip)
+                if not torch.isfinite(grad_norm):
+                    raise RuntimeError("non-finite policy gradient")
+                optimizer.step()
+                if not all(torch.isfinite(p).all() for p in candidate.parameters()):
+                    raise RuntimeError("non-finite model after optimizer update")
+                records.extend(batch_records)
+                records.append({
+                    "kind": "update",
+                    "round": number,
+                    "batch_index": batch_index,
+                    "gradient_norm": float(grad_norm),
+                    "circuits": len(batch),
+                    "circuit_names": [circuit.name for circuit in batch],
+                })
             best = self.best
             if best is not None and not eligible(best["report"], states):
                 best = None
@@ -270,8 +298,6 @@ class Trainer:
                 report, _ = self.evaluate_model(candidate, number, states)
                 best = self._choose_best(best, candidate, report, states)
                 records.append({"kind": "evaluation", "report": report})
-            records.append({"kind": "update", "round": number, "gradient_norm": float(grad_norm),
-                            "circuits": len(self.circuits)})
             payload = self._payload(model=candidate, optimizer=optimizer, round_number=number,
                                     states=states, best=best)
             self._write_round(number, records, orders)
@@ -345,6 +371,27 @@ def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind
     report["native_metrics"] = native_metrics
     report["native_pattern_total"] = sum(m["pattern_count"] for m in native_metrics.values())
     report["pattern_reduction"] = report["native_pattern_total"] - report["totals"]["pattern_count"]
+    comparisons = {}
+    for name, metrics in report["circuits"].items():
+        native = native_metrics[name]
+        reduction = native["pattern_count"] - metrics["pattern_count"]
+        comparisons[name] = {
+            "circuit": name,
+            "native_pattern_count": native["pattern_count"],
+            "model_pattern_count": metrics["pattern_count"],
+            "pattern_reduction": reduction,
+            "pattern_reduction_percent": (
+                100.0 * reduction / native["pattern_count"]
+                if native["pattern_count"] else 0.0
+            ),
+            "native_covered_equivalent_faults": native["covered_equivalent_faults"],
+            "model_covered_equivalent_faults": metrics["covered_equivalent_faults"],
+            "coverage_eligible": (
+                metrics["covered_equivalent_faults"]
+                >= native["covered_equivalent_faults"]
+            ),
+        }
+    report["pattern_reduction_by_circuit"] = comparisons
     shortfalls = {
         name: max(0, state["native_covered_equivalent_faults"]
                   - report["circuits"][name]["covered_equivalent_faults"])
@@ -360,10 +407,122 @@ def _write_evaluation(output, report, exports):
     output = Path(output)
     for name, arrays in exports.items():
         write_npz(output / (name + ".ranking.npz"), **arrays)
+    rows = list(report["pattern_reduction_by_circuit"].values())
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=list(rows[0]) if rows else ["circuit"],
+                            lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    encoded = stream.getvalue().encode("utf-8")
+    atomic_write(output / "pattern_reduction_by_circuit.csv",
+                 lambda destination: destination.write(encoded))
     write_json(output / "summary.json", report)
 
 
-def evaluate_checkpoint(checkpoint, output, environment=None):
+def _evaluation_totals(results):
+    keys = (
+        "pattern_count", "detected_equivalent_faults", "detected_collapsed_faults",
+        "redundant_equivalent_faults", "covered_equivalent_faults",
+        "uncollapsed_faults", "podem_calls", "total_backtracks",
+        "aborted_faults", "redundant_faults",
+    )
+    totals = {key: sum(result[key] for result in results.values()) for key in keys}
+    totals["fault_coverage"] = (
+        totals["covered_equivalent_faults"] / totals["uncollapsed_faults"]
+        if totals["uncollapsed_faults"] else 0.0
+    )
+    return totals
+
+
+def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment):
+    trainer = Trainer(manifest, TrainConfig(**saved["config"]), output, environment)
+    if saved["solver_digest"] != trainer.solver_digest:
+        raise ValueError("checkpoint PODEM binary changed")
+    if saved["torch_version"] != str(torch.__version__):
+        raise ValueError("checkpoint PyTorch version changed; evaluation is not reproducible")
+    trainer.model.load_state_dict(saved["model"])
+    output = Path(output).resolve()
+    checkpoint_digest = _sha256(checkpoint)
+    identity = {
+        "checkpoint_sha256": checkpoint_digest,
+        "evaluation_manifest_digest": trainer.manifest.digest,
+        "artifacts": trainer.provenance,
+        "solver_digest": trainer.solver_digest,
+    }
+    status_path = output / "status.json"
+    completed = []
+    if status_path.is_file():
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        if status.get("identity") != identity:
+            raise ValueError("evaluation output belongs to a different checkpoint or manifest")
+        completed = list(status.get("completed", []))
+    elif output.exists() and any(output.iterdir()):
+        raise ValueError("evaluation output is non-empty and has no resumable status")
+
+    results, native_metrics = {}, {}
+    circuit_names = [circuit.name for circuit in trainer.circuits]
+    completed_set = set(completed)
+    unknown = completed_set - set(circuit_names)
+    if unknown:
+        raise ValueError("evaluation status contains unknown circuits")
+    for circuit in trainer.circuits:
+        metrics_path = output / "circuits" / (circuit.name + ".metrics.json")
+        ranking_path = output / (circuit.name + ".ranking.npz")
+        if circuit.name in completed_set:
+            if not metrics_path.is_file() or not ranking_path.is_file():
+                raise ValueError("completed evaluation artifact is missing: " + circuit.name)
+            saved_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            if saved_metrics.get("identity") != identity:
+                raise ValueError("circuit metrics identity changed: " + circuit.name)
+            native_metrics[circuit.name] = saved_metrics["native"]
+            results[circuit.name] = saved_metrics["model"]
+            continue
+
+        native, native_elapsed = trainer._run(
+            circuit, np.arange(circuit.fault_count, dtype=np.int64))
+        native = dict(native, seconds=native_elapsed)
+        trainer.model.eval()
+        with torch.no_grad():
+            scores = trainer.model(circuit.embeddings)
+            order = deterministic_permutation(scores).numpy()
+        model_metrics, model_elapsed = trainer._run(circuit, order)
+        model_metrics = dict(model_metrics, seconds=model_elapsed)
+        ranks = np.empty(circuit.fault_count, dtype=np.int64)
+        ranks[order] = np.arange(1, circuit.fault_count + 1)
+        write_npz(ranking_path, fault_ids=np.asarray(circuit.fault_ids),
+                  scores=scores.numpy(), ranks=ranks, permutation=order)
+        write_json(metrics_path, {"identity": identity, "native": native,
+                                  "model": model_metrics})
+        native_metrics[circuit.name] = native
+        results[circuit.name] = model_metrics
+        completed.append(circuit.name)
+        completed_set.add(circuit.name)
+        write_json(status_path, {
+            "identity": identity,
+            "complete": False,
+            "completed": completed,
+            "pending": [name for name in circuit_names if name not in completed_set],
+        })
+
+    states = {
+        name: {"native_covered_equivalent_faults": metrics["covered_equivalent_faults"]}
+        for name, metrics in native_metrics.items()
+    }
+    report = {"round": saved["round"], "circuits": results,
+              "totals": _evaluation_totals(results)}
+    report["eligible"] = eligible(report, states)
+    report["training_manifest"] = saved["manifest_path"]
+    report["training_manifest_digest"] = saved["manifest_digest"]
+    report["evaluation_manifest"] = str(trainer.manifest.path)
+    report["evaluation_manifest_digest"] = trainer.manifest.digest
+    report = _complete_report(report, checkpoint, native_metrics, states, "best")
+    _write_evaluation(output, report, {})
+    write_json(status_path, {"identity": identity, "complete": True,
+                             "completed": circuit_names, "pending": []})
+    return report
+
+
+def evaluate_checkpoint(checkpoint, output, environment=None, manifest=None):
     checkpoint = Path(checkpoint).resolve()
     saved = load_checkpoint(checkpoint)
     if saved.get("kind") != "best" or not saved.get("available"):
@@ -385,6 +544,9 @@ def evaluate_checkpoint(checkpoint, output, environment=None):
                 raise ValueError("best.pt is stale relative to latest.pt; resume latest.pt once to repair it")
     rng = capture_rng()
     try:
+        if manifest is not None:
+            return _evaluate_external_manifest(
+                saved, checkpoint, output, manifest, environment)
         trainer = Trainer(saved["manifest_path"], TrainConfig(**saved["config"]), output, environment)
         trainer._check_compatibility(saved)
         trainer.model.load_state_dict(saved["model"])

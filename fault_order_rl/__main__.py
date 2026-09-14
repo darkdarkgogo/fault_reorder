@@ -27,6 +27,8 @@ def main(argv=None):
         train.add_argument("--" + name.replace("_", "-"), type=type(value), default=None)
     evaluate = commands.add_parser("evaluate", help="Fresh deterministic best evaluation and rank export")
     evaluate.add_argument("--checkpoint", type=Path, required=True)
+    evaluate.add_argument("--manifest", type=Path,
+                          help="Evaluate the checkpoint on a separate manifest")
     evaluate.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     try:
@@ -57,8 +59,14 @@ def main(argv=None):
                               "patterns": report["totals"]["pattern_count"],
                               "pattern_reduction": report["pattern_reduction"]}, indent=2))
         else:
-            output = args.output or args.checkpoint.resolve().parent / "evaluation"
-            report = evaluate_checkpoint(args.checkpoint, output)
+            if args.output is not None:
+                output = args.output
+            elif args.manifest is not None:
+                output = (args.checkpoint.resolve().parent
+                          / ("evaluation-" + args.manifest.stem))
+            else:
+                output = args.checkpoint.resolve().parent / "evaluation"
+            report = evaluate_checkpoint(args.checkpoint, output, manifest=args.manifest)
             print(json.dumps(report["totals"], indent=2))
     except KeyboardInterrupt:
         print("Interrupted; resume from the last committed latest.pt.", file=sys.stderr)

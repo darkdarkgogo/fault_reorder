@@ -12,11 +12,21 @@ import pytest
 import torch
 
 from fault_order_rl.checkpoint import capture_rng, load_checkpoint, save_checkpoint
-from fault_order_rl.data import CircuitData, CircuitSpec, _sha256, load_circuit_data
+from fault_order_rl.data import (
+    CircuitData, CircuitSpec, _sha256, load_circuit_data, load_manifest,
+)
 from fault_order_rl.environment import PodemEnvironment
 from fault_order_rl.model import FaultScorer
 from fault_order_rl.policy import deterministic_permutation, plackett_luce_log_prob, sample_permutation
-from fault_order_rl.trainer import TrainConfig, Trainer, eligible, evaluate_checkpoint, reward_transition
+from fault_order_rl.trainer import (
+    TrainConfig,
+    Trainer,
+    _complete_report,
+    _write_evaluation,
+    eligible,
+    evaluate_checkpoint,
+    reward_transition,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +146,48 @@ def test_shared_update_and_exact_resume(mock_training, tmp_path):
             assert sorted(arrays['ranks']) == list(range(1, len(arrays['fault_ids'])+1))
 
 
+def test_minibatch_updates_and_exact_resume(mock_training, tmp_path):
+    manifest, env = mock_training
+    config = TrainConfig(rounds=2, evaluate_every=1, batch_size=1)
+    continuous = Trainer.create(manifest, config, tmp_path/'continuous-batches', env)
+    first_records = continuous.step()
+    updates = [record for record in first_records if record['kind'] == 'update']
+    assert len(updates) == 2
+    assert {tuple(record['circuit_names']) for record in updates} == {('small',), ('larger',)}
+    assert {record['batch_index'] for record in updates} == {0, 1}
+    continuous.step()
+
+    interrupted = Trainer.create(manifest, config, tmp_path/'interrupted-batches', env)
+    interrupted.step()
+    resumed = Trainer.resume(
+        tmp_path/'interrupted-batches/latest.pt', environment=env)
+    resumed.step()
+    assert_model_equal(continuous.model.state_dict(), resumed.model.state_dict())
+    assert continuous.states == resumed.states
+
+
+def test_512_circuits_form_32_batches_of_16():
+    trainer = object.__new__(Trainer)
+    trainer.circuits = list(range(512))
+    trainer.config = SimpleNamespace(batch_size=16)
+    state = capture_rng()
+    try:
+        torch.manual_seed(14)
+        np.random.seed(14)
+        import random
+        random.seed(14)
+        first = trainer._round_batches()
+        random.seed(14)
+        second = trainer._round_batches()
+    finally:
+        from fault_order_rl.checkpoint import restore_rng
+        restore_rng(state)
+    assert len(first) == 32
+    assert all(len(batch) == 16 for batch in first)
+    assert sorted(index for batch in first for index in batch) == list(range(512))
+    assert first == second
+
+
 def test_failed_round_preserves_checkpoint_model_baselines_and_rng(mock_training, tmp_path):
     manifest, env = mock_training
     trainer = Trainer.create(manifest, TrainConfig(rounds=2), tmp_path/'run', env)
@@ -222,10 +274,74 @@ def test_completed_training_falls_back_to_latest_when_no_best(mock_training, tmp
         assert (tmp_path/'run/evaluation'/(name+'.ranking.npz')).is_file()
 
 
+def test_evaluation_writes_per_circuit_pattern_reduction_csv(tmp_path):
+    native = {
+        'better': dict(pattern_count=10, covered_equivalent_faults=5),
+        'worse': dict(pattern_count=8, covered_equivalent_faults=5),
+    }
+    states = {name: dict(native_covered_equivalent_faults=5) for name in native}
+    report = dict(
+        round=1,
+        eligible=True,
+        circuits={
+            'better': dict(pattern_count=7, covered_equivalent_faults=5),
+            'worse': dict(pattern_count=9, covered_equivalent_faults=5),
+        },
+        totals=dict(pattern_count=16),
+    )
+    checkpoint = tmp_path/'checkpoint.pt'
+    checkpoint.write_bytes(b'checkpoint')
+    report = _complete_report(report, checkpoint, native, states, 'best')
+    _write_evaluation(tmp_path/'evaluation', report, {})
+    csv_text = (tmp_path/'evaluation/pattern_reduction_by_circuit.csv').read_text()
+    assert 'better,10,7,3,30.0,5,5,True' in csv_text
+    assert 'worse,8,9,-1,-12.5,5,5,True' in csv_text
+    summary = json.loads((tmp_path/'evaluation/summary.json').read_text())
+    assert summary['pattern_reduction_by_circuit']['worse']['pattern_reduction'] == -1
+
+
+def test_best_can_be_evaluated_on_separate_resumable_manifest(mock_training, tmp_path):
+    manifest, env = mock_training
+    trainer = Trainer.create(
+        manifest, TrainConfig(rounds=1, evaluate_every=1), tmp_path/'run-external', env)
+    trainer.step()
+    test_manifest = tmp_path/'test-manifest.json'
+    raw = json.loads(manifest.read_text())
+    raw['purpose'] = 'external-test'
+    test_manifest.write_text(json.dumps(raw))
+    output = tmp_path/'external-evaluation'
+    report = evaluate_checkpoint(
+        tmp_path/'run-external/best.pt', output, env, manifest=test_manifest)
+    assert report['training_manifest_digest'] != report['evaluation_manifest_digest']
+    assert report['evaluation_manifest'] == str(test_manifest.resolve())
+    assert json.loads((output/'status.json').read_text())['complete'] is True
+    assert (output/'pattern_reduction_by_circuit.csv').is_file()
+    for name in ('small', 'larger'):
+        assert (output/'circuits'/(name+'.metrics.json')).is_file()
+        assert (output/(name+'.ranking.npz')).is_file()
+    resumed = evaluate_checkpoint(
+        tmp_path/'run-external/best.pt', output, env, manifest=test_manifest)
+    assert resumed['totals']['pattern_count'] == report['totals']['pattern_count']
+
+
 def test_linux_run_script_auto_resumes_existing_output():
     script = (ROOT/'scripts/run_linux.sh').read_text(encoding='utf-8')
     assert '[[ -f "$output/latest.pt" ]]' in script
     assert '--resume "$output/latest.pt"' in script
+
+
+def test_anchor_linux_scripts_are_offline_rootless_and_use_anchor_manifests():
+    setup = (ROOT/'scripts/setup_anchor_linux.sh').read_text(encoding='utf-8')
+    train = (ROOT/'scripts/run_anchor_linux.sh').read_text(encoding='utf-8')
+    evaluate = (ROOT/'scripts/evaluate_anchor_linux.sh').read_text(encoding='utf-8')
+    forbidden = ('sudo ', 'apt ', 'apt-get ', 'pip install', 'conda ')
+    assert not any(token in setup for token in forbidden)
+    assert 'PODEM/setup.py build_ext --inplace' in setup
+    assert 'configs/anchor_train_1024.json' in train
+    assert '[[ -f "$output/latest.pt" ]]' in train
+    assert '--resume "$output/latest.pt"' in train
+    assert 'configs/anchor_validation_6.json' in evaluate
+    assert '--checkpoint "$checkpoint"' in evaluate
 
 
 def test_existing_pretrained_artifact_and_bench_provenance(tmp_path):
@@ -244,7 +360,7 @@ def test_existing_pretrained_artifact_and_bench_provenance(tmp_path):
         load_circuit_data(replace(spec, bench_path=changed), catalog)
 
 
-@pytest.mark.parametrize('field,value', [('learning_rate', float('nan')), ('temperature_min', 2.), ('rounds', 0), ('backtrack_limit', 3000)])
+@pytest.mark.parametrize('field,value', [('learning_rate', float('nan')), ('temperature_min', 2.), ('rounds', 0), ('backtrack_limit', 3000), ('batch_size', -1)])
 def test_bad_training_config(field, value):
     with pytest.raises(ValueError):
         replace(TrainConfig(), **{field: value}).validate()
@@ -279,6 +395,43 @@ def test_environment_derives_uncollapsed_resolved_coverage(tmp_path, monkeypatch
     assert result['covered_equivalent_faults'] == 7
     assert result['fault_coverage'] == 1.0
     assert calls[0][3:] == (5000, 14)
+
+
+def test_environment_passes_empty_faultmap_for_original_bench(tmp_path, monkeypatch):
+    from fault_order_rl import environment as module
+    bench = tmp_path/'tiny.bench'
+    bench.write_text('INPUT(a)\nOUTPUT(a)\n')
+    calls = []
+
+    class Binding:
+        @staticmethod
+        def catalog_stuck_at(bench_path, faultmap_path):
+            calls.append((bench_path, faultmap_path))
+            return {'faults': [], 'uncollapsed_total': 0}
+
+        @staticmethod
+        def run_stuck_at_ordered(*args):
+            raise AssertionError('not used')
+
+    monkeypatch.setattr(module, 'load_cpp_podem', lambda module_dir: Binding())
+    env = PodemEnvironment(tmp_path)
+    env.catalog(bench, None)
+    assert calls == [(str(bench), '')]
+
+
+def test_anchor_preserving_manifest_loads_original_faults_without_faultmap():
+    manifest_path = ROOT/'configs/anchor_smoke_train.json'
+    if not manifest_path.is_file():
+        pytest.skip('anchor smoke manifest is unavailable')
+    manifest = load_manifest(manifest_path)
+    spec = manifest.circuits[0]
+    assert spec.faultmap_path is None
+    assert spec.bench_path.parent.name == 'train'
+    assert spec.aig_bench_path.parent.name == 'train_AIG'
+    env = PodemEnvironment(manifest.module_dir)
+    circuit = load_circuit_data(spec, env.catalog(spec.bench_path, None))
+    assert circuit.fault_count == 96
+    assert int(circuit.eqv_fault_nums.sum()) == 248
 
 
 def test_environment_rejects_binding_without_equivalent_redundant_count(tmp_path, monkeypatch):
