@@ -41,6 +41,9 @@
 - `pattern_reduction_percent = 100 * (native - model) / native`
 
 正的 `covered_fault_increase` 和 `fault_coverage_increase_percentage_points` 表示覆盖提升；正的 `pattern_reduction` 表示 pattern 减少。负值原样保留，不能截断为零。
+当 native pattern count 为零时，若模型也为零则减少比例为 `0`；若模型产生了
+pattern，则绝对减少量保留负数，百分比因除数为零在 JSON 中写 `null`、终端显示
+`N/A`，不能用 `0%` 掩盖退化。
 
 ## 输出
 

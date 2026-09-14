@@ -1,6 +1,7 @@
 """Policy math, shared updates, coverage gating and exact round recovery."""
 
 import copy
+import csv
 from dataclasses import replace
 import itertools
 import json
@@ -274,30 +275,50 @@ def test_completed_training_falls_back_to_latest_when_no_best(mock_training, tmp
         assert (tmp_path/'run/evaluation'/(name+'.ranking.npz')).is_file()
 
 
-def test_evaluation_writes_per_circuit_pattern_reduction_csv(tmp_path):
+def test_evaluation_writes_per_circuit_coverage_and_pattern_comparison(tmp_path):
     native = {
-        'better': dict(pattern_count=10, covered_equivalent_faults=5),
-        'worse': dict(pattern_count=8, covered_equivalent_faults=5),
+        'better': dict(pattern_count=10, covered_equivalent_faults=5,
+                       fault_coverage=0.5),
+        'worse': dict(pattern_count=8, covered_equivalent_faults=5,
+                      fault_coverage=0.5),
+        'zero': dict(pattern_count=0, covered_equivalent_faults=5,
+                     fault_coverage=0.5),
     }
     states = {name: dict(native_covered_equivalent_faults=5) for name in native}
     report = dict(
         round=1,
         eligible=True,
         circuits={
-            'better': dict(pattern_count=7, covered_equivalent_faults=5),
-            'worse': dict(pattern_count=9, covered_equivalent_faults=5),
+            'better': dict(pattern_count=7, covered_equivalent_faults=6,
+                           fault_coverage=0.6),
+            'worse': dict(pattern_count=9, covered_equivalent_faults=4,
+                          fault_coverage=0.4),
+            'zero': dict(pattern_count=2, covered_equivalent_faults=5,
+                         fault_coverage=0.5),
         },
-        totals=dict(pattern_count=16),
+        totals=dict(pattern_count=18),
     )
     checkpoint = tmp_path/'checkpoint.pt'
     checkpoint.write_bytes(b'checkpoint')
     report = _complete_report(report, checkpoint, native, states, 'best')
     _write_evaluation(tmp_path/'evaluation', report, {})
-    csv_text = (tmp_path/'evaluation/pattern_reduction_by_circuit.csv').read_text()
-    assert 'better,10,7,3,30.0,5,5,True' in csv_text
-    assert 'worse,8,9,-1,-12.5,5,5,True' in csv_text
+    with (tmp_path/'evaluation/comparison_by_circuit.csv').open(newline='') as stream:
+        rows = {row['circuit']: row for row in csv.DictReader(stream)}
+    assert float(rows['better']['fault_coverage_increase_percentage_points']) == pytest.approx(10)
+    assert int(rows['better']['covered_fault_increase']) == 1
+    assert int(rows['better']['pattern_reduction']) == 3
+    assert float(rows['better']['pattern_reduction_percent']) == pytest.approx(30)
+    assert int(rows['worse']['covered_fault_increase']) == -1
+    assert int(rows['worse']['pattern_reduction']) == -1
+    assert rows['worse']['coverage_eligible'] == 'False'
+    assert int(rows['zero']['pattern_reduction']) == -2
+    assert rows['zero']['pattern_reduction_percent'] == ''
     summary = json.loads((tmp_path/'evaluation/summary.json').read_text())
-    assert summary['pattern_reduction_by_circuit']['worse']['pattern_reduction'] == -1
+    comparison = summary['comparison_by_circuit']
+    assert comparison['better']['covered_fault_increase'] == 1
+    assert comparison['better']['fault_coverage_increase_percentage_points'] == pytest.approx(10)
+    assert comparison['worse']['pattern_reduction'] == -1
+    assert comparison['zero']['pattern_reduction_percent'] is None
 
 
 def test_best_can_be_evaluated_on_separate_resumable_manifest(mock_training, tmp_path):
@@ -314,14 +335,53 @@ def test_best_can_be_evaluated_on_separate_resumable_manifest(mock_training, tmp
         tmp_path/'run-external/best.pt', output, env, manifest=test_manifest)
     assert report['training_manifest_digest'] != report['evaluation_manifest_digest']
     assert report['evaluation_manifest'] == str(test_manifest.resolve())
+    assert report['checkpoint_kind'] == 'best'
     assert json.loads((output/'status.json').read_text())['complete'] is True
-    assert (output/'pattern_reduction_by_circuit.csv').is_file()
+    assert (output/'comparison_by_circuit.csv').is_file()
+    summary = json.loads((output/'summary.json').read_text())
+    assert 'totals' not in summary
+    assert 'pattern_reduction' not in summary
     for name in ('small', 'larger'):
         assert (output/'circuits'/(name+'.metrics.json')).is_file()
         assert (output/(name+'.ranking.npz')).is_file()
     resumed = evaluate_checkpoint(
         tmp_path/'run-external/best.pt', output, env, manifest=test_manifest)
     assert resumed['totals']['pattern_count'] == report['totals']['pattern_count']
+
+
+def test_latest_can_be_evaluated_on_separate_manifest(mock_training, tmp_path):
+    manifest, env = mock_training
+    trainer = Trainer.create(
+        manifest, TrainConfig(rounds=1, evaluate_every=1), tmp_path/'run-latest', env)
+    trainer.step()
+    latest_path = tmp_path/'run-latest/latest.pt'
+    latest = load_checkpoint(latest_path)
+    latest['model'] = {
+        key: torch.zeros_like(value) for key, value in latest['model'].items()
+    }
+    save_checkpoint(latest_path, latest)
+    test_manifest = tmp_path/'latest-validation.json'
+    raw = json.loads(manifest.read_text())
+    raw['purpose'] = 'latest-external-test'
+    test_manifest.write_text(json.dumps(raw))
+
+    report = evaluate_checkpoint(
+        tmp_path/'run-latest/latest.pt', tmp_path/'latest-evaluation', env,
+        manifest=test_manifest)
+
+    assert report['checkpoint_kind'] == 'latest'
+    assert report['round'] == 1
+    assert all(row['checkpoint_kind'] == 'latest'
+               for row in report['comparison_by_circuit'].values())
+    for circuit in trainer.circuits:
+        with np.load(tmp_path/'latest-evaluation'/(circuit.name+'.ranking.npz')) as arrays:
+            np.testing.assert_array_equal(
+                arrays['permutation'], np.arange(circuit.fault_count))
+        model_metrics = report['circuits'][circuit.name]
+        native_metrics = report['native_metrics'][circuit.name]
+        assert {key: value for key, value in model_metrics.items() if key != 'seconds'} == {
+            key: value for key, value in native_metrics.items() if key != 'seconds'
+        }
 
 
 def test_linux_run_script_auto_resumes_existing_output():
@@ -341,7 +401,34 @@ def test_anchor_linux_scripts_are_offline_rootless_and_use_anchor_manifests():
     assert '[[ -f "$output/latest.pt" ]]' in train
     assert '--resume "$output/latest.pt"' in train
     assert 'configs/anchor_validation_6.json' in evaluate
-    assert '--checkpoint "$checkpoint"' in evaluate
+    assert '--checkpoint "$best_checkpoint"' in evaluate
+    assert '--checkpoint "$latest_checkpoint"' in evaluate
+    assert '"${output_base}-best"' in evaluate
+    assert '"${output_base}-latest"' in evaluate
+
+
+def test_evaluate_cli_prints_only_per_circuit_changes(tmp_path, monkeypatch, capsys):
+    from fault_order_rl import __main__ as cli
+    comparison = {
+        'tiny': {
+            'circuit': 'tiny', 'checkpoint_kind': 'latest', 'round': 7,
+            'native_fault_coverage': 0.75, 'model_fault_coverage': 0.875,
+            'fault_coverage_increase_percentage_points': 12.5,
+            'native_pattern_count': 10, 'model_pattern_count': 8,
+            'pattern_reduction': 2, 'pattern_reduction_percent': 20.0,
+        }
+    }
+    monkeypatch.setattr(cli, 'evaluate_checkpoint',
+                        lambda *args, **kwargs: {'comparison_by_circuit': comparison})
+    result = cli.main([
+        'evaluate', '--checkpoint', str(tmp_path/'latest.pt'),
+        '--manifest', str(tmp_path/'validation.json'),
+    ])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert 'circuit\tcheckpoint\tround\tnative_cov\tmodel_cov\tcov_delta_pp' in output
+    assert 'tiny\tlatest\t7\t75.000000%\t87.500000%\t+12.500000' in output
+    assert 'totals' not in output
 
 
 def test_existing_pretrained_artifact_and_bench_provenance(tmp_path):

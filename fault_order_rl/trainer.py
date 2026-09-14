@@ -375,23 +375,39 @@ def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind
     for name, metrics in report["circuits"].items():
         native = native_metrics[name]
         reduction = native["pattern_count"] - metrics["pattern_count"]
+        if native["pattern_count"]:
+            reduction_percent = 100.0 * reduction / native["pattern_count"]
+        elif metrics["pattern_count"] == 0:
+            reduction_percent = 0.0
+        else:
+            reduction_percent = None
+        native_coverage = native["fault_coverage"]
+        model_coverage = metrics["fault_coverage"]
+        coverage_increase = model_coverage - native_coverage
         comparisons[name] = {
             "circuit": name,
+            "checkpoint_kind": checkpoint_kind,
+            "round": report["round"],
+            "native_fault_coverage": native_coverage,
+            "model_fault_coverage": model_coverage,
+            "fault_coverage_increase": coverage_increase,
+            "fault_coverage_increase_percentage_points": 100.0 * coverage_increase,
+            "native_covered_equivalent_faults": native["covered_equivalent_faults"],
+            "model_covered_equivalent_faults": metrics["covered_equivalent_faults"],
+            "covered_fault_increase": (
+                metrics["covered_equivalent_faults"]
+                - native["covered_equivalent_faults"]
+            ),
             "native_pattern_count": native["pattern_count"],
             "model_pattern_count": metrics["pattern_count"],
             "pattern_reduction": reduction,
-            "pattern_reduction_percent": (
-                100.0 * reduction / native["pattern_count"]
-                if native["pattern_count"] else 0.0
-            ),
-            "native_covered_equivalent_faults": native["covered_equivalent_faults"],
-            "model_covered_equivalent_faults": metrics["covered_equivalent_faults"],
+            "pattern_reduction_percent": reduction_percent,
             "coverage_eligible": (
                 metrics["covered_equivalent_faults"]
                 >= native["covered_equivalent_faults"]
             ),
         }
-    report["pattern_reduction_by_circuit"] = comparisons
+    report["comparison_by_circuit"] = comparisons
     shortfalls = {
         name: max(0, state["native_covered_equivalent_faults"]
                   - report["circuits"][name]["covered_equivalent_faults"])
@@ -403,20 +419,25 @@ def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind
     return report
 
 
-def _write_evaluation(output, report, exports):
+def _write_evaluation(output, report, exports, include_aggregate=True):
     output = Path(output)
     for name, arrays in exports.items():
         write_npz(output / (name + ".ranking.npz"), **arrays)
-    rows = list(report["pattern_reduction_by_circuit"].values())
+    rows = list(report["comparison_by_circuit"].values())
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=list(rows[0]) if rows else ["circuit"],
                             lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)
     encoded = stream.getvalue().encode("utf-8")
-    atomic_write(output / "pattern_reduction_by_circuit.csv",
+    atomic_write(output / "comparison_by_circuit.csv",
                  lambda destination: destination.write(encoded))
-    write_json(output / "summary.json", report)
+    summary = copy.deepcopy(report)
+    if not include_aggregate:
+        for key in ("totals", "native_pattern_total", "pattern_reduction",
+                    "coverage_shortfall"):
+            summary.pop(key, None)
+    write_json(output / "summary.json", summary)
 
 
 def _evaluation_totals(results):
@@ -515,8 +536,8 @@ def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment
     report["training_manifest_digest"] = saved["manifest_digest"]
     report["evaluation_manifest"] = str(trainer.manifest.path)
     report["evaluation_manifest_digest"] = trainer.manifest.digest
-    report = _complete_report(report, checkpoint, native_metrics, states, "best")
-    _write_evaluation(output, report, {})
+    report = _complete_report(report, checkpoint, native_metrics, states, saved["kind"])
+    _write_evaluation(output, report, {}, include_aggregate=False)
     write_json(status_path, {"identity": identity, "complete": True,
                              "completed": circuit_names, "pending": []})
     return report
@@ -525,13 +546,16 @@ def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment
 def evaluate_checkpoint(checkpoint, output, environment=None, manifest=None):
     checkpoint = Path(checkpoint).resolve()
     saved = load_checkpoint(checkpoint)
-    if saved.get("kind") != "best" or not saved.get("available"):
+    checkpoint_kind = saved.get("kind")
+    if checkpoint_kind not in ("best", "latest"):
+        raise ValueError("evaluation requires a best.pt or latest.pt checkpoint")
+    if checkpoint_kind == "best" and not saved.get("available"):
         raise ValueError("no coverage-eligible best checkpoint; continue training from latest.pt")
     # latest.pt is the commit point. A crash between committing latest and
     # publishing its derived best file must never permit a stale standalone
     # evaluation with obsolete coverage requirements.
     latest_path = checkpoint.parent / "latest.pt"
-    if latest_path.is_file():
+    if checkpoint_kind == "best" and latest_path.is_file():
         latest = load_checkpoint(latest_path)
         if latest.get("run_id") == saved.get("run_id"):
             expected = latest.get("best")
@@ -551,13 +575,15 @@ def evaluate_checkpoint(checkpoint, output, environment=None, manifest=None):
         trainer._check_compatibility(saved)
         trainer.model.load_state_dict(saved["model"])
         report, exports = trainer.evaluate_model(trainer.model, saved["round"], saved["states"])
-        if not report["eligible"]:
+        if checkpoint_kind == "best" and not report["eligible"]:
             raise RuntimeError("fresh best evaluation failed coverage requirements")
-        for name, metrics in report["circuits"].items():
-            expected = saved["evaluation"]["circuits"][name]
-            if any(metrics[key] != expected[key] for key in expected if key != "seconds"):
-                raise RuntimeError("fresh best evaluation differs from saved deterministic metrics")
-        report = _complete_report(report, checkpoint, saved["native_metrics"], saved["states"], "best")
+        if checkpoint_kind == "best":
+            for name, metrics in report["circuits"].items():
+                expected = saved["evaluation"]["circuits"][name]
+                if any(metrics[key] != expected[key] for key in expected if key != "seconds"):
+                    raise RuntimeError("fresh best evaluation differs from saved deterministic metrics")
+        report = _complete_report(
+            report, checkpoint, saved["native_metrics"], saved["states"], checkpoint_kind)
         _write_evaluation(output, report, exports)
         return report
     finally:

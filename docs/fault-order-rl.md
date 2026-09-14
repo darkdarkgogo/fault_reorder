@@ -63,13 +63,13 @@ python3 -m fault_order_rl train \
   --resume runs/anchor_train_1024/latest.pt --rounds 200
 ```
 
-默认使用 6 个 validation 电路重新评估 best 并导出排名：
+默认使用 6 个 validation 电路分别重新评估 best 和 latest，并导出各自排名：
 
 ```bash
 ./scripts/evaluate_anchor_linux.sh runs/anchor_train_1024
 ```
 
-第二个参数可以指定整体验证或单电路 manifest，第三个参数可以指定输出目录：
+第二个参数可以指定整体验证或单电路 manifest，第三个参数可以指定输出目录前缀：
 
 ```bash
 ./scripts/evaluate_anchor_linux.sh \
@@ -77,6 +77,13 @@ python3 -m fault_order_rl train \
   configs/anchor_validation_single/b12_C.json \
   runs/anchor_train_1024/evaluation-b12
 ```
+
+以上示例分别写入 `evaluation-b12-best` 和 `evaluation-b12-latest`。终端为每个
+checkpoint 打印逐电路表格，展示 native/model coverage、coverage 百分点变化、
+native/model pattern count、pattern 减少数和减少比例，不打印跨电路总计。每个
+输出目录的 `comparison_by_circuit.csv` 和 `summary.json` 保存同一套逐电路对比，
+验证集 summary 不写跨电路对比总计。若 native pattern count 为零而模型产生了
+pattern，绝对变化显示为负数，无法定义的减少百分比显示为 `N/A`。
 
 `configs/anchor_train_1024.json` 包含 1024 个训练电路；
 `configs/anchor_validation_6.json` 包含 6 个验证电路；
@@ -129,6 +136,10 @@ embedding 使用 CPU，单线程和确定性运算，便于精确恢复；不微
   best 时保存 latest 的确定性评估，并以 uncollapsed fault 数记录 coverage 缺口。
 - `evaluation/<circuit>.ranking.npz`：catalog 顺序的 `fault_ids`、`scores`、从 1
   开始的 `ranks`，以及从 0 开始的排序行号 `permutation`。
+
+`fault_order_rl evaluate` 可读取 `best.pt` 或 `latest.pt`。best 继续执行覆盖资格、
+陈旧派生文件和确定性复验检查；latest 只读使用最后完整轮次的模型权重，不改变其
+断点续训内容，也不要求最后一轮满足 best 的训练集覆盖门槛。
 
 每轮日志文件在提交后不修改。以 `latest.pt` 的 round 为提交界限；中断时可能有
 更高轮次的未提交日志，恢复时会重新生成这些文件。只有全部 episode、梯度更新
