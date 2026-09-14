@@ -23,7 +23,7 @@ EXPANDED_XOR_CANDIDATE_RE = re.compile(
     r"^\s*#\s*[A-Za-z0-9_.\[\]]+\s*=\s*XOR\b",
     re.IGNORECASE,
 )
-SUPPORTED_TYPES = {"AND", "OR", "NAND", "NOR", "NOT", "BUF", "XOR", "EQV"}
+SUPPORTED_TYPES = {"AND", "OR", "NAND", "NOR", "NOT", "BUF", "BUFF", "XOR", "EQV"}
 ASSOCIATIVE_TYPES = {"AND", "OR", "NAND", "NOR"}
 SYNTHETIC_PREFIX = "__smartatpg_bin_"
 
@@ -101,6 +101,8 @@ def _parse_bench(
             raise ValueError(f"Malformed BENCH record on line {line_no}: {raw_line}")
         output, gate_type, input_text = gate_match.groups()
         gate_type = gate_type.upper()
+        if gate_type == "BUF":
+            gate_type = "BUFF"
         inputs = tuple(part.strip() for part in input_text.split(",") if part.strip())
         if gate_type not in SUPPORTED_TYPES:
             raise ValueError(f"Unsupported gate type '{gate_type}' on line {line_no}.")
@@ -108,7 +110,7 @@ def _parse_bench(
             raise ValueError(f"Gate '{output}' has no inputs on line {line_no}.")
         if output in outputs:
             raise ValueError(f"Duplicate gate output '{output}' on line {line_no}.")
-        expected_fanin = 1 if gate_type in {"NOT", "BUF"} else None
+        expected_fanin = 1 if gate_type in {"NOT", "BUFF"} else None
         if expected_fanin is not None and len(inputs) != expected_fanin:
             raise ValueError(f"Gate '{output}' must have one input.")
         if gate_type in {"XOR", "EQV"} and len(inputs) != 2:
@@ -278,11 +280,11 @@ def _filter_expanded_xor_faults(
             if len(consumers) != 1:
                 break
             consumer = consumers[0]
-            if stuck_value == 0 and consumer.gate_type in {"AND", "BUF"}:
+            if stuck_value == 0 and consumer.gate_type in {"AND", "BUFF"}:
                 next_value = 0
             elif stuck_value == 0 and consumer.gate_type in {"NAND", "NOT"}:
                 next_value = 1
-            elif stuck_value == 1 and consumer.gate_type in {"OR", "BUF"}:
+            elif stuck_value == 1 and consumer.gate_type in {"OR", "BUFF"}:
                 next_value = 1
             elif stuck_value == 1 and consumer.gate_type in {"NOR", "NOT"}:
                 next_value = 0
@@ -589,7 +591,7 @@ def _verify_equivalence(
                     value = (~value) & mask
             elif gate.gate_type == "NOT":
                 value = (~inputs[0]) & mask
-            elif gate.gate_type == "BUF":
+            elif gate.gate_type == "BUFF":
                 value = inputs[0]
             elif gate.gate_type == "XOR":
                 value = inputs[0] ^ inputs[1]
@@ -747,4 +749,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

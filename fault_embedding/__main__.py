@@ -86,7 +86,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("prepare", "export"):
         sub = commands.add_parser(command)
-        sub.add_argument("--bench", type=Path, required=True, help="Binary BENCH (unary NOT/BUF accepted)")
+        sub.add_argument("--bench", type=Path, required=True, help="Binary BENCH (unary NOT/BUFF accepted)")
         sub.add_argument("--faultmap", type=Path, help="Companion V2/V3 map; defaults to BENCH with .faultmap suffix")
         sub.add_argument("--out-dir", type=Path, required=True, help="Directory with no conflicting output files")
         if command == "export":
