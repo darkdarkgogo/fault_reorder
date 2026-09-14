@@ -24,9 +24,9 @@
 
 ## Native baseline 与指标
 
-“启发式算法”在本设计中固定指 PODEM 按原始网表 native fault 顺序运行的结果。对于每个验证电路，两个 checkpoint 都各自运行并记录同一语义的 native baseline；汇总结果也由这些验证电路的 native 指标求和得到。
+“启发式算法”在本设计中固定指 PODEM 按原始网表 native fault 顺序运行的结果。对于每个验证电路，两个 checkpoint 都各自运行并记录同一语义的 native baseline。结果只按电路比较，不提供或展示将多个电路相加得到的总计变化。
 
-每个电路和全体电路总计均报告：
+每个电路均报告：
 
 - `native_covered_equivalent_faults`
 - `model_covered_equivalent_faults`
@@ -46,12 +46,12 @@
 
 每个 checkpoint 的验证目录包含：
 
-- `summary.json`：完整逐电路指标、总计指标、checkpoint 类型、轮次及来源。
+- `summary.json`：完整逐电路指标、checkpoint 类型、轮次及来源；不写跨电路对比总计。
 - `comparison_by_circuit.csv`：上述逐电路 native/model 对比字段。
 - 每个电路的排序或断点恢复文件，保持现有外部验证格式。
 - `status.json`：记录该 checkpoint 与 manifest 的身份以及已完成电路。
 
-命令行在每个 checkpoint 完成后打印一段紧凑汇总，至少包含 checkpoint 类型、轮次、native/model coverage、coverage 百分点变化、native/model pattern count、pattern 减少数和减少百分比。
+命令行在每个 checkpoint 完成后打印逐电路表格。每一行至少包含电路名、checkpoint 类型和轮次、native/model coverage、coverage 百分点变化、native/model pattern count、pattern 减少数和减少百分比。命令行和对比 CSV 不显示跨电路总计行。
 
 ## 代码边界
 
@@ -64,7 +64,7 @@
 ## 测试与验收
 
 - 单元测试覆盖 `latest.pt` 的外部 manifest 评估及其 checkpoint 类型、轮次和模型权重。
-- 单元测试验证逐电路和总计 coverage/pattern 差值，包括提升、下降和零 baseline 边界。
+- 单元测试验证逐电路 coverage/pattern 差值，包括提升、下降和零 baseline 边界，并确认对比输出没有跨电路总计行。
 - 脚本测试确认同时调用 best/latest，并写入不同目录。
 - 现有 best 评估、陈旧 best 检查、断点续训和外部验证恢复测试继续通过。
 - Linux shell 语法检查和 fault-order RL 测试集通过。
