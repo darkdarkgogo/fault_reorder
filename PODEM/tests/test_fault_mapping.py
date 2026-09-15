@@ -257,16 +257,34 @@ class FaultMappingTests(unittest.TestCase):
         self.assertEqual(set(reversed_run), expected_keys)
 
     def test_redundant_equivalent_count_uses_uncollapsed_weights(self):
-        binary = ROOT / "sample_circuits" / "c1908_binary.bench"
-        fault_map = binary.with_suffix(".faultmap")
-        catalog = cpp_podem.catalog_stuck_at(str(binary), str(fault_map))
-        fault_ids = [str(fault["fault_id"]) for fault in catalog["faults"]]
-        metrics = cpp_podem.run_stuck_at_ordered(
-            str(binary), str(fault_map), fault_ids, 5000, 14
+        _, binary, fault_map, _, catalog = self.convert(
+            "INPUT(a)\n"
+            "INPUT(b)\n"
+            "OUTPUT(y)\n"
+            "n1 = AND(a,b)\n"
+            "y = OR(a,n1)\n"
         )
+        weights = {
+            str(fault["fault_id"]): int(fault["eqv_fault_num"])
+            for fault in catalog["faults"]
+        }
+        session = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), 5000, 14
+        )
+        redundant_ids = []
+        while session.remaining_fault_ids():
+            step = session.step(session.remaining_fault_ids()[0])
+            if step["target_status"] == "redundant":
+                redundant_ids.append(step["selected_fault_id"])
+        metrics = session.result()
 
-        self.assertEqual(metrics["redundant_faults"], 36)
-        self.assertEqual(metrics["redundant_equivalent_faults"], 88)
+        self.assertTrue(redundant_ids)
+        self.assertTrue(any(weights[fault_id] > 1 for fault_id in redundant_ids))
+        self.assertEqual(metrics["redundant_faults"], len(redundant_ids))
+        self.assertEqual(
+            metrics["redundant_equivalent_faults"],
+            sum(weights[fault_id] for fault_id in redundant_ids),
+        )
 
     def test_ordered_atpg_rejects_invalid_permutations(self):
         _, binary, fault_map, _, catalog = self.convert(
