@@ -7,6 +7,8 @@
 
 #include "atpg.h"
 
+#include <unordered_set>
+
 void ATPG::configure_ordered_stuck_at(int configured_backtrack_limit,
 		int configured_seed)
 {
@@ -20,12 +22,21 @@ void ATPG::configure_ordered_stuck_at(int configured_backtrack_limit,
 	dynamic_test_compression = false;
 	static_test_compression = false;
 	print_test_vectors = false;
+	stuck_at_session_prepared = false;
+	stuck_at_total_detect_num = 0;
+	stuck_at_total_backtracks = 0;
+	stuck_at_aborted_faults = 0;
+	stuck_at_redundant_faults = 0;
+	stuck_at_redundant_equivalent_faults = 0;
+	stuck_at_podem_calls = 0;
 }
 
-ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
+void ATPG::prepare_stuck_at_session()
 {
 	if (!SAF_atpg || fsim_only || tdfsim_only || total_attempt_num != 1)
 		throw runtime_error("Ordered ATPG requires one-attempt stuck-at generation mode");
+	if (stuck_at_session_prepared)
+		return;
 
 	// Backtrace supports AND/OR/NAND/NOR/NOT/BUF, not physical XOR/EQV.
 	// Reject these before a sampled order can reach an undefined backtrace path.
@@ -37,75 +48,137 @@ ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
 	}
 
 	srand(seed);
-	int current_detect_num = 0;
-	int total_detect_num = 0;
-	int total_no_of_backtracks = 0;
-	int current_backtracks = 0;
-	int no_of_aborted_faults = 0;
-	int no_of_redundant_faults = 0;
-	int no_of_redundant_equivalent_faults = 0;
-	int no_of_calls = 0;
-	fptr fault_under_test = flist_undetect.empty() ? nullptr : flist_undetect.front();
+	stuck_at_session_prepared = true;
+}
 
-	while (fault_under_test != nullptr)
+vector<string> ATPG::get_selectable_fault_ids() const
+{
+	vector<string> result;
+	for (fptr fault : flist_undetect)
 	{
-		switch (podem(fault_under_test, current_backtracks))
-		{
-			case TRUE:
-			{
-				string vec;
-				for (wptr w : cktin)
-					vec.push_back(itoc(w->value));
-				fault_sim_a_vector(vec, current_detect_num);
-				total_detect_num += current_detect_num;
-				in_vector_no++;
-				break;
-			}
-			case FALSE:
-				fault_under_test->detect = REDUNDANT;
-				no_of_redundant_faults++;
-				no_of_redundant_equivalent_faults += fault_under_test->eqv_fault_num;
-				break;
-			case MAYBE:
-				no_of_aborted_faults++;
-				break;
-		}
-		fault_under_test->test_tried = true;
-		fault_under_test = nullptr;
-		for (fptr candidate : flist_undetect)
-		{
-			if (!candidate->test_tried)
-			{
-				fault_under_test = candidate;
-				break;
-			}
-		}
-		total_no_of_backtracks += current_backtracks;
-		no_of_calls++;
+		if (!fault->test_tried && fault->detect != REDUNDANT)
+			result.push_back(fault_identifier(fault));
 	}
+	return result;
+}
 
+ATPG::AtpgRunResult ATPG::get_stuck_at_result() const
+{
 	AtpgRunResult result;
 	result.pattern_count = in_vector_no;
-	result.detected_equivalent_faults = total_detect_num;
+	result.detected_equivalent_faults = stuck_at_total_detect_num;
 	result.uncollapsed_faults = num_of_gate_fault;
-	result.aborted_faults = no_of_aborted_faults;
-	result.redundant_faults = no_of_redundant_faults;
-	result.redundant_equivalent_faults = no_of_redundant_equivalent_faults;
-	result.podem_calls = no_of_calls;
-	result.total_backtracks = total_no_of_backtracks;
+	result.aborted_faults = stuck_at_aborted_faults;
+	result.redundant_faults = stuck_at_redundant_faults;
+	result.redundant_equivalent_faults = stuck_at_redundant_equivalent_faults;
+	result.podem_calls = stuck_at_podem_calls;
+	result.total_backtracks = stuck_at_total_backtracks;
 	for (const auto &owned_fault : flist)
 	{
 		if (owned_fault->detect == TRUE)
 			result.detected_collapsed_faults++;
 	}
+	return result;
+}
 
+ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
+{
+	prepare_stuck_at_session();
+
+	fptr known_fault = nullptr;
+	for (const auto &owned_fault : flist)
+	{
+		if (fault_identifier(owned_fault.get()) == fault_id)
+		{
+			known_fault = owned_fault.get();
+			break;
+		}
+	}
+	if (known_fault == nullptr)
+		throw runtime_error("Unknown fault ID: " + fault_id);
+
+	fptr fault_under_test = nullptr;
+	vector<string> before_ids;
+	for (fptr fault : flist_undetect)
+	{
+		before_ids.push_back(fault_identifier(fault));
+		if (fault == known_fault && !fault->test_tried && fault->detect != REDUNDANT)
+			fault_under_test = fault;
+	}
+	if (fault_under_test == nullptr)
+		throw runtime_error("Fault ID is not selectable: " + fault_id);
+
+	AtpgStepResult step;
+	step.selected_fault_id = fault_id;
+	int current_backtracks = 0;
+	const int podem_result = podem(fault_under_test, current_backtracks);
+	switch (podem_result)
+	{
+		case TRUE:
+		{
+			string vec;
+			for (wptr wire : cktin)
+				vec.push_back(itoc(wire->value));
+			int current_detect_num = 0;
+			fault_sim_a_vector(vec, current_detect_num);
+			stuck_at_total_detect_num += current_detect_num;
+			in_vector_no++;
+			step.target_status = "detected";
+			step.generated_pattern = true;
+			break;
+		}
+		case FALSE:
+			fault_under_test->detect = REDUNDANT;
+			stuck_at_redundant_faults++;
+			stuck_at_redundant_equivalent_faults += fault_under_test->eqv_fault_num;
+			step.target_status = "redundant";
+			break;
+		case MAYBE:
+			stuck_at_aborted_faults++;
+			step.target_status = "aborted";
+			break;
+		default:
+			throw runtime_error("PODEM returned an unsupported status");
+	}
+	fault_under_test->test_tried = true;
+	stuck_at_total_backtracks += current_backtracks;
+	stuck_at_podem_calls++;
+
+	const vector<string> undetected_ids = [&]() {
+		vector<string> ids;
+		for (fptr fault : flist_undetect)
+			ids.push_back(fault_identifier(fault));
+		return ids;
+	}();
+	const unordered_set<string> after_set(undetected_ids.begin(), undetected_ids.end());
+	for (const string &identifier : before_ids)
+	{
+		if (after_set.find(identifier) == after_set.end())
+			step.newly_detected_fault_ids.push_back(identifier);
+	}
+	step.remaining_fault_ids = get_selectable_fault_ids();
+	step.cumulative_result = get_stuck_at_result();
+	return step;
+}
+
+ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
+{
+	prepare_stuck_at_session();
+	vector<string> selectable = get_selectable_fault_ids();
+	while (!selectable.empty())
+	{
+		step_stuck_at(selectable.front());
+		selectable = get_selectable_fault_ids();
+	}
+
+	const AtpgRunResult result = get_stuck_at_result();
 	if (print_report)
 	{
 		display_undetect();
-		fprintf(stdout, "\n#number of aborted faults = %d\n", no_of_aborted_faults);
-		fprintf(stdout, "\n#number of redundant faults = %d\n", no_of_redundant_faults);
-		fprintf(stdout, "\n#number of calling podem1 = %d\n", no_of_calls);
-		fprintf(stdout, "\n#total number of backtracks = %d\n", total_no_of_backtracks);
+		fprintf(stdout, "\n#number of aborted faults = %d\n", result.aborted_faults);
+		fprintf(stdout, "\n#number of redundant faults = %d\n", result.redundant_faults);
+		fprintf(stdout, "\n#number of calling podem1 = %d\n", result.podem_calls);
+		fprintf(stdout, "\n#total number of backtracks = %d\n", result.total_backtracks);
 	}
 	return result;
 }

@@ -285,6 +285,46 @@ class FaultMappingTests(unittest.TestCase):
                         str(binary), str(fault_map), ordered
                     )
 
+    def test_incremental_session_matches_native_complete_run(self):
+        _, binary, fault_map, _, catalog = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\ny = AND(a,b,c)\n"
+        )
+        ids = [str(item["fault_id"]) for item in catalog["faults"]]
+        expected = cpp_podem.run_stuck_at_ordered(
+            str(binary), str(fault_map), ids, 5000, 14
+        )
+        session = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), 5000, 14
+        )
+        self.assertEqual(
+            [str(item["fault_id"]) for item in session.catalog()["faults"]],
+            ids,
+        )
+        seen = []
+        while session.remaining_fault_ids():
+            selected = session.remaining_fault_ids()[0]
+            before = set(session.remaining_fault_ids())
+            step = session.step(selected)
+            seen.append(selected)
+            self.assertEqual(step["selected_fault_id"], selected)
+            self.assertLess(set(step["remaining_fault_ids"]), before)
+        self.assertTrue(seen)
+        self.assertEqual(session.result(), expected)
+
+    def test_incremental_session_rejects_non_selectable_fault(self):
+        _, binary, fault_map, _, catalog = self.convert(
+            "INPUT(a)\nOUTPUT(y)\ny = BUF(a)\n"
+        )
+        fault_id = str(catalog["faults"][0]["fault_id"])
+        session = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), 5000, 14
+        )
+        session.step(fault_id)
+        with self.assertRaisesRegex(RuntimeError, "not selectable"):
+            session.step(fault_id)
+        with self.assertRaisesRegex(RuntimeError, "Unknown fault ID"):
+            session.step("missing:GO:sa0")
+
 
 if __name__ == "__main__":
     unittest.main()

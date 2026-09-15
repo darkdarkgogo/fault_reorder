@@ -85,6 +85,15 @@ public:
 		int podem_calls{};
 		int total_backtracks{};
 	};
+	struct AtpgStepResult
+	{
+		string selected_fault_id;
+		string target_status;
+		bool generated_pattern{};
+		vector<string> newly_detected_fault_ids;
+		vector<string> remaining_fault_ids;
+		AtpgRunResult cumulative_result;
+	};
 
 	ATPG();
 
@@ -138,6 +147,9 @@ public:
 	/* defined in atpg.cpp */
 	void test();
 	void configure_ordered_stuck_at(int backtrack_limit, int seed);
+	vector<string> get_selectable_fault_ids() const;
+	AtpgStepResult step_stuck_at(const string &fault_id);
+	AtpgRunResult get_stuck_at_result() const;
 	AtpgRunResult run_stuck_at(bool print_report = false);
 	vector<int> cc0, cc1, co;
 
@@ -176,6 +188,14 @@ private:
 	bool fsim_only;				 /* flag to indicate fault simulation only */
 	bool tdfsim_only;			 /* flag to indicate tdfault simulation only */
 	int fault_num;
+	bool stuck_at_session_prepared{};
+	int stuck_at_total_detect_num{};
+	int stuck_at_total_backtracks{};
+	int stuck_at_aborted_faults{};
+	int stuck_at_redundant_faults{};
+	int stuck_at_redundant_equivalent_faults{};
+	int stuck_at_podem_calls{};
+	void prepare_stuck_at_session();
 
 	/* used in input.cpp to parse circuit*/
 	int debug;				 /* != 0 if debugging;  this is a switch of debug mode */
