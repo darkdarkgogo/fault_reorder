@@ -1,7 +1,9 @@
-"""Gumbel/Plackett-Luce listwise ranking operations."""
+"""Dynamic categorical actions and legacy listwise ranking operations."""
 
 import numpy as np
 import torch
+
+from fault_order_rl.model import build_dynamic_features
 
 
 def centered_logits(scores, temperature):
@@ -11,7 +13,48 @@ def centered_logits(scores, temperature):
         raise ValueError("scores contain non-finite values")
     if not np.isfinite(temperature) or temperature <= 0:
         raise ValueError("temperature must be finite and positive")
-    return (scores - scores.mean()) / float(temperature)
+    logits = (scores - scores.mean()) / float(temperature)
+    if not torch.isfinite(logits).all():
+        raise ValueError("temperature-scaled logits contain non-finite values")
+    return logits
+
+
+def select_categorical_action(scores, remaining_rows, temperature, stochastic,
+                              generator=None):
+    """Select a catalog row from current candidates, with stable evaluation ties."""
+    logits = centered_logits(scores, temperature)
+    rows = torch.as_tensor(remaining_rows, device=scores.device)
+    if rows.ndim != 1 or rows.numel() != scores.numel():
+        raise ValueError("remaining rows must match the one-dimensional scores")
+    if rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        raise ValueError("remaining rows must contain integer indices")
+    if (rows < 0).any() or torch.unique(rows).numel() != rows.numel():
+        raise ValueError("remaining rows must be non-negative and unique")
+    if stochastic:
+        local = torch.multinomial(torch.softmax(logits, 0), 1,
+                                  generator=generator).item()
+    else:
+        maximum = torch.max(scores)
+        tied_rows = rows[scores == maximum]
+        return int(torch.min(tied_rows).item())
+    return int(rows[local].item())
+
+
+def trajectory_log_prob(model, embeddings, decisions, temperature):
+    """Replay saved remaining sets under autograd and sum categorical log-probs."""
+    if not decisions:
+        raise ValueError("trajectory must contain at least one decision")
+    step_log_probs = []
+    for decision in decisions:
+        rows = torch.as_tensor(decision["remaining_rows"], device=embeddings.device)
+        features = build_dynamic_features(embeddings, rows)
+        selected = decision["selected_row"]
+        local_indices = (rows == selected).nonzero(as_tuple=True)[0]
+        if local_indices.numel() != 1:
+            raise ValueError("selected row must occur exactly once in remaining rows")
+        logits = centered_logits(model(features), temperature)
+        step_log_probs.append(torch.log_softmax(logits, 0)[local_indices[0]])
+    return torch.stack(step_log_probs).sum()
 
 
 def sample_permutation(scores, temperature, generator=None):

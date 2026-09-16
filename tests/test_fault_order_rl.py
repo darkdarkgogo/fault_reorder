@@ -17,8 +17,11 @@ from fault_order_rl.data import (
     CircuitData, CircuitSpec, _sha256, load_circuit_data, load_manifest,
 )
 from fault_order_rl.environment import PodemEnvironment
-from fault_order_rl.model import FaultScorer
-from fault_order_rl.policy import deterministic_permutation, plackett_luce_log_prob, sample_permutation
+from fault_order_rl.model import FaultScorer, build_dynamic_features
+from fault_order_rl.policy import (
+    centered_logits, deterministic_permutation, plackett_luce_log_prob,
+    sample_permutation, select_categorical_action, trajectory_log_prob,
+)
 from fault_order_rl.trainer import (
     TrainConfig,
     Trainer,
@@ -31,6 +34,83 @@ from fault_order_rl.trainer import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_dynamic_features_append_remaining_mean_and_ratio():
+    embeddings = torch.arange(4 * 257, dtype=torch.float32).reshape(4, 257)
+    unchanged = embeddings.clone()
+    rows = torch.tensor([1, 3])
+    features = build_dynamic_features(embeddings, rows)
+    assert features.shape == (2, 515)
+    assert torch.equal(features[:, :257], embeddings[rows])
+    mean = embeddings[rows].mean(dim=0)
+    assert torch.equal(features[:, 257:514], mean.expand(2, -1))
+    assert torch.equal(features[:, 514], torch.full((2,), 0.5))
+    assert torch.equal(embeddings, unchanged)
+
+
+@pytest.mark.parametrize('rows', [[], [1, 1], [-1], [4], [[1, 2]]])
+def test_dynamic_features_reject_invalid_rows(rows):
+    with pytest.raises(ValueError):
+        build_dynamic_features(torch.zeros(4, 257), rows)
+
+
+def test_dynamic_scorer_requires_515_features():
+    model = FaultScorer()
+    assert model(torch.zeros(2, 515)).shape == (2,)
+    with pytest.raises(ValueError, match='515'):
+        model(torch.zeros(2, 257))
+
+
+def test_categorical_action_samples_only_remaining_and_reproduces_seed():
+    scores = torch.tensor([0.2, 1.0, -0.5])
+    rows = (5, 2, 8)
+    first = select_categorical_action(scores, rows, 0.7, stochastic=True,
+                                      generator=torch.Generator().manual_seed(12))
+    second = select_categorical_action(scores, rows, 0.7, stochastic=True,
+                                       generator=torch.Generator().manual_seed(12))
+    assert first == second
+    assert first in rows
+    assert select_categorical_action(scores, rows, 0.7, stochastic=False) == 2
+    assert select_categorical_action(torch.tensor([1., 1., 0.]), rows, 0.7,
+                                     stochastic=False) == 2
+
+
+@pytest.mark.parametrize('scores,rows,temperature', [
+    (torch.tensor([0., float('nan')]), (0, 1), 1.),
+    (torch.tensor([0., 1.]), (0, 1), 0.),
+    (torch.tensor([0., 1.]), (0, 0), 1.),
+    (torch.tensor([0., 1.]), (0,), 1.),
+])
+def test_categorical_action_rejects_invalid_input(scores, rows, temperature):
+    with pytest.raises(ValueError):
+        select_categorical_action(scores, rows, temperature, stochastic=False)
+
+
+def test_dynamic_trajectory_log_prob_matches_direct_steps():
+    embeddings = torch.randn(4, 257, generator=torch.Generator().manual_seed(9))
+    model = FaultScorer()
+    decisions = [
+        {"remaining_rows": (0, 1, 2, 3), "selected_row": 2},
+        {"remaining_rows": (1, 3), "selected_row": 3},
+    ]
+    actual = trajectory_log_prob(model, embeddings, decisions, 0.7)
+    direct = []
+    for state in decisions:
+        rows = torch.tensor(state["remaining_rows"])
+        logits = centered_logits(model(build_dynamic_features(embeddings, rows)), 0.7)
+        local = state["remaining_rows"].index(state["selected_row"])
+        direct.append(torch.log_softmax(logits, 0)[local])
+    assert torch.allclose(actual, torch.stack(direct).sum())
+    actual.backward()
+    assert any(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+               and parameter.grad.abs().sum() > 0 for parameter in model.parameters())
+
+
+def test_dynamic_trajectory_rejects_selected_row_outside_remaining():
+    with pytest.raises(ValueError, match='selected row'):
+        trajectory_log_prob(FaultScorer(), torch.zeros(3, 257),
+                            [{"remaining_rows": (0, 2), "selected_row": 1}], 1.)
 
 
 def test_policy_distribution_and_gradient_match_direct_formula():
