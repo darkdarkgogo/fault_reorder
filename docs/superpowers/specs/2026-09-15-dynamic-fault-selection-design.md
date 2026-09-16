@@ -232,7 +232,7 @@ session = StuckAtSession(
     dtc_enabled=True,
     dtc_backtrack_limit=50,
     stc_enabled=True,
-    stc_seed=7,
+    stc_shuffle_seed=7,
     stc_no_improvement_limit=5,
 )
 
@@ -365,9 +365,12 @@ temperature、轨迹 RNG 状态和 session binding digest，并记录以下求�
 
 ```text
 primary_backtrack_limit = 200
+primary_seed = 14
+attempts_per_primary_fault = 1
 dtc_enabled = true
 dtc_secondary_backtrack_limit = 50
 stc_enabled = true
+stc_reverse_order_enabled = true
 stc_shuffle_seed = 7
 stc_no_improvement_limit = 5
 scoap_enabled = false
