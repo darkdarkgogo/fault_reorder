@@ -28,7 +28,7 @@
 
 ---
 
-### 任务 1：加固增量会话、固定求解协议并隔离随机数
+### Task 1: 任务 1：加固增量会话、固定求解协议并隔离随机数
 
 **涉及文件：**
 - 修改：`PODEM/src/atpg.h`
@@ -134,7 +134,7 @@ git commit -m "fix: harden incremental stuck-at sessions"
 
 ---
 
-### 任务 2：实现 Stuck-at PODEMX 动态测试压缩
+### Task 2: 任务 2：实现 Stuck-at PODEMX 动态测试压缩
 
 **涉及文件：**
 - 创建：`PODEM/src/saf_compaction.cpp`
@@ -231,7 +231,7 @@ git commit -m "feat: add stuck-at dynamic test compression"
 
 ---
 
-### 任务 3：实现确定性 Stuck-at 静态测试压缩
+### Task 3: 任务 3：实现确定性 Stuck-at 静态测试压缩
 
 **涉及文件：**
 - 修改：`PODEM/src/saf_compaction.cpp`
@@ -309,7 +309,7 @@ git commit -m "feat: compact stuck-at test patterns"
 
 ---
 
-### 任务 4：构造 515 维动态特征与类别策略
+### Task 4: 任务 4：构造 515 维动态特征与类别策略
 
 **涉及文件：**
 - 修改：`fault_order_rl/model.py`
@@ -394,7 +394,7 @@ git commit -m "feat: add dynamic fault context policy"
 
 ---
 
-### 任务 5：实现带压缩协议校验的 Python 会话环境
+### Task 5: 任务 5：实现带压缩协议校验的 Python 会话环境
 
 **涉及文件：**
 - 修改：`fault_order_rl/environment.py`
@@ -482,7 +482,7 @@ git commit -m "feat: validate compressed PODEM sessions"
 
 ---
 
-### 任务 6：实现动态训练回合与压缩后奖励
+### Task 6: 任务 6：实现动态训练回合与压缩后奖励
 
 **涉及文件：**
 - 修改：`fault_order_rl/trainer.py`
@@ -601,7 +601,7 @@ git commit -m "feat: train on compressed dynamic trajectories"
 
 ---
 
-### 任务 7：升级 Schema 3 检查点与动态确定性评估
+### Task 7: 任务 7：升级 Schema 3 检查点与动态确定性评估
 
 **涉及文件：**
 - 修改：`fault_order_rl/checkpoint.py`
@@ -682,7 +682,7 @@ git commit -m "feat: evaluate compressed dynamic trajectories"
 
 ---
 
-### 任务 8：真实求解器集成、文档和完整验证
+### Task 8: 任务 8：真实求解器集成、文档和完整验证
 
 **涉及文件：**
 - 修改：`tests/test_fault_order_rl.py`
