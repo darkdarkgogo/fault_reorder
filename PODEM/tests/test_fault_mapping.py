@@ -78,6 +78,131 @@ class FaultMappingTests(unittest.TestCase):
         self.keep_dtc_faults(fault_map, ids)
         return binary, fault_map
 
+    def complete_stc_session(self, binary, fault_map, **options):
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map), **options)
+        trace = []
+        while session.remaining_fault_ids():
+            trace.append(session.step(session.remaining_fault_ids()[0]))
+        return session, trace
+
+    def test_stc_result_does_not_finalize_while_faults_remain(self):
+        binary, fault_map = self.make_three_input_and_fixture()
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        for expected_count in (0, 1):
+            result = session.result()
+            self.assertFalse(result["finalized"])
+            self.assertEqual(result["pattern_count"], expected_count)
+            self.assertEqual(result["current_pattern_count"], expected_count)
+            self.assertEqual(result["stc_shuffle_attempts"], 0)
+            self.assertEqual(result["stc_removed_patterns"], 0)
+            self.assertEqual(session.result(), result)
+            session.step(session.remaining_fault_ids()[0])
+
+    def test_stc_reverse_finalization_preserves_statuses_and_dtc_metrics(self):
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nOUTPUT(y)\nn1 = AND(a,b)\ny = OR(a,n1)\n"
+        )
+        session, trace = self.complete_stc_session(binary, fault_map)
+        baseline, baseline_trace = self.complete_stc_session(
+            binary, fault_map, stc_enabled=False)
+        self.assertEqual(trace, baseline_trace)
+        self.assertEqual([step["generated_test_vector"] for step in trace
+                          if step["generated_pattern"]], ["10", "00", "01"])
+        self.assertFalse(trace[-1]["finalized"])
+        before = baseline.result()
+        self.assertTrue(before["finalized"])
+        self.assertEqual(before["patterns_before_stc"], 3)
+        self.assertEqual(before["patterns_after_stc"], 3)
+        self.assertEqual(before["stc_shuffle_attempts"], 0)
+        self.assertEqual(before["stc_removed_patterns"], 0)
+        first = session.result()
+        self.assertTrue(first["finalized"])
+        self.assertEqual(first, session.result())
+        self.assertEqual(first["patterns_before_stc"], 3)
+        self.assertEqual(first["current_pattern_count"], 3)
+        self.assertEqual(first["patterns_after_stc"], 2)
+        self.assertEqual(first["pattern_count"], 2)
+        self.assertEqual(first["stc_removed_patterns"], 1)
+        self.assertEqual(first["stc_shuffle_attempts"], 5)
+        self.assertTrue(first["stc_coverage_preserved"])
+        self.assertEqual(first["redundant_faults"], 2)
+        self.assertGreater(first["dtc_secondary_calls"], 0)
+        for key in ("detected_collapsed_faults", "detected_equivalent_faults",
+                    "aborted_faults", "redundant_faults", "redundant_equivalent_faults",
+                    "podem_calls", "primary_podem_calls", "dtc_secondary_calls",
+                    "total_backtracks", "primary_backtracks", "dtc_backtracks"):
+            self.assertEqual(first[key], before[key], key)
+        self.assertEqual(session.remaining_fault_ids(), [])
+        with self.assertRaisesRegex(RuntimeError, "not selectable"):
+            session.step(trace[-1]["selected_fault_id"])
+        self.assertEqual(session.result(), first)
+
+    def test_stc_shuffle_reduces_reverse_cover_and_is_deterministic(self):
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\nINPUT(d)\n"
+            "OUTPUT(w)\nOUTPUT(x)\nOUTPUT(y)\nOUTPUT(z)\n"
+            "w = BUF(a)\nx = BUF(b)\ny = BUF(c)\nz = BUF(d)\n"
+        )
+        left, left_trace = self.complete_stc_session(binary, fault_map, dtc_enabled=False)
+        right, right_trace = self.complete_stc_session(binary, fault_map, dtc_enabled=False)
+        # Reverse scanning retains all three; a shuffled scan can discard 1100.
+        self.assertEqual([step["generated_test_vector"] for step in left_trace],
+                         ["1111", "1100", "0000"])
+        self.assertEqual(left_trace, right_trace)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda s: s.result(), [left, right, left, left]))
+        self.assertEqual(results, [results[0]] * 4)
+        first = results[0]
+        self.assertEqual(first["patterns_before_stc"], 3)
+        self.assertEqual(first["patterns_after_stc"], 2)
+        self.assertGreater(first["stc_shuffle_attempts"], 5)
+        self.assertTrue(first["stc_coverage_preserved"])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            repeated = list(pool.map(lambda _: left.result(), range(8)))
+        self.assertEqual(repeated, [first] * 8)
+
+    def test_stc_finalization_preserves_aborted_faults_and_empty_vectors(self):
+        binary, fault_map = self.make_three_input_and_fixture()
+        session, trace = self.complete_stc_session(binary, fault_map, backtrack_limit=0)
+        result = session.result()
+        self.assertEqual(result["aborted_faults"], 4)
+        self.assertEqual(result["patterns_before_stc"], 1)
+        self.assertEqual(result["patterns_after_stc"], 1)
+        self.assertEqual(result["detected_collapsed_faults"], 1)
+        self.assertEqual(result["detected_equivalent_faults"], 4)
+        self.assertTrue(result["stc_coverage_preserved"])
+        for key in ("podem_calls", "total_backtracks", "aborted_faults",
+                    "detected_collapsed_faults", "detected_equivalent_faults"):
+            self.assertEqual(result[key], trace[-1][key], key)
+        # Restrict to faults whose primary searches abort before a vector exists.
+        self.keep_dtc_faults(fault_map, ["dummy_gate1:GO:sa1", "dummy_gate2:GO:sa1"])
+        session, trace = self.complete_stc_session(binary, fault_map, backtrack_limit=0)
+        self.assertEqual([step["target_status"] for step in trace], ["aborted", "aborted"])
+        result = session.result()
+        self.assertTrue(result["finalized"])
+        self.assertEqual(result["aborted_faults"], 2)
+        self.assertEqual(result["podem_calls"], 2)
+        self.assertEqual(result["pattern_count"], 0)
+        self.assertEqual(result["patterns_before_stc"], 0)
+        self.assertEqual(result["patterns_after_stc"], 0)
+        self.assertEqual(result["stc_shuffle_attempts"], 5)
+        self.assertTrue(result["stc_coverage_preserved"])
+        self.assertEqual(result, session.result())
+
+    def test_stc_finalization_keeps_expanded_xor_catalog_coverage(self):
+        _, binary, fault_map, _, catalog = self.convert(expanded_xor(True, True))
+        session, trace = self.complete_stc_session(binary, fault_map)
+        result = session.result()
+        self.assertTrue(result["finalized"])
+        self.assertTrue(result["stc_coverage_preserved"])
+        self.assertEqual(result["detected_collapsed_faults"],
+                         len({fault for step in trace for fault in step["newly_detected_fault_ids"]}))
+        weights = {fault["fault_id"]: fault["eqv_fault_num"] for fault in catalog["faults"]}
+        self.assertEqual(result["detected_equivalent_faults"], sum(
+            weights[fault] for step in trace for fault in step["newly_detected_fault_ids"]))
+        self.assertEqual(result["detected_equivalent_faults"], result["uncollapsed_faults"])
+        self.assertLessEqual(result["patterns_after_stc"], result["patterns_before_stc"])
+
     def keep_dtc_faults(self, fault_map, ids):
         lines = fault_map.read_text(encoding="ascii").splitlines()
         records = {line.split()[1]: line for line in lines if line.startswith("fault ")}
@@ -356,6 +481,9 @@ class FaultMappingTests(unittest.TestCase):
         fault_ids = [str(fault["fault_id"]) for fault in catalog["faults"]]
         expected_keys = {
             "pattern_count", "detected_collapsed_faults",
+            "current_pattern_count", "finalized", "patterns_before_stc",
+            "patterns_after_stc", "stc_removed_patterns", "stc_shuffle_attempts",
+            "stc_coverage_preserved",
             "detected_equivalent_faults", "uncollapsed_faults",
             "aborted_faults", "redundant_faults",
             "redundant_equivalent_faults", "podem_calls",

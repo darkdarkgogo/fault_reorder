@@ -159,3 +159,143 @@ ATPG::DtcResult ATPG::run_stuck_at_dtc(fptr primary)
 	}
 	return result;
 }
+
+ATPG::AtpgRunResult ATPG::finalize_stuck_at_session()
+{
+	if (stuck_at_final_result.finalized || !get_selectable_fault_ids().empty())
+		return get_stuck_at_result();
+
+	AtpgRunResult result = get_stuck_at_result();
+	if (vectors.size() != static_cast<size_t>(in_vector_no))
+		throw runtime_error("Stuck-at STC raw vector count mismatch");
+	vector<string> compacted = vectors;
+	mt19937 shuffle_rng = stc_shuffle_rng;
+	vector<FAULT> detection_faults;
+	vector<string> expected_ids;
+	int expected_equivalents = 0;
+	for (const auto &fault : flist)
+	{
+		detection_faults.push_back(*fault);
+		if (fault->detect == TRUE)
+		{
+			expected_ids.push_back(fault_identifier(fault.get()));
+			expected_equivalents += fault->eqv_fault_num;
+		}
+	}
+	if (expected_equivalents != result.detected_equivalent_faults)
+		throw runtime_error("Stuck-at STC pre-compaction equivalent count mismatch");
+
+	{
+		// SAF simulation drops only these cloned FAULT records. Preserve every
+		// wire field (including private decision/injection flags) and both lists
+		// with an exception-safe scope guard. No live fault status or ATPG counter
+		// is changed, even if coverage validation or an allocation throws.
+		struct SimulationState
+		{
+			ATPG &owner;
+			vector<WIRE> wires;
+			forward_list<fptr> undetected;
+			forward_list<wptr> faulty;
+			explicit SimulationState(ATPG &atpg) : owner(atpg)
+			{
+				for (wptr wire : owner.sort_wlist)
+					wires.push_back(*wire);
+				undetected.swap(owner.flist_undetect);
+				faulty.swap(owner.wlist_faulty);
+				for (wptr wire : owner.sort_wlist)
+				{
+					wire->remove_changed();
+					wire->remove_scheduled();
+					wire->remove_faulty();
+					wire->remove_fault_injected();
+					wire->set_fault_free();
+				}
+			}
+			~SimulationState()
+			{
+				for (size_t i = 0; i < wires.size(); ++i)
+					swap(*owner.sort_wlist[i], wires[i]);
+				owner.flist_undetect.swap(undetected);
+				owner.wlist_faulty.swap(faulty);
+			}
+		} saved_state(*this);
+
+		auto reset_detection = [&]() {
+			flist_undetect.clear();
+			for (auto it = detection_faults.rbegin(); it != detection_faults.rend(); ++it)
+			{
+				it->detect = FALSE;
+				it->detected_time = 0;
+				flist_undetect.push_front(&*it);
+			}
+		};
+		auto validate_coverage = [&]() {
+			vector<string> detected_ids;
+			int equivalents = 0;
+			for (FAULT &fault : detection_faults)
+				if (fault.detect == TRUE)
+				{
+					detected_ids.push_back(fault_identifier(&fault));
+					equivalents += fault.eqv_fault_num;
+				}
+			// Both lists follow the unchanged catalog order: vector equality is
+			// exact ID-set equality, not merely equal coverage percentages.
+			if (detected_ids != expected_ids || equivalents != expected_equivalents)
+				throw runtime_error("Stuck-at STC changed detected catalog coverage");
+		};
+		auto verify_patterns = [&]() {
+			reset_detection();
+			for (const string &pattern : compacted)
+			{
+				int detected = 0;
+				fault_sim_a_vector(pattern, detected);
+			}
+			validate_coverage();
+		};
+		auto compact_pass = [&](bool reverse_order) {
+			reset_detection();
+			vector<string> retained;
+			for (size_t i = 0; i < compacted.size(); ++i)
+			{
+				const string &pattern = compacted[reverse_order ? compacted.size() - 1 - i : i];
+				int detected = 0;
+				fault_sim_a_vector(pattern, detected);
+				if (detected > 0)
+					retained.push_back(pattern);
+			}
+			validate_coverage();
+			if (reverse_order)
+				reverse(retained.begin(), retained.end());
+			compacted.swap(retained);
+		};
+
+		verify_patterns();
+		if (static_test_compression)
+		{
+			if (stuck_at_protocol_config.stc_reverse_order_enabled)
+				compact_pass(true);
+			int consecutive_failures = 0;
+			while (consecutive_failures < stuck_at_protocol_config.stc_no_improvement_limit)
+			{
+				const size_t before = compacted.size();
+				shuffle(compacted.begin(), compacted.end(), shuffle_rng);
+				compact_pass(false);
+				++result.stc_shuffle_attempts;
+				consecutive_failures = compacted.size() < before ? 0 : consecutive_failures + 1;
+			}
+		}
+		verify_patterns();
+	}
+
+	result.patterns_after_stc = static_cast<int>(compacted.size());
+	result.pattern_count = result.patterns_after_stc;
+	result.stc_removed_patterns = result.patterns_before_stc - result.patterns_after_stc;
+	result.stc_coverage_preserved = true;
+	result.finalized = true;
+	// Commit only after all validation and state restoration. Keep in_vector_no
+	// as the raw monotonic step counter. The binding holds the session mutex.
+	vectors.swap(compacted);
+	stc_shuffle_rng = shuffle_rng;
+	stuck_at_final_result = result;
+	return result;
+}

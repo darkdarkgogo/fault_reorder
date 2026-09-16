@@ -91,6 +91,13 @@ public:
 	struct AtpgRunResult
 	{
 		int pattern_count{};
+		int current_pattern_count{};
+		bool finalized{};
+		int patterns_before_stc{};
+		int patterns_after_stc{};
+		int stc_removed_patterns{};
+		int stc_shuffle_attempts{};
+		bool stc_coverage_preserved{};
 		int detected_collapsed_faults{};
 		int detected_equivalent_faults{};
 		int uncollapsed_faults{};
@@ -186,6 +193,7 @@ public:
 	vector<string> get_selectable_fault_ids() const;
 	AtpgStepResult step_stuck_at(const string &fault_id);
 	AtpgRunResult get_stuck_at_result() const;
+	AtpgRunResult finalize_stuck_at_session();
 	AtpgRunResult run_stuck_at(bool print_report = false);
 	vector<int> cc0, cc1, co;
 
@@ -225,6 +233,7 @@ private:
 	bool tdfsim_only;			 /* flag to indicate tdfault simulation only */
 	int fault_num;
 	bool stuck_at_session_prepared{};
+	AtpgRunResult stuck_at_final_result{};
 	int stuck_at_total_detect_num{};
 	int stuck_at_total_backtracks{};
 	int stuck_at_aborted_faults{};

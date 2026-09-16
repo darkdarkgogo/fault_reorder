@@ -28,6 +28,7 @@ void ATPG::configure_ordered_stuck_at(const StuckAtProtocolConfig &config)
 	primary_fill_rng.seed(config.primary_seed);
 	stc_shuffle_rng.seed(config.stc_shuffle_seed);
 	stuck_at_session_prepared = false;
+	stuck_at_final_result = AtpgRunResult{};
 	stuck_at_total_detect_num = 0;
 	stuck_at_total_backtracks = 0;
 	stuck_at_aborted_faults = 0;
@@ -97,8 +98,13 @@ vector<string> ATPG::get_selectable_fault_ids() const
 
 ATPG::AtpgRunResult ATPG::get_stuck_at_result() const
 {
+	if (stuck_at_final_result.finalized)
+		return stuck_at_final_result;
 	AtpgRunResult result;
 	result.pattern_count = in_vector_no;
+	result.current_pattern_count = in_vector_no;
+	result.patterns_before_stc = in_vector_no;
+	result.patterns_after_stc = in_vector_no;
 	result.detected_equivalent_faults = stuck_at_total_detect_num;
 	result.uncollapsed_faults = num_of_gate_fault;
 	result.aborted_faults = stuck_at_aborted_faults;
@@ -168,6 +174,7 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 				display_io();
 			int current_detect_num = 0;
 			fault_sim_a_vector(vec, current_detect_num);
+			vectors.push_back(vec);
 			stuck_at_total_detect_num += current_detect_num;
 			in_vector_no++;
 			step.target_status = "detected";
@@ -222,7 +229,7 @@ ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
 		selectable = get_selectable_fault_ids();
 	}
 
-	const AtpgRunResult result = get_stuck_at_result();
+	const AtpgRunResult result = finalize_stuck_at_session();
 	if (print_report)
 	{
 		display_undetect();

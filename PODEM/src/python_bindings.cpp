@@ -35,6 +35,13 @@ py::dict catalog_to_dict(
 py::dict summary_to_dict(const ATPG::AtpgRunResult &summary) {
   py::dict result;
   result["pattern_count"] = summary.pattern_count;
+  result["current_pattern_count"] = summary.current_pattern_count;
+  result["finalized"] = summary.finalized;
+  result["patterns_before_stc"] = summary.patterns_before_stc;
+  result["patterns_after_stc"] = summary.patterns_after_stc;
+  result["stc_removed_patterns"] = summary.stc_removed_patterns;
+  result["stc_shuffle_attempts"] = summary.stc_shuffle_attempts;
+  result["stc_coverage_preserved"] = summary.stc_coverage_preserved;
   result["detected_collapsed_faults"] = summary.detected_collapsed_faults;
   result["detected_equivalent_faults"] = summary.detected_equivalent_faults;
   result["uncollapsed_faults"] = summary.uncollapsed_faults;
@@ -180,7 +187,7 @@ public:
     result["newly_detected_fault_ids"] = step_result.newly_detected_fault_ids;
     result["remaining_fault_ids"] = step_result.remaining_fault_ids;
     result["current_pattern_count"] =
-        step_result.cumulative_result.pattern_count;
+        step_result.cumulative_result.current_pattern_count;
     result["current_podem_calls"] =
         step_result.cumulative_result.podem_calls;
     result["current_total_backtracks"] =
@@ -188,12 +195,12 @@ public:
     return result;
   }
 
-  py::dict result() const {
+  py::dict result() {
     ATPG::AtpgRunResult summary;
     {
       py::gil_scoped_release release;
       std::lock_guard<std::mutex> lock(mutex_);
-      summary = atpg_.get_stuck_at_result();
+      summary = atpg_.finalize_stuck_at_session();
     }
     return summary_to_dict(summary);
   }
