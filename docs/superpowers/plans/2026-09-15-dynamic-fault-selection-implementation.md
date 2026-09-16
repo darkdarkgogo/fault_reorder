@@ -1,44 +1,44 @@
-# Dynamic Fault Selection Implementation Plan
+# 动态故障选择实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **面向智能体执行者：** 必须使用子技能 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐项执行本计划。各步骤使用复选框（`- [ ]`）跟踪状态。
 
-**Goal:** Replace the fixed full-permutation fault policy with a stateful policy that recomputes scores from each fault embedding, the current remaining-fault mean, and the remaining ratio after every PODEM/fault-simulation step.
+**目标：** 将固定的完整故障排列策略替换为有状态策略；每次执行 PODEM／故障仿真后，基于每个候选故障的 embedding、当前剩余故障 embedding 的均值和剩余比例重新计算分数。
 
-**Architecture:** A stateful C++ PODEM session exposes one-primary-fault steps and the current selectable fault IDs. Python builds 515-dimensional dynamic features and samples one masked categorical action per state; after the solver episode, it replays recorded masks under autograd and applies the existing coverage-gated REINFORCE reward, normalized by the circuit's initial fault count.
+**架构：** 有状态的 C++ PODEM 会话对外提供“每次处理一个主故障”的步进接口，以及当前可选故障 ID。Python 为每个状态构造 515 维动态特征，并从带 mask 的类别分布中选择一个动作；求解回合结束后，在 autograd 下重放已记录的 mask，应用现有的、受覆盖率门控的 REINFORCE 奖励，并按电路的初始故障数归一化。
 
-**Tech Stack:** C++11/14, pybind11, Python 3.9+, PyTorch, NumPy, pytest.
+**技术栈：** C++11/14、pybind11、Python 3.9+、PyTorch、NumPy、pytest。
 
-**Spec:** `docs/superpowers/specs/2026-09-15-dynamic-fault-selection-design.md`
+**设计规格：** `docs/superpowers/specs/2026-09-15-dynamic-fault-selection-design.md`
 
-## Global Constraints
+## 全局约束
 
-- Keep every DeepGate2 fault embedding frozen at exactly 257 dimensions.
-- Scorer input is exactly `[fault embedding (257), remaining mean (257), remaining ratio (1)]`, or 515 dimensions.
-- Recompute context and scores after every TRUE, FALSE, or MAYBE primary-fault attempt.
-- A selectable fault is undetected, not redundant, and not previously attempted in the current one-attempt episode.
-- Keep PODEM seed 14, backtrack limit 5000, one attempt, and STC/DTC/SCOAP/TDF disabled.
-- Keep the existing pattern-count reward, native resolved-coverage guard, EMA advantage, Adam optimizer, temperature schedule, minibatch transaction, and best-selection key.
-- Normalize trajectory log probability by the initial catalog fault count, never by the realized decision count.
-- Do not load schema-2 static checkpoints into the dynamic model; require a fresh schema-3 run.
-- Preserve existing user changes in `README.md` and `docs/fault-reorder-algorithm.md` unless the documentation task explicitly updates overlapping text.
+- 每个 DeepGate2 故障 embedding 必须保持冻结，并且维度严格为 257。
+- 评分器输入严格为 `[fault embedding (257), remaining mean (257), remaining ratio (1)]`，总计 515 维。
+- 每次对主故障尝试得到 TRUE、FALSE 或 MAYBE 后，都必须重新计算上下文和分数。
+- 可选故障必须同时满足：尚未检测、不是冗余故障，并且在当前单次尝试回合中尚未尝试过。
+- 保持 PODEM 随机种子为 14、回溯上限为 5000、尝试次数为 1，并禁用 STC/DTC/SCOAP/TDF。
+- 保留现有的测试向量数量奖励、原生 resolved-coverage 保护条件、EMA advantage、Adam 优化器、温度调度、小批次事务机制和最优模型选择键。
+- 轨迹 log probability 必须按 catalog 的初始故障数归一化，不能按实际决策步数归一化。
+- 禁止将 Schema 2 的静态策略检查点加载到动态模型中；必须重新开始 Schema 3 训练。
+- 除非文档任务明确需要修改重叠内容，否则保留用户在 `README.md` 和 `docs/fault-reorder-algorithm.md` 中已有的改动。
 
 ---
 
-### Task 1: Incremental PODEM core and pybind session
+### 任务 1：增量式 PODEM 核心与 pybind 会话接口
 
-**Files:**
-- Modify: `PODEM/src/atpg.h`
-- Modify: `PODEM/src/atpg.cpp`
-- Modify: `PODEM/src/python_bindings.cpp`
-- Test: `PODEM/tests/test_fault_mapping.py`
+**涉及文件：**
+- 修改：`PODEM/src/atpg.h`
+- 修改：`PODEM/src/atpg.cpp`
+- 修改：`PODEM/src/python_bindings.cpp`
+- 测试：`PODEM/tests/test_fault_mapping.py`
 
-**Interfaces:**
-- Consumes: the existing `ATPG::podem`, `ATPG::fault_sim_a_vector`, fault catalog, and ordered stuck-at configuration.
-- Produces: `ATPG::get_selectable_fault_ids() const -> vector<string>`, `ATPG::step_stuck_at(const string&) -> AtpgStepResult`, `ATPG::get_stuck_at_result() const -> AtpgRunResult`, and Python `cpp_podem.StuckAtSession` with `catalog()`, `remaining_fault_ids()`, `step(fault_id)`, and `result()`.
+**接口：**
+- 使用：现有的 `ATPG::podem`、`ATPG::fault_sim_a_vector`、故障 catalog 和有序固定型故障配置。
+- 产出：`ATPG::get_selectable_fault_ids() const -> vector<string>`、`ATPG::step_stuck_at(const string&) -> AtpgStepResult`、`ATPG::get_stuck_at_result() const -> AtpgRunResult`，以及提供 `catalog()`、`remaining_fault_ids()`、`step(fault_id)`、`result()` 的 Python `cpp_podem.StuckAtSession`。
 
-- [ ] **Step 1: Write failing binding tests for an incremental session**
+- [ ] **步骤 1：为增量式会话编写预期失败的绑定测试**
 
-Add this test beside the existing ordered-ATPG tests:
+在现有的有序 ATPG 测试旁添加以下测试：
 
 ```python
 def test_incremental_session_matches_native_complete_run(self):
@@ -64,7 +64,7 @@ def test_incremental_session_matches_native_complete_run(self):
     self.assertEqual(session.result(), expected)
 ```
 
-Add rejection coverage:
+增加非法调用的拒绝测试：
 
 ```python
 def test_incremental_session_rejects_non_selectable_fault(self):
@@ -80,21 +80,21 @@ def test_incremental_session_rejects_non_selectable_fault(self):
         session.step("missing:GO:sa0")
 ```
 
-- [ ] **Step 2: Run the new tests and verify the class is missing**
+- [ ] **步骤 2：运行新测试，确认因缺少会话类而失败**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest PODEM/tests/test_fault_mapping.py -k incremental -v
 ```
 
-Expected: FAIL because `cpp_podem.StuckAtSession` does not exist.
+预期结果：FAIL，因为 `cpp_podem.StuckAtSession` 尚不存在。
 
-- [ ] **Step 3: Add cumulative step state and refactor the complete run**
+- [ ] **步骤 3：增加步进累计状态，并重构完整运行流程**
 
-In `atpg.h`, add an `AtpgStepResult` containing the selected ID, `target_status`, `generated_pattern`, `newly_detected_fault_ids`, `remaining_fault_ids`, and cumulative `AtpgRunResult`. Add private cumulative counters initialized by `configure_ordered_stuck_at`.
+在 `atpg.h` 中新增 `AtpgStepResult`，其中包含所选 ID、`target_status`、`generated_pattern`、`newly_detected_fault_ids`、`remaining_fault_ids` 和累计的 `AtpgRunResult`。新增私有累计计数器，并由 `configure_ordered_stuck_at` 初始化。
 
-Implement the following behavior in `atpg.cpp`:
+在 `atpg.cpp` 中实现以下行为：
 
 ```cpp
 vector<string> ATPG::get_selectable_fault_ids() const {
@@ -107,11 +107,11 @@ vector<string> ATPG::get_selectable_fault_ids() const {
 }
 ```
 
-`step_stuck_at` must locate an exact selectable ID, call `podem` once, run `fault_sim_a_vector` only on TRUE, mark the target tried, update cumulative counters, determine dropped IDs by comparing `flist_undetect` before and after fault simulation, and return the new selectable list. Seed `rand()` and validate unsupported physical XOR/EQV once at the first step. Refactor `run_stuck_at` to repeatedly call `step_stuck_at(get_selectable_fault_ids().front())`; this makes the old full-run API and the new session share one solver path.
+`step_stuck_at` 必须精确定位一个当前可选的 ID，调用一次 `podem`，仅在结果为 TRUE 时运行 `fault_sim_a_vector`，将目标标记为已尝试，更新累计计数器，通过比较故障仿真前后的 `flist_undetect` 确定被 drop 的 ID，并返回新的可选故障列表。首次步进时设置 `rand()` 种子，并执行一次“不支持物理 XOR/EQV”的校验。重构 `run_stuck_at`，使其反复调用 `step_stuck_at(get_selectable_fault_ids().front())`；这样旧的完整运行 API 与新会话将共用同一条求解路径。
 
-- [ ] **Step 4: Bind the stateful session**
+- [ ] **步骤 4：绑定有状态会话**
 
-Add a small owning wrapper in `python_bindings.cpp`:
+在 `python_bindings.cpp` 中增加一个持有底层对象的轻量包装类：
 
 ```cpp
 class StuckAtSession {
@@ -128,20 +128,20 @@ private:
 };
 ```
 
-Release the GIL during circuit initialization and each `step`, but construct Python dictionaries only while holding the GIL. Reuse one `summary_to_dict` helper for legacy and session results.
+在电路初始化和每次 `step` 期间释放 GIL，但只能在持有 GIL 时构造 Python 字典。旧接口和会话接口的结果应复用同一个 `summary_to_dict` 辅助函数。
 
-- [ ] **Step 5: Build and run C++/binding tests**
+- [ ] **步骤 5：构建并运行 C++／绑定测试**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe PODEM\setup.py build_ext --inplace
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest PODEM/tests/test_fault_mapping.py -v
 ```
 
-Expected: all fault-mapping, full ordered-run, and incremental-session tests PASS; the session native-first result exactly equals the legacy native permutation result.
+预期结果：所有故障映射、完整有序运行和增量会话测试均 PASS；会话按原生顺序执行得到的结果必须与旧版原生完整排列结果完全一致。
 
-- [ ] **Step 6: Commit the incremental solver boundary**
+- [ ] **步骤 6：提交增量式求解器边界改动**
 
 ```powershell
 git add PODEM/src/atpg.h PODEM/src/atpg.cpp PODEM/src/python_bindings.cpp PODEM/tests/test_fault_mapping.py
@@ -150,20 +150,20 @@ git commit -m "feat: expose incremental PODEM fault sessions"
 
 ---
 
-### Task 2: Dynamic feature construction and categorical policy math
+### 任务 2：动态特征构造与类别策略计算
 
-**Files:**
-- Modify: `fault_order_rl/model.py`
-- Modify: `fault_order_rl/policy.py`
-- Modify: `tests/test_fault_order_rl.py`
+**涉及文件：**
+- 修改：`fault_order_rl/model.py`
+- 修改：`fault_order_rl/policy.py`
+- 修改：`tests/test_fault_order_rl.py`
 
-**Interfaces:**
-- Consumes: validated `[N,257]` frozen embeddings and catalog-row indices.
-- Produces: `build_dynamic_features(embeddings, remaining_rows) -> Tensor[K,515]`, `sample_action(scores, temperature, generator=None) -> (local_index, logits)`, `deterministic_action(scores) -> local_index`, and `trajectory_log_prob(model, embeddings, decisions, temperature) -> scalar Tensor`.
+**接口：**
+- 使用：已校验的 `[N,257]` 冻结 embedding，以及 catalog 行索引。
+- 产出：`build_dynamic_features(embeddings, remaining_rows) -> Tensor[K,515]`、`sample_action(scores, temperature, generator=None) -> (local_index, logits)`、`deterministic_action(scores) -> local_index`，以及 `trajectory_log_prob(model, embeddings, decisions, temperature) -> scalar Tensor`。
 
-- [ ] **Step 1: Write failing tests for the 515-dimensional input**
+- [ ] **步骤 1：为 515 维输入编写预期失败的测试**
 
-Add tests that use hand-checkable tensors:
+添加使用可人工核对 tensor 的测试：
 
 ```python
 def test_dynamic_features_append_remaining_mean_and_ratio():
@@ -177,32 +177,32 @@ def test_dynamic_features_append_remaining_mean_and_ratio():
     assert torch.equal(features[:, 514], torch.full((2,), 0.5))
 ```
 
-Also assert that empty, duplicate, out-of-range, and non-one-dimensional row tensors raise `ValueError`, and that `FaultScorer()` rejects `[N,257]` while accepting `[N,515]`.
+同时断言：空的、重复的、越界的或非一维的行索引 tensor 会抛出 `ValueError`；`FaultScorer()` 拒绝 `[N,257]` 输入，但接受 `[N,515]` 输入。
 
-- [ ] **Step 2: Run the feature tests and verify failure**
+- [ ] **步骤 2：运行特征测试并确认失败**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k "dynamic_features or scorer" -v
 ```
 
-Expected: FAIL because the feature builder is absent and the scorer still expects 257 dimensions.
+预期结果：FAIL，因为动态特征构造函数尚不存在，评分器仍然要求 257 维输入。
 
-- [ ] **Step 3: Implement the dynamic scorer input**
+- [ ] **步骤 3：实现动态评分器输入**
 
-Change `FaultScorer`'s default input dimension to 515 while retaining the current nonlinear topology:
+将 `FaultScorer` 的默认输入维度改为 515，同时保留当前的非线性网络结构：
 
 ```text
 LayerNorm(515) -> Linear(515,256) -> ReLU
 -> Linear(256,128) -> ReLU -> Linear(128,1)
 ```
 
-Implement `build_dynamic_features` without modifying or cloning the source embedding matrix. Compute ratio as `K / N` and expand the shared mean and scalar across the `K` candidate rows.
+实现 `build_dynamic_features`，不得修改或克隆源 embedding 矩阵。按 `K / N` 计算剩余比例，并将共享均值和标量扩展到全部 `K` 个候选行。
 
-- [ ] **Step 4: Write failing masked categorical and replay tests**
+- [ ] **步骤 4：为带 mask 的类别策略和轨迹重放编写预期失败的测试**
 
-Add a fixed-seed sampling test and a direct-formula replay test:
+添加固定随机种子的采样测试，以及按公式直接计算的重放测试：
 
 ```python
 def test_dynamic_trajectory_log_prob_matches_direct_steps():
@@ -222,21 +222,21 @@ def test_dynamic_trajectory_log_prob_matches_direct_steps():
     assert torch.allclose(actual, torch.stack(direct).sum())
 ```
 
-- [ ] **Step 5: Implement categorical action helpers and trajectory replay**
+- [ ] **步骤 5：实现类别动作辅助函数和轨迹重放**
 
-Use `torch.multinomial(torch.softmax(logits, 0), 1, generator=generator)` for training selection. Use stable first-maximum selection for evaluation. In `trajectory_log_prob`, verify that every selected row occurs exactly once in its saved remaining rows, rebuild dynamic features for each state, and sum the selected `log_softmax` terms.
+训练时使用 `torch.multinomial(torch.softmax(logits, 0), 1, generator=generator)` 选择动作。评估时使用稳定的“第一个最大值”选择规则。在 `trajectory_log_prob` 中，校验每个选中行在其保存的剩余行中恰好出现一次；随后为每个状态重新构造动态特征，并累加被选动作对应的 `log_softmax` 项。
 
-- [ ] **Step 6: Run policy tests**
+- [ ] **步骤 6：运行策略测试**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k "dynamic_features or dynamic_trajectory or categorical or scorer" -v
 ```
 
-Expected: all selected tests PASS with finite gradients through the scorer.
+预期结果：所有筛选出的测试均 PASS，并且通过评分器得到的梯度都是有限值。
 
-- [ ] **Step 7: Commit model and policy math**
+- [ ] **步骤 7：提交模型和策略计算改动**
 
 ```powershell
 git add fault_order_rl/model.py fault_order_rl/policy.py tests/test_fault_order_rl.py
@@ -245,56 +245,56 @@ git commit -m "feat: add dynamic fault context policy"
 
 ---
 
-### Task 3: Validated Python session environment
+### 任务 3：带状态校验的 Python 会话环境
 
-**Files:**
-- Modify: `fault_order_rl/environment.py`
-- Modify: `tests/test_fault_order_rl.py`
+**涉及文件：**
+- 修改：`fault_order_rl/environment.py`
+- 修改：`tests/test_fault_order_rl.py`
 
-**Interfaces:**
-- Consumes: `cpp_podem.StuckAtSession` from Task 1.
-- Produces: `PodemEnvironment.start_session(bench_path, faultmap_path) -> PodemSession`; `PodemSession.remaining_fault_ids() -> tuple[str,...]`, `step(fault_id) -> dict`, and `result() -> dict`.
+**接口：**
+- 使用：任务 1 产出的 `cpp_podem.StuckAtSession`。
+- 产出：`PodemEnvironment.start_session(bench_path, faultmap_path) -> PodemSession`；以及 `PodemSession.remaining_fault_ids() -> tuple[str,...]`、`step(fault_id) -> dict` 和 `result() -> dict`。
 
-- [ ] **Step 1: Write failing wrapper validation tests**
+- [ ] **步骤 1：为包装层校验编写预期失败的测试**
 
-Create a fake binding session whose first step changes `("f0","f1","f2")` to `("f2",)` and reports `newly_detected_fault_ids=("f0","f1")`. Assert that `PodemEnvironment.start_session` forwards paths, limit 5000, and seed 14; assert that the wrapper rejects duplicate/unknown remaining IDs, a remaining set that grows, a TRUE step without a pattern increment, and a final result missing any `RESULT_FIELDS` key.
+创建一个假的绑定会话：第一次步进将 `("f0","f1","f2")` 变为 `("f2",)`，并报告 `newly_detected_fault_ids=("f0","f1")`。断言 `PodemEnvironment.start_session` 会传递路径、回溯上限 5000 和随机种子 14；同时断言包装层会拒绝以下情况：剩余 ID 重复或未知、剩余集合变大、TRUE 步骤却没有增加测试向量，以及最终结果缺少任意 `RESULT_FIELDS` 字段。
 
-- [ ] **Step 2: Run wrapper tests and verify failure**
+- [ ] **步骤 2：运行包装层测试并确认失败**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k "session_wrapper" -v
 ```
 
-Expected: FAIL because `start_session` and `PodemSession` do not exist.
+预期结果：FAIL，因为 `start_session` 和 `PodemSession` 尚不存在。
 
-- [ ] **Step 3: Implement the wrapper and share result validation**
+- [ ] **步骤 3：实现包装层并复用结果校验逻辑**
 
-Extract the current final-result checks into `_validate_result(raw, catalog_size)`. `PodemSession` stores the immutable initial IDs and previous remaining tuple. On every step it verifies:
+将当前的最终结果检查提取为 `_validate_result(raw, catalog_size)`。`PodemSession` 保存不可变的初始 ID，以及上一步的剩余故障 tuple。每次步进都要校验：
 
 ```text
-selected ID was in the previous remaining set
-new remaining IDs are unique, known, and a strict subset
-newly detected IDs are known and absent from the new remaining set
-generated_pattern changes cumulative pattern_count by exactly one
-non-pattern steps do not change cumulative pattern_count
-calls increase by one and backtracks never decrease
+所选 ID 存在于上一步的剩余集合中
+新的剩余 ID 唯一、已知，并且构成严格子集
+新检测到的 ID 均为已知 ID，且不在新的剩余集合中
+generated_pattern 为真时，累计 pattern_count 恰好增加 1
+未生成测试向量的步骤不能改变累计 pattern_count
+calls 增加 1，backtracks 永不减少
 ```
 
-Keep `PodemEnvironment.run` supported and route its aggregate dictionary through the same `_validate_result` helper.
+继续支持 `PodemEnvironment.run`，并让其聚合结果字典也经过同一个 `_validate_result` 辅助函数。
 
-- [ ] **Step 4: Run environment tests**
+- [ ] **步骤 4：运行环境层测试**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k "environment or session_wrapper" -v
 ```
 
-Expected: all selected tests PASS.
+预期结果：所有筛选出的测试均 PASS。
 
-- [ ] **Step 5: Commit the Python environment boundary**
+- [ ] **步骤 5：提交 Python 环境边界改动**
 
 ```powershell
 git add fault_order_rl/environment.py tests/test_fault_order_rl.py
@@ -303,23 +303,23 @@ git commit -m "feat: validate incremental PODEM sessions"
 
 ---
 
-### Task 4: Dynamic trainer episodes and fixed initial-count normalization
+### 任务 4：动态训练回合与按初始故障数归一化
 
-**Files:**
-- Modify: `fault_order_rl/trainer.py`
-- Modify: `tests/test_fault_order_rl.py`
+**涉及文件：**
+- 修改：`fault_order_rl/trainer.py`
+- 修改：`tests/test_fault_order_rl.py`
 
-**Interfaces:**
-- Consumes: Tasks 2-3 policy helpers and `PodemEnvironment.start_session`.
-- Produces: `Trainer._run_native(circuit)`, `Trainer._run_policy(circuit, model, temperature, stochastic)`, saved per-step decision states, and dynamic REINFORCE updates.
+**接口：**
+- 使用：任务 2～3 产出的策略辅助函数和 `PodemEnvironment.start_session`。
+- 产出：`Trainer._run_native(circuit)`、`Trainer._run_policy(circuit, model, temperature, stochastic)`、保存的逐步决策状态，以及动态 REINFORCE 更新。
 
-- [ ] **Step 1: Replace the fake complete-run environment with a fake session**
+- [ ] **步骤 1：用假的步进会话替换假的完整运行环境**
 
-In the trainer fixture, make `FakeEnvironment.start_session` return a deterministic session over the test circuit's IDs. Its first selected even-numbered fault must also drop the next selectable fault, so a test can prove that the second decision's remaining set differs by more than the selected target alone. Keep complete aggregate metrics deterministic from the selected-row trajectory.
+在 trainer fixture 中，让 `FakeEnvironment.start_session` 针对测试电路的 ID 返回确定性会话。当第一次选择编号为偶数的故障时，还必须同时 drop 下一个可选故障，以便测试能够证明：第二次决策的剩余集合并非只移除了上一步选中的目标。完整的聚合指标仍应由所选行轨迹确定性地产生。
 
-- [ ] **Step 2: Write failing dynamic-episode tests**
+- [ ] **步骤 2：编写预期失败的动态回合测试**
 
-Assert that:
+断言：
 
 ```python
 metrics, elapsed, decisions, trace = trainer._run_policy(
@@ -332,31 +332,31 @@ assert trace[1]["remaining_ratio"] == (
 )
 ```
 
-Add a loss test that constructs three decisions for a five-fault circuit and checks the exact denominator is `5`, not `3`.
+增加一个损失测试：为包含 5 个故障的电路构造 3 次决策，检查分母严格为 `5`，而不是 `3`。
 
-- [ ] **Step 3: Run trainer tests and verify failure**
+- [ ] **步骤 3：运行训练器测试并确认失败**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k "dynamic_episode or initial_fault_normalization" -v
 ```
 
-Expected: FAIL because the trainer still requests one complete permutation.
+预期结果：FAIL，因为训练器仍然一次性请求完整排列。
 
-- [ ] **Step 4: Implement native and policy session runners**
+- [ ] **步骤 4：实现原生会话运行器和策略会话运行器**
 
-`_run_native` repeatedly selects the first ID returned by the session. `_run_policy` maps session IDs back to immutable catalog rows, rebuilds `[K,515]` features on every iteration, samples or chooses one local candidate, performs exactly one session step, and records:
+`_run_native` 反复选择会话返回的第一个 ID。`_run_policy` 将会话 ID 映射回不可变的 catalog 行；每轮重新构造 `[K,515]` 特征，采样或确定性选择一个局部候选，严格执行一次会话步进，并记录：
 
 ```python
 {"remaining_rows": tuple(rows), "selected_row": selected_row}
 ```
 
-The human trace separately records selected ID/score, remaining count/ratio, target status, generated-pattern flag, newly detected IDs, and cumulative metrics. Reject unknown, duplicate, reordered-to-unknown, or nonshrinking session states.
+供人阅读的轨迹另行记录：所选 ID／分数、剩余数量／比例、目标状态、是否生成测试向量、新检测到的 ID，以及累计指标。会话状态中若出现未知 ID、重复 ID、重排后指向未知项，或剩余集合不缩小，必须拒绝。
 
-- [ ] **Step 5: Replace static round collection and gradient calculation**
+- [ ] **步骤 5：替换静态回合收集和梯度计算流程**
 
-Within each batch, collect all circuit episodes using one unchanged candidate-model snapshot under `torch.no_grad()`. Then call `trajectory_log_prob` for each saved decision list and compute exactly:
+在每个 batch 内，使用同一个不发生变化的候选模型快照，在 `torch.no_grad()` 下收集所有电路回合。随后针对每个保存的决策列表调用 `trajectory_log_prob`，并严格按下式计算：
 
 ```python
 loss = (
@@ -367,23 +367,23 @@ loss = (
 )
 ```
 
-Do not update model parameters between collection and replay for any episode in the batch. Keep transactional exception handling and RNG restoration unchanged.
+对于同一 batch 中的所有回合，在收集与重放之间不得更新模型参数。保持事务式异常处理和随机数生成器状态恢复逻辑不变。
 
-- [ ] **Step 6: Encode compact round trajectories**
+- [ ] **步骤 6：以紧凑格式编码回合轨迹**
 
-For each circuit save three numeric arrays in the round NPZ: `<name>__selected_rows`, `<name>__remaining_offsets`, and `<name>__remaining_rows`. Offsets start at zero and terminate at the flattened remaining-row array length, allowing every decision state to be reconstructed without pickle.
+每个电路在回合 NPZ 中保存三个数值数组：`<name>__selected_rows`、`<name>__remaining_offsets` 和 `<name>__remaining_rows`。offset 从 0 开始，并以扁平化剩余行数组的长度结束，从而无需 pickle 即可重建每个决策状态。
 
-- [ ] **Step 7: Run trainer recovery and minibatch tests**
+- [ ] **步骤 7：运行训练恢复和小批次测试**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k "shared_update or minibatch or failed_round or dynamic_episode or initial_fault_normalization" -v
 ```
 
-Expected: continuous and resumed runs produce byte-identical selected-row and remaining-row arrays, equal model parameters, and equal baselines.
+预期结果：连续运行与断点恢复运行生成逐字节相同的已选行数组和剩余行数组，并得到相同的模型参数与 baseline。
 
-- [ ] **Step 8: Commit dynamic trainer behavior**
+- [ ] **步骤 8：提交动态训练器行为改动**
 
 ```powershell
 git add fault_order_rl/trainer.py tests/test_fault_order_rl.py
@@ -392,20 +392,20 @@ git commit -m "feat: train on dynamic fault trajectories"
 
 ---
 
-### Task 5: Dynamic deterministic evaluation and schema-3 checkpoints
+### 任务 5：动态确定性评估与 Schema 3 检查点
 
-**Files:**
-- Modify: `fault_order_rl/checkpoint.py`
-- Modify: `fault_order_rl/trainer.py`
-- Modify: `tests/test_fault_order_rl.py`
+**涉及文件：**
+- 修改：`fault_order_rl/checkpoint.py`
+- 修改：`fault_order_rl/trainer.py`
+- 修改：`tests/test_fault_order_rl.py`
 
-**Interfaces:**
-- Consumes: deterministic `_run_policy(..., stochastic=False)` and dynamic traces from Task 4.
-- Produces: schema-3 checkpoints, initial-ranking diagnostic NPZ files, and `<circuit>.trajectory.jsonl` execution traces.
+**接口：**
+- 使用：确定性执行的 `_run_policy(..., stochastic=False)`，以及任务 4 产出的动态轨迹。
+- 产出：Schema 3 检查点、初始排序诊断 NPZ 文件，以及 `<circuit>.trajectory.jsonl` 执行轨迹。
 
-- [ ] **Step 1: Write failing checkpoint migration tests**
+- [ ] **步骤 1：编写预期失败的检查点迁移测试**
 
-Save minimal version-1 and version-2 dictionaries and assert distinct errors:
+保存最小化的版本 1 和版本 2 字典，并断言二者产生不同的错误：
 
 ```python
 with pytest.raises(ValueError, match="detected-only coverage"):
@@ -414,15 +414,15 @@ with pytest.raises(ValueError, match="static 257-dimensional policy"):
     load_checkpoint(schema2)
 ```
 
-Assert a schema-3 payload contains `policy_version == "dynamic_remaining_mean_v1"` and `input_dimension == 515`.
+断言 Schema 3 payload 包含 `policy_version == "dynamic_remaining_mean_v1"` 和 `input_dimension == 515`。
 
-- [ ] **Step 2: Upgrade checkpoint validation and payloads**
+- [ ] **步骤 2：升级检查点校验与 payload**
 
-Make `load_checkpoint` accept only version 3. Preserve the schema-1 message and add an explicit schema-2 restart message. Add the two dynamic-policy identity fields to latest and derived-best payloads, and check them during resume/evaluation compatibility.
+让 `load_checkpoint` 仅接受版本 3。保留 Schema 1 的错误消息，并为 Schema 2 增加明确的“需要重新训练”消息。将上述两个动态策略身份字段加入 latest 和派生 best payload，并在恢复训练／评估的兼容性检查中校验它们。
 
-- [ ] **Step 3: Write failing dynamic evaluation artifact tests**
+- [ ] **步骤 3：为动态评估产物编写预期失败的测试**
 
-For every evaluated circuit, assert the NPZ contains:
+对每个参与评估的电路，断言其 NPZ 包含：
 
 ```text
 fault_ids, scores, ranks, permutation,
@@ -430,25 +430,25 @@ selected_rows, selected_scores, selected_steps,
 exit_steps, exit_reasons
 ```
 
-Treat `scores/ranks/permutation` as initial-state diagnostics. Assert `selected_steps == -1` for a fault dropped by another selected target and assert the JSONL trace identifies the selecting target and the dropped ID at the same step.
+将 `scores/ranks/permutation` 视为初始状态诊断信息。对于被另一个选中目标 drop 的故障，断言其 `selected_steps == -1`；同时断言 JSONL 轨迹在同一步中标明执行选择的目标及被 drop 的 ID。
 
-- [ ] **Step 4: Implement dynamic evaluation and artifacts**
+- [ ] **步骤 4：实现动态评估及其输出产物**
 
-Replace all static `model(circuit.embeddings)` plus complete-order runs with deterministic dynamic sessions. Build the initial diagnostic ranking from the first dynamic state only. Derive selected and exit arrays from the step trace, using Unicode strings for exit reasons so `np.load(..., allow_pickle=False)` remains valid. Write JSONL atomically next to each ranking NPZ.
+将所有静态的 `model(circuit.embeddings)` 加完整顺序运行替换为确定性的动态会话。初始诊断排序只能根据第一个动态状态生成。根据步进轨迹推导 selected 和 exit 数组；退出原因使用 Unicode 字符串，以保证 `np.load(..., allow_pickle=False)` 仍然可用。在每个排序 NPZ 旁以原子方式写入 JSONL。
 
-Update external-manifest resumable evaluation so a circuit is complete only when metrics JSON, ranking NPZ, and trajectory JSONL all exist with the expected checkpoint/evaluation identity.
+更新外部 manifest 的可恢复评估逻辑：只有当 metrics JSON、ranking NPZ 和 trajectory JSONL 全部存在，并且具有预期的检查点／评估身份信息时，才将一个电路视为评估完成。
 
-- [ ] **Step 5: Run checkpoint and evaluation tests**
+- [ ] **步骤 5：运行检查点和评估测试**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k "checkpoint or evaluation or latest or best" -v
 ```
 
-Expected: all selected tests PASS; fresh deterministic re-evaluation matches the saved best metrics exactly.
+预期结果：所有筛选出的测试均 PASS；重新进行一次确定性评估时，其结果与已保存的 best 指标完全一致。
 
-- [ ] **Step 6: Commit evaluation and checkpoint migration**
+- [ ] **步骤 6：提交评估和检查点迁移改动**
 
 ```powershell
 git add fault_order_rl/checkpoint.py fault_order_rl/trainer.py tests/test_fault_order_rl.py
@@ -457,76 +457,76 @@ git commit -m "feat: evaluate dynamic fault trajectories"
 
 ---
 
-### Task 6: Real-solver integration, documentation, and full verification
+### 任务 6：真实求解器集成、文档更新与完整验证
 
-**Files:**
-- Modify: `tests/test_fault_order_rl.py`
-- Modify: `docs/fault-order-rl.md`
+**涉及文件：**
+- 修改：`tests/test_fault_order_rl.py`
+- 修改：`docs/fault-order-rl.md`
 
-**Interfaces:**
-- Consumes: completed schema-3 dynamic policy and rebuilt `cpp_podem` extension.
-- Produces: verified real-circuit dynamic training/evaluation behavior and current user documentation.
+**接口：**
+- 使用：已完成的 Schema 3 动态策略，以及重新构建的 `cpp_podem` 扩展。
+- 产出：经过验证的真实电路动态训练／评估行为，以及与当前实现一致的用户文档。
 
-- [ ] **Step 1: Add a real dynamic smoke assertion**
+- [ ] **步骤 1：增加真实动态流程的冒烟断言**
 
-Extend the existing real PODEM smoke test to run a one-round dynamic trainer on its tiny converted circuit. Assert that the round NPZ contains selected rows and remaining offsets, that at least one successive remaining set shrinks, and that deterministic evaluation writes both ranking and trajectory artifacts while preserving native resolved coverage.
+扩展现有的真实 PODEM 冒烟测试，在其转换得到的微型电路上运行一轮动态训练。断言回合 NPZ 包含已选行和剩余集合 offset；至少有一个相邻步骤的剩余集合发生缩小；确定性评估会同时写出排序产物与轨迹产物，并保持原生 resolved coverage 不变。
 
-- [ ] **Step 2: Run the focused real-solver smoke test**
+- [ ] **步骤 2：运行聚焦的真实求解器冒烟测试**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k real_podem -v
 ```
 
-Expected: PASS with a real incremental C++ session and a finite optimizer update.
+预期结果：PASS；测试使用真实的增量式 C++ 会话，并产生有限值的优化器更新。
 
-- [ ] **Step 3: Update algorithm and operating documentation**
+- [ ] **步骤 3：更新算法与运行文档**
 
-Document the 515-dimensional feature layout, eligible remaining-mask semantics, per-step deterministic and sampled selection, trajectory log probability, initial-fault-count normalization, stateful PODEM boundary, schema-3 restart requirement, and the distinction between initial ranking and actual selected trajectory. Remove statements in this tracked operating guide that say the model generates one complete permutation per episode. Leave the user's existing `README.md` edit and untracked `docs/fault-reorder-algorithm.md` unchanged.
+记录以下内容：515 维特征布局、可选剩余故障 mask 的语义、逐步确定性选择和采样选择、轨迹 log probability、按初始故障数归一化、有状态 PODEM 边界、Schema 3 必须重新训练的要求，以及初始排序与实际选择轨迹之间的区别。删除这份受版本控制的运行指南中“模型每个回合生成一个完整排列”的表述。不要修改用户已有的 `README.md` 改动和未跟踪的 `docs/fault-reorder-algorithm.md`。
 
-- [ ] **Step 4: Run formatting and placeholder checks**
+- [ ] **步骤 4：运行格式和占位内容检查**
 
-Run:
+运行：
 
 ```powershell
 git diff --check
 rg -n "complete permutation" docs/fault-order-rl.md fault_order_rl PODEM/src
 ```
 
-Expected: `git diff --check` is clean; any remaining `complete permutation` occurrence refers only to legacy behavior or migration context.
+预期结果：`git diff --check` 无报错；任何剩余的 `complete permutation` 只能用于描述旧行为或迁移背景。
 
-- [ ] **Step 5: Run the complete relevant test suite**
+- [ ] **步骤 5：运行完整的相关测试套件**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py PODEM/tests/test_fault_mapping.py -v
 ```
 
-Expected: all tests PASS.
+预期结果：所有测试均 PASS。
 
-- [ ] **Step 6: Validate one production manifest without training**
+- [ ] **步骤 6：在不训练的情况下校验一个生产 manifest**
 
-Run:
+运行：
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m fault_order_rl validate --manifest configs/anchor_smoke_train.json
 ```
 
-Expected: manifest, catalog, embedding dimensions, IDs, equivalent counts, and provenance validate successfully.
+预期结果：manifest、catalog、embedding 维度、ID、等价故障计数和来源信息全部通过校验。
 
-- [ ] **Step 7: Review the complete change**
+- [ ] **步骤 7：审查完整改动**
 
-Invoke the `requesting-code-review` skill. Resolve every correctness finding, rerun the smallest affected test followed by the complete relevant suite, and verify `git status --short` contains no build products or unrelated staged changes.
+调用 `requesting-code-review` 技能。解决所有正确性问题；先重新运行受影响的最小测试，再运行完整的相关测试套件；最后确认 `git status --short` 中没有构建产物或无关的已暂存改动。
 
-- [ ] **Step 8: Commit verified documentation and integration tests**
+- [ ] **步骤 8：提交已验证的文档与集成测试**
 
 ```powershell
 git add tests/test_fault_order_rl.py docs/fault-order-rl.md
 git commit -m "docs: describe dynamic fault selection"
 ```
 
-- [ ] **Step 9: Report verification evidence**
+- [ ] **步骤 9：报告验证证据**
 
-Report the exact passing test commands, dynamic smoke circuit, checkpoint incompatibility, remaining known limitations, and the paths of the design and implementation plan. Do not claim pattern-count improvement from a smoke run; improvement requires a real training experiment.
+报告准确的测试通过命令、动态冒烟测试所用电路、检查点不兼容情况、仍然存在的已知限制，以及设计文档和实施计划的路径。不得依据冒烟运行宣称测试向量数量已经改善；要证明改善必须进行真实训练实验。
