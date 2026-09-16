@@ -8,8 +8,9 @@
 模型不得通过降低当前定义的 resolved coverage 获益。
 
 现有 257 维 DeepGate2 fault embedding 保持冻结，也不改变 fault catalog、fault
-collapsing、原始 BENCH/AIG anchor 或 PODEM 搜索算法。本功能只改变 scorer 输入、
-策略采样方式以及 Python 与 PODEM 之间的执行粒度。
+collapsing 或原始 BENCH/AIG anchor。本功能改变 scorer 输入、策略采样方式、Python
+与 PODEM 之间的执行粒度，并为 stuck-at 路径新增 PODEMX 动态测试压缩和生成后的
+静态测试压缩。
 
 ## 方案选择
 
@@ -26,6 +27,31 @@ collapsing、原始 BENCH/AIG anchor 或 PODEM 搜索算法。本功能只改变
 第一版不加入手工点积、逐维乘积或绝对差等交互特征。非线性 MLP 直接从拼接后的
 输入学习 fault 与剩余集合之间的条件关系。后续只有在消融实验表明简单拼接不足时，
 才考虑增加显式交互项。
+
+## 固定求解与压缩配置
+
+native baseline、训练 episode 和确定性评估必须使用完全相同的求解与压缩配置：
+
+```text
+primary PODEM backtrack limit       = 200
+primary PODEM seed                  = 14
+attempts per primary fault          = 1
+stuck-at DTC                        = enabled
+DTC secondary backtrack limit       = 50
+stuck-at STC                        = enabled
+STC reverse-order compaction        = enabled
+STC shuffle seed                    = 7
+STC consecutive no-improvement limit= 5
+SCOAP fault ordering                = disabled
+transition-delay mode               = disabled
+```
+
+主 PODEM 的回溯上限 200 作用于每一次 primary-fault 调用，不是整个电路的总上限。
+达到上限仍未找到测试向量时，该 primary fault 返回 MAYBE/aborted。DTC 对每个
+secondary fault 使用独立的 50 次回溯上限。
+
+SCOAP 在本项目中只用于重排 fault list，因此必须关闭。primary fault 的选择顺序
+只能由 native baseline 的 catalog-first 规则或动态策略决定，不能再被启发式排序覆盖。
 
 ## 动态状态与候选集合
 
@@ -121,6 +147,76 @@ mask 的语义是：不在 \(R_t\) 中的 fault 不进入 softmax，选择概率
 这不是固定 logits 下的完整 permutation：每次 fault simulation 后都会根据新的
 \(R_t\) 重新构造 515 维输入并重新计算全部候选分数。
 
+## Stuck-at PODEMX 动态测试压缩
+
+当主 PODEM 对 primary fault 返回 TRUE 后，先保留当前尚未确定的输入位，不立即
+随机填充。stuck-at PODEMX 随后排除本步 primary fault，按当前 catalog 行号从小到大
+的固定顺序扫描其他仍可选的 secondary fault，尝试利用这些未知输入位让同一个测试
+cube 同时检测更多 fault。扫描在全部 secondary 候选都已尝试或不再存在未知输入位
+时结束。
+该固定顺序只决定 DTC 内部的 secondary 尝试顺序，不构成新的 primary 选择，也不
+使用 SCOAP。
+
+每次 secondary 尝试必须满足以下约束：
+
+- 只能继续约束当前仍为未知值的输入位，不能修改已经固定的输入位；
+- 必须保持 primary fault 仍然可检测；
+- 必须保持之前已经成功加入的 secondary fault 仍然可检测；
+- 每个 secondary fault 最多允许 50 次 PODEMX 回溯；
+- 成功时保留新增约束，失败或达到回溯上限时完整回滚本次尝试产生的赋值；
+- secondary 尝试不把 fault 标记为 `test_tried`、redundant 或 aborted；
+- 只有最终测试向量经过 fault simulation 确实检测到该 fault 时，才能把它从
+  remaining 集合中 drop。
+
+DTC 完成后，使用会话级 seed 14 随机数生成器填充仍然未知的输入位，然后只执行
+一次 stuck-at fault simulation。本步返回的 `newly_detected_fault_ids` 以这次 fault
+simulation 的实际检测结果为准，其中可以同时包含 primary fault、DTC 加入的
+secondary fault，以及被测试向量顺带检测到的其他 fault。
+
+DTC 的搜索开销与主 PODEM 分开记录：
+
+```text
+primary_podem_calls
+dtc_secondary_calls
+primary_backtracks
+dtc_backtracks
+total_backtracks = primary_backtracks + dtc_backtracks
+```
+
+`primary_podem_calls` 只统计策略或 native baseline 主动选择 primary fault 后的主
+PODEM 调用；`dtc_secondary_calls` 统计 secondary 尝试次数，无论该次尝试成功还是
+失败。为兼容现有输出，`podem_calls` 是 `primary_podem_calls` 的别名，不包含 DTC
+secondary 尝试；`total_backtracks` 表示本次协议实际执行的全部搜索回溯。
+
+## Stuck-at 静态测试压缩
+
+当 remaining 集合为空、所有 primary 尝试结束后，对本回合生成的完整测试向量执行
+一次 STC。STC 不参与逐步 mask 更新，也不会回写或改变已经记录的策略轨迹。
+
+STC 分为两个确定性阶段：
+
+1. 反向应用测试向量并执行 stuck-at fault simulation；删除没有新增检测贡献的向量。
+2. 使用独立的会话级 seed 7 随机数生成器打乱剩余向量，再执行相同的压缩；连续
+   5 次 shuffle 都不能删除向量时停止。
+
+STC 必须保留压缩前全部已检测 fault 的集合及 equivalent fault coverage。压缩实现
+不能覆盖 primary 求解阶段保存的 redundant、aborted、calls 或 backtracks 状态。
+如果压缩后检测集合或 coverage 发生下降，应把它视为求解器错误并中止当前回合，
+不能把它当作普通 coverage penalty 样本。
+
+pattern 数明确区分为：
+
+```text
+current_pattern_count       # step 阶段已经生成的数量，只增不减
+patterns_before_stc         # episode 结束、STC 开始前的数量
+patterns_after_stc          # STC 结束后的最终数量
+pattern_count               # 对外兼容字段，等于 patterns_after_stc
+```
+
+训练 reward、best 模型比较和最终评估使用 `patterns_after_stc`。逐步轨迹使用
+`current_pattern_count`，不得把回合末尾 STC 的减少误报成某个 primary fault 步骤
+生成了负数 pattern。
+
 ## Stateful PODEM 环境
 
 当前 `run_stuck_at_ordered()` 一次接收完整 permutation 并运行到结束，Python 无法
@@ -131,8 +227,13 @@ mask 的语义是：不在 \(R_t\) 中的 fault 不进入 softmax，选择概率
 session = StuckAtSession(
     circuit_path,
     fault_map_path,
-    backtrack_limit=5000,
+    backtrack_limit=200,
     seed=14,
+    dtc_enabled=True,
+    dtc_backtrack_limit=50,
+    stc_enabled=True,
+    stc_seed=7,
+    stc_no_improvement_limit=5,
 )
 
 session.catalog()             # 初始、稳定的 fault catalog
@@ -141,12 +242,15 @@ step = session.step(fault_id) # 只尝试一个 primary fault
 summary = session.result()    # episode 结束后的累计指标
 ```
 
-`step(fault_id)` 必须先确认 fault ID 属于当前候选集合，再执行一次现有 PODEM 分支：
+`step(fault_id)` 必须先确认 fault ID 属于当前候选集合，再执行一次 primary PODEM
+分支：
 
-- TRUE：生成一个 pattern，立即进行 fault simulation 和 fault dropping；
+- TRUE：运行 stuck-at PODEMX DTC、填充剩余未知输入位、生成一个 pattern，再进行
+  fault simulation 和 fault dropping；
 - FALSE：标记 redundant，并累计对应 equivalent fault 数；
 - MAYBE：标记 aborted；
-- 所有情况都把本 primary fault 标记为已尝试，并更新累计 calls/backtracks。
+- 所有情况都把本 primary fault 标记为已尝试，并更新累计 primary/DTC calls 与
+  backtracks。
 
 每步至少返回：
 
@@ -157,17 +261,32 @@ generated_pattern             # 本步是否新增一个 pattern
 newly_detected_fault_ids      # 本次 fault sim 实际 drop 的 catalog IDs
 remaining_fault_ids
 current_pattern_count
-current_podem_calls
+current_primary_podem_calls
+current_dtc_secondary_calls
+current_primary_backtracks
+current_dtc_backtracks
 current_total_backtracks
 ```
 
 `result()` 延续当前环境的完整指标语义：pattern、detected collapsed/equivalent、
 uncollapsed、aborted、redundant/equivalent、PODEM calls 和 total backtracks。
+此外返回 `patterns_before_stc`、`patterns_after_stc`、DTC calls 和拆分后的 backtracks。
 Python 层继续派生 covered equivalent faults 与 resolved coverage。
+
+当仍存在 selectable fault 时，`result()` 可以返回尚未 STC 的中间摘要，但必须用
+`finalized=false` 明确标识，且 `pattern_count` 此时等于 `current_pattern_count`。
+当 selectable fault 为空时，第一次调用 `result()` 原子地执行一次 STC 并缓存结果；
+后续调用返回同一个 `finalized=true` 摘要，禁止重复 shuffle 或重复压缩。
 
 旧的 `run_stuck_at_ordered()` 可以保留用于兼容和回归测试，但动态训练、native
 baseline 和动态评估统一通过 session 执行，避免两个执行路径产生指标漂移。native
-baseline 在每一步选择当前 catalog 中最早的合法候选，等价于现有原始顺序行为。
+baseline 在每一步选择当前 catalog 中最早的合法候选，并使用与模型策略完全相同的
+回溯、DTC 和 STC 配置。
+
+PODEM 输入填充与 STC shuffle 使用两个独立的会话级随机数生成器。不得使用共享的
+全局 `srand/rand` 状态；同一个会话对象的可变操作也必须串行化。这样固定配置下
+重复会话的 step trace 和最终压缩结果可复现，并且不同 Python 线程中的会话不会
+互相改变随机轨迹。
 
 ## Episode 收集与梯度重算
 
@@ -191,9 +310,14 @@ log probability 传播。
 reward=P^{previous}-P^{current}.
 \]
 
+其中 \(P\) 一律表示 `patterns_after_stc`，不是逐步生成数量或
+`patterns_before_stc`。native baseline 也必须先执行相同的 DTC/STC 协议，再建立
+previous pattern baseline。
+
 coverage 低于 native resolved coverage 时，继续使用现有强负奖励，并且不更新
 previous pattern baseline。模型不能通过制造 aborted fault 或漏检来获得较少
-pattern 的正收益。
+pattern 的正收益。STC 自身造成检测集合或 coverage 下降属于求解器错误，必须中止
+本轮，而不是进入普通 coverage penalty 分支。
 
 单电路损失固定除以该电路的初始 fault 数 \(N\)：
 
@@ -220,11 +344,15 @@ clipping、temperature schedule 和 minibatch 事务语义保持当前行为。
 - 每个初始 fault 的 `selected_step`，从未被选时为 `-1`；
 - 每个 fault 的 `resolved_step` 和 resolved 原因；
 - 每一步的 remaining count、ratio、selected score、target status、是否生成 pattern、
-  新 drop 的 fault IDs 和累计 solver 指标。
+  新 drop 的 fault IDs、primary/DTC calls 和拆分后的累计 backtracks；
+- `patterns_before_stc`、`patterns_after_stc`、STC 删除数量、shuffle 次数和最终
+  coverage-preservation 检查结果。
 
 训练轮次中的 sampled trajectory 使用紧凑 NPZ 保存整数 mask/indices 和 selected rows；
 面向人工检查的确定性 evaluation trace 使用 JSONL 保存。现有 per-circuit metrics、
-comparison CSV、summary、coverage eligibility 和 best comparison key 保持不变。
+comparison CSV、summary 和 coverage eligibility 保持不变。best comparison key 仍先
+比较最终 pattern 数，但该字段现在明确取 `patterns_after_stc`；其后的 coverage、
+primary calls 和 total backtracks 比较继续使用最终回合摘要。
 
 ## Checkpoint 与恢复
 
@@ -233,8 +361,21 @@ schema 升级。旧的静态 257 维 checkpoint 必须给出明确的 restart �
 加载 scorer 权重或 optimizer state 后继续训练。
 
 新 checkpoint 除当前内容外，还需要记录动态策略版本、输入布局、初始 fault 数、
-temperature、轨迹 RNG 状态和 session binding digest。轮次事务边界不变：只有本轮
-全部 episode、梯度更新、必要评估和日志写入成功后才原子发布 `latest.pt`。
+temperature、轨迹 RNG 状态和 session binding digest，并记录以下求解协议身份：
+
+```text
+primary_backtrack_limit = 200
+dtc_enabled = true
+dtc_secondary_backtrack_limit = 50
+stc_enabled = true
+stc_shuffle_seed = 7
+stc_no_improvement_limit = 5
+scoap_enabled = false
+compression_algorithm_version = "stuck_at_podemx_reverse_shuffle_v1"
+```
+
+恢复或评估时任一字段不一致都必须拒绝加载。轮次事务边界不变：只有本轮全部
+episode、梯度更新、必要评估和日志写入成功后才原子发布 `latest.pt`。
 
 恢复测试必须证明连续训练与中断后恢复产生相同的 sampled action trajectory、模型、
 optimizer、baseline 和 EMA 状态。
@@ -248,7 +389,12 @@ optimizer、baseline 和 EMA 状态。
 - C++ 返回的 remaining IDs 必须是初始 catalog 的无重复子集，且每一步只能减少；
   Python 检测到状态回退或未知 ID 时中止当前轮。
 - TRUE 步必须新增一个 pattern；FALSE/MAYBE 步不得新增 pattern。累计指标必须单调且
-  最终与 `result()` 一致。
+  最终与 `result()` 中的 `patterns_before_stc` 一致；最终 `pattern_count` 可以因 STC
+  小于逐步累计值，但必须等于 `patterns_after_stc`。
+- DTC 失败或达到 secondary 回溯上限后，若 primary/既有 secondary 的约束没有完整
+  恢复，应立即中止回合。
+- `patterns_after_stc` 必须小于或等于 `patterns_before_stc`，且 STC 前后的已检测
+  fault 集合和 equivalent coverage 必须完全一致，否则中止当前轮。
 - solver 异常、非有限 loss、无效 mask 或不能重放的轨迹中止当前轮，不提交模型、
   optimizer、baseline、EMA 或 RNG 状态。
 - coverage 不合格仍作为带强负 reward 的有效训练样本处理，不当作程序错误。
@@ -269,12 +415,22 @@ optimizer、baseline 和 EMA 状态。
 ### C++ session 与 binding 测试
 
 - session 初始 remaining IDs 与 catalog 完全一致。
+- primary PODEM 对每个 fault 使用 200 次回溯上限；达到上限时返回 MAYBE。
+- TRUE 后运行 stuck-at PODEMX；每个 secondary fault 最多回溯 50 次。
+- PODEMX 只能约束未知输入，并在保持 primary 可检测的情况下加入 secondary fault。
+- DTC 失败会完整回滚本次赋值；成功的 secondary 只有经过最终 fault simulation
+  检测后才从 remaining 集合 drop，且不会被标记为 primary selection。
 - TRUE 后返回精确的 newly detected IDs，并从 remaining 集合 drop。
 - FALSE 和 MAYBE 不增加 pattern，并且目标不再可选。
 - 已 drop、已尝试、重复及未知 ID 在 PODEM 前被拒绝。
-- 按 catalog 首个剩余 fault 逐步运行的 native session 指标与当前
-  `run_stuck_at_ordered(native_order)` 完全一致。
-- 固定 seed 下重复 session 的 step trace 和最终指标一致。
+- STC 先反向压缩，再用 seed 7 shuffle；连续 5 次无改进后停止。
+- STC 前后检测集合与 equivalent coverage 完全一致，且
+  `patterns_after_stc <= patterns_before_stc`。
+- 按 catalog 首个剩余 fault 逐步运行的 native session 与动态 session 使用相同的
+  backtrack/DTC/STC 协议。
+- 固定 seed 下重复 session 的 step trace、DTC 统计、STC 结果和最终指标一致。
+- 并发创建和运行独立 session 不会互相改变随机轨迹；同一 session 的可变操作被
+  串行化。
 
 ### Trainer 与端到端测试
 
@@ -282,12 +438,13 @@ optimizer、baseline 和 EMA 状态。
   ratio 和 scores，而不是沿用初始顺序。
 - sampled trajectory 在 `no_grad` 收集后可用相同参数精确重算 log probability。
 - coverage penalty、previous-pattern baseline、EMA advantage、minibatch 和 best 选择
-  保持当前语义。
+  保持当前语义，但所有 pattern 比较使用 `patterns_after_stc`。
 - 动态 evaluation 生成完整 decision/drop trace，不把被顺带 drop 的 fault 标记为
   primary selection。
+- evaluation 和 round artifacts 同时保存 DTC 开销及 STC 前后 pattern 数。
 - checkpoint resume 精确恢复下一条动态轨迹；旧 schema 被明确拒绝。
 - 至少一个微型真实电路完成 native baseline、动态 episode、optimizer update、
-  checkpoint、resume 和确定性评估。
+  DTC、STC、checkpoint、resume 和确定性评估。
 
 ## 验收标准
 
@@ -298,17 +455,24 @@ optimizer、baseline 和 EMA 状态。
 3. 训练使用动态 masked categorical trajectory log probability，损失除以初始
    fault 数，不除以实际决策步数。
 4. 梯度不穿过 PODEM；动态轨迹可在 episode 后重放并产生有限 scorer 梯度。
-5. native baseline、coverage guard、pattern-count reward、best 资格和最终指标与当前
-   定义一致。
-6. 确定性评估可复现，并明确区分 primary-selected fault 与 fault-sim-dropped fault。
-7. 静态旧 checkpoint 不得静默迁移；新 checkpoint 可精确中断恢复。
+5. 每个 primary fault 的主 PODEM 回溯上限固定为 200；TRUE 后执行回溯上限为 50
+   的 stuck-at PODEMX DTC，失败尝试不污染已建立的测试 cube。
+6. episode 结束后执行 reverse-order 加固定 seed shuffle 的 STC；最终 reward 使用
+   `patterns_after_stc`，并且压缩前后检测集合与 coverage 完全一致。
+7. native baseline、coverage guard、pattern-count reward、best 资格和最终指标使用与
+   模型策略完全相同的 backtrack/DTC/STC 协议。
+8. 确定性评估可复现，并明确区分 primary-selected fault、DTC secondary 尝试与
+   fault-sim-dropped fault。
+9. 静态旧 checkpoint 或压缩配置不一致的 checkpoint 不得静默迁移；新 checkpoint
+   可精确中断恢复。
 
 ## 不在本次范围内
 
 - 微调 DeepGate2 或重新生成 257 维 embedding。
-- 修改 fault collapsing、fault catalog、PODEM objective/backtrace 或 fault simulation
-  语义。
+- 修改 fault collapsing、fault catalog、primary PODEM objective/backtrace 或 fault
+  simulation 的检测语义。
 - attention、Transformer、显式 embedding 乘积/差值或 marginal-coverage 辅助头。
-- Top-K PODEM lookahead、STC、DTC、SCOAP、transition-delay 或并行 solver worker。
+- Top-K primary PODEM lookahead、SCOAP fault ordering、transition-delay ATPG 或并行
+  solver worker。
 - 将 PODEM calls、backtracks 或运行时间加入主要 reward；第一版仍只以 pattern count
   改进为正向目标，并用 coverage penalty 保证有效性。
