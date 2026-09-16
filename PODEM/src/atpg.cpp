@@ -34,6 +34,9 @@ void ATPG::configure_ordered_stuck_at(const StuckAtProtocolConfig &config)
 	stuck_at_redundant_faults = 0;
 	stuck_at_redundant_equivalent_faults = 0;
 	stuck_at_podem_calls = 0;
+	stuck_at_dtc_secondary_calls = 0;
+	stuck_at_primary_backtracks = 0;
+	stuck_at_dtc_backtracks = 0;
 }
 
 void ATPG::prepare_stuck_at_session()
@@ -103,6 +106,10 @@ ATPG::AtpgRunResult ATPG::get_stuck_at_result() const
 	result.redundant_equivalent_faults = stuck_at_redundant_equivalent_faults;
 	result.podem_calls = stuck_at_podem_calls;
 	result.total_backtracks = stuck_at_total_backtracks;
+	result.primary_podem_calls = stuck_at_podem_calls;
+	result.dtc_secondary_calls = stuck_at_dtc_secondary_calls;
+	result.primary_backtracks = stuck_at_primary_backtracks;
+	result.dtc_backtracks = stuck_at_dtc_backtracks;
 	for (const auto &owned_fault : flist)
 	{
 		if (owned_fault->detect == TRUE)
@@ -146,12 +153,17 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 	{
 		case TRUE:
 		{
-			// DTC is inserted before this boundary by the next protocol task. Keep
-			// the successful primary cube's U inputs intact until step-level fill.
+			const DtcResult dtc = run_stuck_at_dtc(fault_under_test);
+			step.dtc_attempted_fault_ids = dtc.attempted_fault_ids;
+			step.dtc_embedded_fault_ids = dtc.embedded_fault_ids;
+			stuck_at_dtc_secondary_calls += dtc.secondary_calls;
+			stuck_at_dtc_backtracks += dtc.backtracks;
+			stuck_at_total_backtracks += dtc.backtracks;
 			fill_stuck_at_primary_cube();
 			string vec;
 			for (wptr wire : cktin)
 				vec.push_back(itoc(wire->value));
+			step.generated_test_vector = vec;
 			if (print_test_vectors)
 				display_io();
 			int current_detect_num = 0;
@@ -177,7 +189,11 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 	}
 	fault_under_test->test_tried = true;
 	stuck_at_total_backtracks += current_backtracks;
+	stuck_at_primary_backtracks += current_backtracks;
 	stuck_at_podem_calls++;
+	step.current_dtc_secondary_calls = stuck_at_dtc_secondary_calls;
+	step.current_primary_backtracks = stuck_at_primary_backtracks;
+	step.current_dtc_backtracks = stuck_at_dtc_backtracks;
 
 	const vector<string> undetected_ids = [&]() {
 		vector<string> ids;

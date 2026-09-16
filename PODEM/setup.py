@@ -15,6 +15,7 @@ CORE_SOURCES = [
     "level.cpp",
     "sim.cpp",
     "podem.cpp",
+    "saf_compaction.cpp",
     "init_flist.cpp",
     "faultsim.cpp",
     "tdfsim.cpp",

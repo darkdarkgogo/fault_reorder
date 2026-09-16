@@ -99,12 +99,29 @@ public:
 		int redundant_equivalent_faults{};
 		int podem_calls{};
 		int total_backtracks{};
+		int primary_podem_calls{};
+		int dtc_secondary_calls{};
+		int primary_backtracks{};
+		int dtc_backtracks{};
+	};
+	struct DtcResult
+	{
+		int secondary_calls{};
+		int backtracks{};
+		vector<string> attempted_fault_ids;
+		vector<string> embedded_fault_ids;
 	};
 	struct AtpgStepResult
 	{
 		string selected_fault_id;
 		string target_status;
 		bool generated_pattern{};
+		string generated_test_vector;
+		vector<string> dtc_attempted_fault_ids;
+		vector<string> dtc_embedded_fault_ids;
+		int current_dtc_secondary_calls{};
+		int current_primary_backtracks{};
+		int current_dtc_backtracks{};
 		vector<string> newly_detected_fault_ids;
 		vector<string> remaining_fault_ids;
 		AtpgRunResult cumulative_result;
@@ -214,6 +231,9 @@ private:
 	int stuck_at_redundant_faults{};
 	int stuck_at_redundant_equivalent_faults{};
 	int stuck_at_podem_calls{};
+	int stuck_at_dtc_secondary_calls{};
+	int stuck_at_primary_backtracks{};
+	int stuck_at_dtc_backtracks{};
 	StuckAtProtocolConfig stuck_at_protocol_config{};
 	mt19937 primary_fill_rng{14};
 	mt19937 stc_shuffle_rng{7};
@@ -326,6 +346,11 @@ private:
 	void unmark_propagate_tree(nptr);
 	int set_uniquely_implied_value(fptr);
 	int backward_imply(wptr, const int &);
+
+	/* declared in saf_compaction.cpp; these never update fault status */
+	DtcResult run_stuck_at_dtc(fptr primary);
+	int stuck_at_podemx_secondary(fptr fault, int &backtracks);
+	bool stuck_at_cube_detects(fptr fault);
 
 	/* New flags */
 	bool dynamic_test_compression = false;

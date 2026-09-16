@@ -43,6 +43,10 @@ py::dict summary_to_dict(const ATPG::AtpgRunResult &summary) {
   result["redundant_equivalent_faults"] = summary.redundant_equivalent_faults;
   result["podem_calls"] = summary.podem_calls;
   result["total_backtracks"] = summary.total_backtracks;
+  result["primary_podem_calls"] = summary.primary_podem_calls;
+  result["dtc_secondary_calls"] = summary.dtc_secondary_calls;
+  result["primary_backtracks"] = summary.primary_backtracks;
+  result["dtc_backtracks"] = summary.dtc_backtracks;
   return result;
 }
 
@@ -167,6 +171,12 @@ public:
     result["selected_fault_id"] = step_result.selected_fault_id;
     result["target_status"] = step_result.target_status;
     result["generated_pattern"] = step_result.generated_pattern;
+    result["generated_test_vector"] = step_result.generated_test_vector;
+    result["dtc_attempted_fault_ids"] = step_result.dtc_attempted_fault_ids;
+    result["dtc_embedded_fault_ids"] = step_result.dtc_embedded_fault_ids;
+    result["current_dtc_secondary_calls"] = step_result.current_dtc_secondary_calls;
+    result["current_primary_backtracks"] = step_result.current_primary_backtracks;
+    result["current_dtc_backtracks"] = step_result.current_dtc_backtracks;
     result["newly_detected_fault_ids"] = step_result.newly_detected_fault_ids;
     result["remaining_fault_ids"] = step_result.remaining_fault_ids;
     result["current_pattern_count"] =

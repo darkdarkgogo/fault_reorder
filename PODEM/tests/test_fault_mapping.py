@@ -64,6 +64,129 @@ class FaultMappingTests(unittest.TestCase):
         )
         return binary, fault_map
 
+    def make_dtc_fixture(self, failure_only=False):
+        # x:sa0 fixes a=1, leaving b and c unknown. z:sa0 can embed c=1;
+        # y:sa0 is impossible for both b values, and z:sa1 conflicts with c=1.
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\n"
+            "OUTPUT(x)\nOUTPUT(y)\nOUTPUT(z)\n"
+            "x = BUF(a)\nn = NOT(b)\ny = AND(b,n)\nz = BUF(c)\n"
+        )
+        ids = ["x:GO:sa0", "y:GO:sa0"] if failure_only else [
+            "x:GO:sa0", "z:GO:sa0", "y:GO:sa0", "z:GO:sa1",
+        ]
+        self.keep_dtc_faults(fault_map, ids)
+        return binary, fault_map
+
+    def keep_dtc_faults(self, fault_map, ids):
+        lines = fault_map.read_text(encoding="ascii").splitlines()
+        records = {line.split()[1]: line for line in lines if line.startswith("fault ")}
+        selected = [records[fault_id] for fault_id in ids]
+        fault_map.write_text("\n".join([
+            *lines[:3], f"count {len(selected)}",
+            f"uncollapsed_total {sum(int(line.split()[7]) for line in selected)}",
+            *selected, "end", "",
+        ]), encoding="ascii")
+
+    def test_stuck_at_dtc_reports_secondary_attempts_without_primary_selection(self):
+        binary, fault_map = self.make_dtc_fixture()
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        step = session.step("x:GO:sa0")
+        self.assertEqual(step["target_status"], "detected")
+        self.assertEqual(step["dtc_attempted_fault_ids"], [
+            "z:GO:sa0", "y:GO:sa0", "z:GO:sa1",
+        ])
+        self.assertEqual(step["dtc_embedded_fault_ids"], ["z:GO:sa0"])
+        self.assertEqual(step["current_dtc_secondary_calls"], 3)
+        self.assertGreater(step["current_dtc_backtracks"], 0)
+        self.assertLessEqual(step["current_dtc_backtracks"], 3 * 50)
+        self.assertEqual(step["current_total_backtracks"],
+                         step["current_primary_backtracks"] + step["current_dtc_backtracks"])
+        self.assertEqual(step["generated_test_vector"][0], "1")
+        self.assertEqual(step["generated_test_vector"][2], "1")
+        self.assertEqual(set(step["newly_detected_fault_ids"]), {"x:GO:sa0", "z:GO:sa0"})
+        self.assertEqual(step["remaining_fault_ids"], ["y:GO:sa0", "z:GO:sa1"])
+        self.assertEqual(step["podem_calls"], 1)
+        self.assertEqual(step["primary_podem_calls"], 1)
+        self.assertEqual(step["dtc_secondary_calls"], 3)
+        self.assertEqual(step["aborted_faults"], 0)
+        self.assertEqual(step["redundant_faults"], 0)
+        # A failed secondary is still eligible to become the next primary.
+        next_step = session.step("z:GO:sa1")
+        self.assertEqual(next_step["target_status"], "detected")
+        self.assertEqual(next_step["generated_test_vector"][2], "0")
+        self.assertEqual(next_step["dtc_attempted_fault_ids"], ["y:GO:sa0"])
+        self.assertEqual(next_step["dtc_secondary_calls"], 4)
+        self.assertEqual(next_step["current_dtc_secondary_calls"], 4)
+        self.assertGreater(next_step["current_dtc_backtracks"], step["current_dtc_backtracks"])
+        self.assertEqual(next_step["current_total_backtracks"],
+                         next_step["current_primary_backtracks"] + next_step["current_dtc_backtracks"])
+        self.assertEqual(next_step["total_backtracks"],
+                         next_step["primary_backtracks"] + next_step["dtc_backtracks"])
+
+    def test_failed_stuck_at_dtc_attempt_restores_primary_cube(self):
+        binary, fault_map = self.make_dtc_fixture(failure_only=True)
+        for seed in (0, 1, 14, 99):
+            with self.subTest(seed=seed):
+                enabled = cpp_podem.StuckAtSession(
+                    str(binary), str(fault_map), seed=seed, dtc_enabled=True)
+                disabled = cpp_podem.StuckAtSession(
+                    str(binary), str(fault_map), seed=seed, dtc_enabled=False)
+                actual = enabled.step("x:GO:sa0")
+                baseline = disabled.step("x:GO:sa0")
+                self.assertEqual(actual["target_status"], "detected")
+                self.assertEqual(actual["dtc_attempted_fault_ids"], ["y:GO:sa0"])
+                self.assertEqual(actual["dtc_embedded_fault_ids"], [])
+                self.assertGreater(actual["current_dtc_backtracks"], 0)
+                self.assertEqual(actual["generated_test_vector"], baseline["generated_test_vector"])
+                self.assertEqual(actual["newly_detected_fault_ids"], baseline["newly_detected_fault_ids"])
+                self.assertEqual(actual["remaining_fault_ids"], ["y:GO:sa0"])
+                self.assertEqual(baseline["dtc_attempted_fault_ids"], [])
+                self.assertEqual(baseline["dtc_secondary_calls"], 0)
+                self.assertEqual(enabled.step("y:GO:sa0")["target_status"], "redundant")
+
+    def test_limited_stuck_at_dtc_attempt_restores_cube_and_keeps_fault_selectable(self):
+        # A seven-input parity requires all seven assignments. Its conjunction
+        # with its own inverse is unsatisfiable and exceeds the 50-flip budget.
+        lines = ["INPUT(a)", *[f"INPUT(b{i})" for i in range(7)],
+                 "OUTPUT(x)", "OUTPUT(y)", "x = BUF(a)"]
+        parity = "b0"
+        for i in range(1, 7):
+            lines.extend([
+                f"n{i} = NAND({parity},b{i})",
+                f"l{i} = NAND({parity},n{i})",
+                f"r{i} = NAND(b{i},n{i})",
+                f"p{i} = NAND(l{i},r{i})",
+            ])
+            parity = f"p{i}"
+        lines.extend([f"inv = NOT({parity})", f"y = AND({parity},inv)", ""])
+        _, binary, fault_map, _, _ = self.convert("\n".join(lines))
+        self.keep_dtc_faults(fault_map, ["x:GO:sa0", "y:GO:sa0"])
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        actual = session.step("x:GO:sa0")
+        baseline = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), dtc_enabled=False).step("x:GO:sa0")
+        self.assertEqual(actual["dtc_attempted_fault_ids"], ["y:GO:sa0"])
+        self.assertEqual(actual["dtc_embedded_fault_ids"], [])
+        self.assertEqual(actual["current_dtc_backtracks"], 50)
+        self.assertEqual(actual["generated_test_vector"], baseline["generated_test_vector"])
+        self.assertEqual(actual["remaining_fault_ids"], ["y:GO:sa0"])
+        self.assertEqual(actual["aborted_faults"], 0)
+        self.assertEqual(actual["redundant_faults"], 0)
+        self.assertIn(session.step("y:GO:sa0")["target_status"], ("redundant", "aborted"))
+
+    def test_stuck_at_dtc_preserves_expanded_xor_input_faults(self):
+        _, binary, fault_map, _, catalog = self.convert(expanded_xor(True, True))
+        for fault in catalog["faults"]:
+            fault_id = fault["fault_id"]
+            with self.subTest(primary=fault_id):
+                session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+                step = session.step(fault_id)
+                self.assertEqual(step["target_status"], "detected")
+                self.assertIn(fault_id, step["newly_detected_fault_ids"])
+                self.assertLessEqual(set(step["dtc_embedded_fault_ids"]),
+                                     set(step["newly_detected_fault_ids"]))
+
     def test_multi_input_gate_uses_only_original_fault_ids(self):
         source, binary, _, stats, mapped = self.convert("\n".join([
             "INPUT(a)",
@@ -237,6 +360,8 @@ class FaultMappingTests(unittest.TestCase):
             "aborted_faults", "redundant_faults",
             "redundant_equivalent_faults", "podem_calls",
             "total_backtracks",
+            "primary_podem_calls", "dtc_secondary_calls",
+            "primary_backtracks", "dtc_backtracks",
         }
 
         native = cpp_podem.run_stuck_at_ordered(
@@ -583,7 +708,12 @@ class FaultMappingTests(unittest.TestCase):
                 )
                 while session.remaining_fault_ids():
                     session.step(session.remaining_fault_ids()[0])
-                self.assertEqual(session.result(), expected_result)
+                result = session.result()
+                self.assertEqual({key: result[key] for key in expected_result}, expected_result)
+                self.assertEqual(result["primary_podem_calls"], expected_result["podem_calls"])
+                self.assertEqual(result["primary_backtracks"], expected_result["total_backtracks"])
+                self.assertEqual(result["dtc_secondary_calls"], 0)
+                self.assertEqual(result["dtc_backtracks"], 0)
 
     def test_same_session_concurrent_steps_are_serialized(self):
         binary, fault_map = self.make_three_input_and_fixture()
