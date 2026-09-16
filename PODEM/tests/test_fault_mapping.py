@@ -203,6 +203,39 @@ class FaultMappingTests(unittest.TestCase):
         self.assertEqual(result["detected_equivalent_faults"], result["uncollapsed_faults"])
         self.assertLessEqual(result["patterns_after_stc"], result["patterns_before_stc"])
 
+    def test_stc_finalization_preserves_detected_set_with_redundant_tail(self):
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\nOUTPUT(z)\nOUTPUT(w)\n"
+            "n1 = AND(a,b)\ny = OR(a,n1)\nn = BUF(c)\nz = BUF(n)\nw = BUF(n)\n"
+        )
+        # The legacy simulator skips a redundant tail before flushing its
+        # pending packet. STC must preserve the session's actual detected set.
+        self.keep_dtc_faults(fault_map, ["n:GO:sa0", "n1:GO:sa0"])
+        for stc_enabled in (False, True):
+            with self.subTest(stc_enabled=stc_enabled):
+                session = cpp_podem.StuckAtSession(
+                    str(binary), str(fault_map), stc_enabled=stc_enabled)
+                redundant = session.step("n1:GO:sa0")
+                self.assertEqual(redundant["target_status"], "redundant")
+                last = session.step("n:GO:sa0")
+                self.assertEqual(last["target_status"], "detected")
+                self.assertEqual(last["generated_test_vector"], "111")
+                self.assertEqual(last["newly_detected_fault_ids"], [])
+                self.assertEqual(session.remaining_fault_ids(), [])
+                result = session.result()
+                self.assertTrue(result["finalized"])
+                self.assertTrue(result["stc_coverage_preserved"])
+                self.assertEqual(result["current_pattern_count"], 1)
+                self.assertEqual(result["patterns_before_stc"], 1)
+                self.assertEqual(result["patterns_after_stc"], 0 if stc_enabled else 1)
+                for key in ("detected_collapsed_faults", "detected_equivalent_faults",
+                            "redundant_faults", "redundant_equivalent_faults", "aborted_faults",
+                            "podem_calls", "primary_podem_calls", "dtc_secondary_calls",
+                            "total_backtracks", "primary_backtracks", "dtc_backtracks"):
+                    self.assertEqual(result[key], last[key], key)
+                self.assertEqual(result, session.result())
+                self.assertEqual(session.remaining_fault_ids(), [])
+
     def keep_dtc_faults(self, fault_map, ids):
         lines = fault_map.read_text(encoding="ascii").splitlines()
         records = {line.split()[1]: line for line in lines if line.startswith("fault ")}

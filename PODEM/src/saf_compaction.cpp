@@ -175,9 +175,13 @@ ATPG::AtpgRunResult ATPG::finalize_stuck_at_session()
 	int expected_equivalents = 0;
 	for (const auto &fault : flist)
 	{
-		detection_faults.push_back(*fault);
 		if (fault->detect == TRUE)
 		{
+			// STC preserves the detected target set, not all catalog faults.
+			// Replaying undetected/redundant entries can change legacy packet
+			// flushing (a redundant tail skips the flush) and discover extra IDs.
+			// Only clone targets already detected by the completed session.
+			detection_faults.push_back(*fault);
 			expected_ids.push_back(fault_identifier(fault.get()));
 			expected_equivalents += fault->eqv_fault_num;
 		}
