@@ -685,6 +685,8 @@ git commit -m "feat: evaluate compressed dynamic trajectories"
 ### Task 8: 任务 8：真实求解器集成、文档和完整验证
 
 **涉及文件：**
+- 修改：`PODEM/src/faultsim.cpp`
+- 修改：`PODEM/tests/test_fault_mapping.py`
 - 修改：`tests/test_fault_order_rl.py`
 - 修改：`docs/fault-order-rl.md`
 
@@ -692,7 +694,21 @@ git commit -m "feat: evaluate compressed dynamic trajectories"
 - 使用：完成的 Schema 3 动态压缩策略与重建后的 `cpp_podem`。
 - 产出：真实微型电路上的端到端证据和与实现一致的运行文档。
 
-- [ ] **步骤 1：扩展真实 PODEM 冒烟测试**
+- [ ] **步骤 1：修复 redundant-tail 的 SAF fault-sim 尾包冲刷**
+
+先在 `PODEM/tests/test_fault_mapping.py` 添加自包含回归电路：
+
+```text
+n1 = AND(a,b)
+y = OR(a,n1)
+n = BUF(c)
+z = BUF(n)
+w = BUF(n)
+```
+
+fault-map 顺序为 `[n:GO:sa0, n1:GO:sa0]`。先选择返回 redundant 的 `n1`，再选择生成向量的 `n`；断言生成向量实际检测到 `n`，`newly_detected_fault_ids` 包含它，并且最终 STC 保留该检测集合。当前 `faultsim.cpp` 在尾元素为 REDUNDANT 时 `continue`，会跳过待处理 packet 的尾部 flush，测试应先失败。将 packet flush 移到不依赖最后一个候选是否 redundant 的位置，不改变非冗余顺序下的检测语义；运行聚焦绑定测试确认通过。
+
+- [ ] **步骤 2：扩展真实 PODEM 冒烟测试**
 
 在测试内转换微型 BENCH，运行一轮真实动态训练和确定性评估，断言：
 
@@ -708,7 +724,7 @@ assert trajectory_jsonl_exists
 assert native_resolved_coverage_is_preserved
 ```
 
-- [ ] **步骤 2：运行真实求解器冒烟测试**
+- [ ] **步骤 3：运行真实求解器冒烟测试**
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py -k real_podem -v
@@ -716,11 +732,11 @@ C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py 
 
 预期结果：真实 C++ session 完成 primary PODEM、DTC、fault simulation、STC 和有限的 optimizer update。
 
-- [ ] **步骤 3：更新运行文档**
+- [ ] **步骤 4：更新运行文档**
 
 在 `docs/fault-order-rl.md` 中记录：515 维布局、remaining mask、逐步采样/确定性选择、轨迹 log probability、初始 fault 数归一化、主回溯 200、DTC 回溯 50、DTC secondary 语义、STC reverse/shuffle 参数、压缩后奖励、Schema 3 重启要求，以及初始 ranking 与真实执行轨迹的区别。删除“每回合生成一个完整 permutation”和“STC/DTC 关闭”的现行描述。
 
-- [ ] **步骤 4：运行格式和过时配置检查**
+- [ ] **步骤 5：运行格式和过时配置检查**
 
 ```powershell
 git diff --check
@@ -729,7 +745,7 @@ rg -n "backtrack limit=5000|backtrack_limit=5000|STC、DTC、SCOAP.*关闭|compl
 
 预期结果：diff 无格式错误；命中项只能描述历史迁移背景，不能代表现行协议。
 
-- [ ] **步骤 5：运行完整相关测试套件**
+- [ ] **步骤 6：运行完整相关测试套件**
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py PODEM/tests/test_fault_mapping.py -v
@@ -737,7 +753,7 @@ C:\Users\acer\.conda\envs\d2l\python.exe -m pytest tests/test_fault_order_rl.py 
 
 预期结果：全部 PASS。
 
-- [ ] **步骤 6：校验一个生产 manifest，不启动训练**
+- [ ] **步骤 7：校验一个生产 manifest，不启动训练**
 
 ```powershell
 C:\Users\acer\.conda\envs\d2l\python.exe -m fault_order_rl validate --manifest configs/anchor_smoke_train.json
@@ -745,17 +761,17 @@ C:\Users\acer\.conda\envs\d2l\python.exe -m fault_order_rl validate --manifest c
 
 预期结果：manifest、catalog、embedding 维度、ID、等价故障数和 provenance 全部通过。
 
-- [ ] **步骤 7：审查完整改动**
+- [ ] **步骤 8：审查完整改动**
 
 调用 `requesting-code-review` 技能。解决所有正确性问题；先运行最小受影响测试，再运行完整套件。确认 `git status --short` 没有构建产物或无关的已暂存改动。
 
-- [ ] **步骤 8：提交文档与集成测试**
+- [ ] **步骤 9：提交文档与集成测试**
 
 ```powershell
-git add tests/test_fault_order_rl.py docs/fault-order-rl.md
+git add PODEM/src/faultsim.cpp PODEM/tests/test_fault_mapping.py tests/test_fault_order_rl.py docs/fault-order-rl.md
 git commit -m "docs: describe compressed dynamic fault selection"
 ```
 
-- [ ] **步骤 9：报告验证证据**
+- [ ] **步骤 10：报告验证证据**
 
 报告准确的通过命令、微型动态压缩电路、检查点不兼容情况、已知限制，以及设计规格和实施计划路径。冒烟测试只能证明流程正确，不能用于宣称真实训练已经减少 pattern 数。
