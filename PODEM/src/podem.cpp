@@ -162,32 +162,8 @@ int ATPG::podem(const fptr fault, int &current_backtracks)
 
 	if (find_test)
 	{
-		/* normally, we want one pattern per fault */
-		if (total_attempt_num == 1)
-		{
-
-			for (i = 0; i < ncktin; i++)
-			{
-				switch (cktin[i]->value)
-				{
-					case 0:
-					case 1:
-						break;
-					case D:
-						cktin[i]->value = 1;
-						break;
-					case D_bar:
-						cktin[i]->value = 0;
-						break;
-					case U:
-						cktin[i]->value = rand() & 01;
-						break; // random fill U
-				}
-			}
-			if (print_test_vectors)
-				display_io();
-		}
-		else
+		// Preserve the primary test cube for step-level DTC and random fill.
+		if (total_attempt_num != 1)
 			fprintf(stdout, "\n"); // do not random fill when multiple patterns per fault
 		return (TRUE);
 	}

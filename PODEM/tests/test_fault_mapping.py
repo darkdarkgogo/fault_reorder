@@ -1,7 +1,9 @@
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +57,12 @@ class FaultMappingTests(unittest.TestCase):
         source.write_text(text, encoding="ascii")
         stats = convert_binary_bench(source, binary, fault_map)
         return source, binary, fault_map, stats, catalog_cpp_podem(binary, fault_map)
+
+    def make_three_input_and_fixture(self):
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\ny = AND(a,b,c)\n"
+        )
+        return binary, fault_map
 
     def test_multi_input_gate_uses_only_original_fault_ids(self):
         source, binary, _, stats, mapped = self.convert("\n".join([
@@ -235,7 +243,7 @@ class FaultMappingTests(unittest.TestCase):
             str(binary), str(fault_map), fault_ids
         )
         explicit_native = cpp_podem.run_stuck_at_ordered(
-            str(binary), str(fault_map), fault_ids, 5000, 14
+            str(binary), str(fault_map), fault_ids, 200, 14
         )
         reversed_run = cpp_podem.run_stuck_at_ordered(
             str(binary), str(fault_map), list(reversed(fault_ids))
@@ -309,10 +317,10 @@ class FaultMappingTests(unittest.TestCase):
         )
         ids = [str(item["fault_id"]) for item in catalog["faults"]]
         expected = cpp_podem.run_stuck_at_ordered(
-            str(binary), str(fault_map), ids, 5000, 14
+            str(binary), str(fault_map), ids, 200, 14
         )
         session = cpp_podem.StuckAtSession(
-            str(binary), str(fault_map), 5000, 14
+            str(binary), str(fault_map), 200, 14
         )
         self.assertEqual(
             [str(item["fault_id"]) for item in session.catalog()["faults"]],
@@ -335,13 +343,270 @@ class FaultMappingTests(unittest.TestCase):
         )
         fault_id = str(catalog["faults"][0]["fault_id"])
         session = cpp_podem.StuckAtSession(
-            str(binary), str(fault_map), 5000, 14
+            str(binary), str(fault_map), 200, 14
         )
         session.step(fault_id)
         with self.assertRaisesRegex(RuntimeError, "not selectable"):
             session.step(fault_id)
         with self.assertRaisesRegex(RuntimeError, "Unknown fault ID"):
             session.step("missing:GO:sa0")
+
+    def test_stuck_at_session_reports_fixed_protocol(self):
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nOUTPUT(y)\ny = AND(a,b)\n"
+        )
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        self.assertEqual(session.config(), {
+            "primary_backtrack_limit": 200,
+            "primary_seed": 14,
+            "attempts_per_primary_fault": 1,
+            "dtc_enabled": True,
+            "dtc_secondary_backtrack_limit": 50,
+            "stc_enabled": True,
+            "stc_reverse_order_enabled": True,
+            "stc_shuffle_seed": 7,
+            "stc_no_improvement_limit": 5,
+            "scoap_enabled": False,
+        })
+        snapshot = session.config()
+        snapshot["primary_seed"] = 99
+        snapshot["dtc_enabled"] = False
+        self.assertEqual(session.config()["primary_seed"], 14)
+        self.assertTrue(session.config()["dtc_enabled"])
+
+    def test_interleaved_sessions_have_identical_primary_traces(self):
+        binary, fault_map = self.make_three_input_and_fixture()
+        left = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        right = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        left_trace, right_trace = [], []
+        while left.remaining_fault_ids():
+            fault_id = left.remaining_fault_ids()[0]
+            self.assertEqual(fault_id, right.remaining_fault_ids()[0])
+            left_trace.append(left.step(fault_id))
+            right_trace.append(right.step(fault_id))
+        self.assertEqual(left_trace, right_trace)
+        self.assertEqual(right.remaining_fault_ids(), [])
+
+    def test_random_fill_is_repeatable_interleaved_and_concurrent(self):
+        # Each independent output leaves other inputs unknown in the primary
+        # cube, so fault dropping observes the random fill directly.
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\nINPUT(d)\n"
+            "OUTPUT(w)\nOUTPUT(x)\nOUTPUT(y)\nOUTPUT(z)\n"
+            "w = BUF(a)\nx = BUF(b)\ny = BUF(c)\nz = BUF(d)\n"
+        )
+
+        def new_session(seed=14):
+            return cpp_podem.StuckAtSession(
+                str(binary), str(fault_map), 200, seed, False, False
+            )
+
+        def collect_trace(session):
+            trace = []
+            while session.remaining_fault_ids():
+                trace.append(session.step(session.remaining_fault_ids()[0]))
+            return trace
+
+        # Guard against a fixture which never consumes RNG state.
+        first_drops = []
+        for seed in range(4):
+            session = new_session(seed)
+            first_drops.append(tuple(session.step(
+                session.remaining_fault_ids()[0]
+            )["newly_detected_fault_ids"]))
+        self.assertGreater(len(set(first_drops)), 1)
+
+        expected = collect_trace(new_session())
+        self.assertEqual(collect_trace(new_session()), expected)
+        left, right = new_session(), new_session()
+        left_trace, right_trace = [], []
+        while left.remaining_fault_ids():
+            fault_id = left.remaining_fault_ids()[0]
+            self.assertEqual(right.remaining_fault_ids()[0], fault_id)
+            left_trace.append(left.step(fault_id))
+            right_trace.append(right.step(fault_id))
+        self.assertEqual(left_trace, expected)
+        self.assertEqual(right_trace, expected)
+        self.assertEqual(right.remaining_fault_ids(), [])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            traces = list(pool.map(collect_trace, [new_session(), new_session()]))
+        self.assertEqual(traces, [expected, expected])
+
+    def test_incremental_status_updates_are_exact(self):
+        binary, fault_map = self.make_three_input_and_fixture()
+        detected = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), 200, 14, False, False
+        )
+        before = detected.result()
+        step = detected.step("dummy_gate1:GO:sa1")
+        self.assertEqual(step["target_status"], "detected")
+        self.assertTrue(step["generated_pattern"])
+        self.assertEqual(step["pattern_count"], before["pattern_count"] + 1)
+
+        _, redundant_binary, redundant_map, _, _ = self.convert(
+            "INPUT(a)\n"
+            "INPUT(b)\n"
+            "OUTPUT(y)\n"
+            "n1 = AND(a,b)\n"
+            "y = OR(a,n1)\n"
+        )
+        redundant = cpp_podem.StuckAtSession(
+            str(redundant_binary), str(redundant_map), 200, 14, False, False
+        )
+        for fault_id in (
+            "dummy_gate1:GO:sa0",
+            "dummy_gate1:GO:sa1",
+            "n1:GI0:sa1",
+        ):
+            redundant.step(fault_id)
+        before = redundant.result()
+        step = redundant.step("dummy_gate2:GO:sa1")
+        self.assertEqual(step["target_status"], "redundant")
+        self.assertFalse(step["generated_pattern"])
+        self.assertEqual(step["pattern_count"], before["pattern_count"])
+
+        aborted = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), 0, 14, False, False
+        )
+        before = aborted.result()
+        step = aborted.step("dummy_gate1:GO:sa1")
+        self.assertEqual(step["target_status"], "aborted")
+        self.assertFalse(step["generated_pattern"])
+        self.assertEqual(step["pattern_count"], before["pattern_count"])
+
+        for session, selected_id in (
+            (detected, "dummy_gate1:GO:sa1"),
+            (redundant, "dummy_gate2:GO:sa1"),
+            (aborted, "dummy_gate1:GO:sa1"),
+        ):
+            before_errors = session.result()
+            remaining = session.remaining_fault_ids()
+            self.assertNotIn(selected_id, remaining)
+            with self.assertRaisesRegex(RuntimeError, "not selectable"):
+                session.step(selected_id)
+            with self.assertRaisesRegex(RuntimeError, "Unknown fault ID"):
+                session.step("missing:GO:sa0")
+            self.assertEqual(session.result(), before_errors)
+            self.assertEqual(session.remaining_fault_ids(), remaining)
+
+    def test_incremental_session_matches_independent_de86cdd_goldens(self):
+        # Captured from run_stuck_at_ordered in an isolated de86cdd worktree
+        # before this refactor, seed=14, compression disabled. Do not regenerate
+        # these constants through the current incremental implementation.
+        cases = (
+            (
+                "INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\n"
+                "y = AND(a,b,c)\n",
+                200,
+                [
+                    "dummy_gate1:GO:sa1",
+                    "dummy_gate2:GO:sa1",
+                    "dummy_gate3:GO:sa1",
+                    "y:GO:sa0",
+                    "y:GO:sa1",
+                ],
+                {
+                    "pattern_count": 4,
+                    "detected_collapsed_faults": 5,
+                    "detected_equivalent_faults": 8,
+                    "uncollapsed_faults": 8,
+                    "aborted_faults": 0,
+                    "redundant_faults": 0,
+                    "redundant_equivalent_faults": 0,
+                    "podem_calls": 4,
+                    "total_backtracks": 0,
+                },
+            ),
+            (
+                "INPUT(a)\nINPUT(b)\nOUTPUT(y)\n"
+                "n1 = AND(a,b)\ny = OR(a,n1)\n",
+                200,
+                [
+                    "dummy_gate1:GO:sa0",
+                    "dummy_gate1:GO:sa1",
+                    "y:GI0:sa0",
+                    "n1:GI0:sa1",
+                    "dummy_gate2:GO:sa1",
+                    "n1:GO:sa0",
+                    "y:GO:sa0",
+                    "y:GO:sa1",
+                ],
+                {
+                    "pattern_count": 3,
+                    "detected_collapsed_faults": 6,
+                    "detected_equivalent_faults": 8,
+                    "uncollapsed_faults": 12,
+                    "aborted_faults": 0,
+                    "redundant_faults": 2,
+                    "redundant_equivalent_faults": 4,
+                    "podem_calls": 5,
+                    "total_backtracks": 1,
+                },
+            ),
+            (
+                "INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\n"
+                "y = AND(a,b,c)\n",
+                0,
+                [
+                    "dummy_gate1:GO:sa1",
+                    "dummy_gate2:GO:sa1",
+                    "dummy_gate3:GO:sa1",
+                    "y:GO:sa0",
+                    "y:GO:sa1",
+                ],
+                {
+                    "pattern_count": 1,
+                    "detected_collapsed_faults": 1,
+                    "detected_equivalent_faults": 4,
+                    "uncollapsed_faults": 8,
+                    "aborted_faults": 4,
+                    "redundant_faults": 0,
+                    "redundant_equivalent_faults": 0,
+                    "podem_calls": 5,
+                    "total_backtracks": 0,
+                },
+            ),
+        )
+        for text, backtrack_limit, expected_ids, expected_result in cases:
+            with self.subTest(backtrack_limit=backtrack_limit, text=text):
+                _, binary, fault_map, _, _ = self.convert(text)
+                session = cpp_podem.StuckAtSession(
+                    str(binary), str(fault_map), backtrack_limit, 14,
+                    False, False,
+                )
+                self.assertEqual(
+                    [
+                        str(item["fault_id"])
+                        for item in session.catalog()["faults"]
+                    ],
+                    expected_ids,
+                )
+                while session.remaining_fault_ids():
+                    session.step(session.remaining_fault_ids()[0])
+                self.assertEqual(session.result(), expected_result)
+
+    def test_same_session_concurrent_steps_are_serialized(self):
+        binary, fault_map = self.make_three_input_and_fixture()
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        fault_id = session.remaining_fault_ids()[0]
+        barrier = Barrier(2)
+
+        def attempt_step():
+            barrier.wait(timeout=10)
+            try:
+                return session.step(fault_id)
+            except RuntimeError as error:
+                return str(error)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(lambda _: attempt_step(), range(2)))
+
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        self.assertEqual(
+            sum("not selectable" in item for item in outcomes if isinstance(item, str)),
+            1,
+        )
+        self.assertEqual(session.result()["podem_calls"], 1)
 
 
 if __name__ == "__main__":

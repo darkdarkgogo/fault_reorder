@@ -13,6 +13,7 @@
 #include <forward_list>
 #include <array>
 #include <memory>
+#include <random>
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -57,6 +58,20 @@
 #define D_bar 4
 
 using namespace std;
+
+struct StuckAtProtocolConfig
+{
+	int primary_backtrack_limit{200};
+	int primary_seed{14};
+	int attempts_per_primary_fault{1};
+	bool dtc_enabled{true};
+	int dtc_secondary_backtrack_limit{50};
+	bool stc_enabled{true};
+	bool stc_reverse_order_enabled{true};
+	int stc_shuffle_seed{7};
+	int stc_no_improvement_limit{5};
+	bool scoap_enabled{false};
+};
 
 /* this is an ATPG solver */
 class ATPG
@@ -146,7 +161,11 @@ public:
 	void random_order_fault_sim();
 	/* defined in atpg.cpp */
 	void test();
-	void configure_ordered_stuck_at(int backtrack_limit, int seed);
+	void configure_ordered_stuck_at(const StuckAtProtocolConfig &config);
+	const StuckAtProtocolConfig &get_stuck_at_protocol_config() const
+	{
+		return stuck_at_protocol_config;
+	}
 	vector<string> get_selectable_fault_ids() const;
 	AtpgStepResult step_stuck_at(const string &fault_id);
 	AtpgRunResult get_stuck_at_result() const;
@@ -195,7 +214,11 @@ private:
 	int stuck_at_redundant_faults{};
 	int stuck_at_redundant_equivalent_faults{};
 	int stuck_at_podem_calls{};
+	StuckAtProtocolConfig stuck_at_protocol_config{};
+	mt19937 primary_fill_rng{14};
+	mt19937 stc_shuffle_rng{7};
 	void prepare_stuck_at_session();
+	void fill_stuck_at_primary_cube();
 
 	/* used in input.cpp to parse circuit*/
 	int debug;				 /* != 0 if debugging;  this is a switch of debug mode */

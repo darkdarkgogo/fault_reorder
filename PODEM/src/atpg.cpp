@@ -9,19 +9,24 @@
 
 #include <unordered_set>
 
-void ATPG::configure_ordered_stuck_at(int configured_backtrack_limit,
-		int configured_seed)
+void ATPG::configure_ordered_stuck_at(const StuckAtProtocolConfig &config)
 {
+	stuck_at_protocol_config = config;
 	SAF_atpg = true;
 	fsim_only = false;
 	tdfsim_only = false;
-	total_attempt_num = 1;
-	backtrack_limit = configured_backtrack_limit;
-	seed = configured_seed;
-	fault_order_by_scoap = false;
-	dynamic_test_compression = false;
-	static_test_compression = false;
+	total_attempt_num = config.attempts_per_primary_fault;
+	backtrack_limit = config.primary_backtrack_limit;
+	seed = config.primary_seed;
+	fault_order_by_scoap = config.scoap_enabled;
+	dynamic_test_compression = config.dtc_enabled;
+	static_test_compression = config.stc_enabled;
+	podemx_backtrack_limit = config.dtc_secondary_backtrack_limit;
+	stcseed = config.stc_shuffle_seed;
+	stctime = -config.stc_no_improvement_limit;
 	print_test_vectors = false;
+	primary_fill_rng.seed(config.primary_seed);
+	stc_shuffle_rng.seed(config.stc_shuffle_seed);
 	stuck_at_session_prepared = false;
 	stuck_at_total_detect_num = 0;
 	stuck_at_total_backtracks = 0;
@@ -47,8 +52,33 @@ void ATPG::prepare_stuck_at_session()
 			throw runtime_error("Stuck-at PODEM requires physical XOR/EQV gates to be expanded before ordering");
 	}
 
-	srand(seed);
+	// Also honor seeds supplied by the legacy CLI, which does not call
+	// configure_ordered_stuck_at(). No stuck-at path uses the C global RNG.
+	primary_fill_rng.seed(seed);
+	stc_shuffle_rng.seed(stcseed);
 	stuck_at_session_prepared = true;
+}
+
+void ATPG::fill_stuck_at_primary_cube()
+{
+	uniform_int_distribution<int> bit(0, 1);
+	for (wptr wire : cktin)
+	{
+		switch (wire->value)
+		{
+			case D:
+				wire->value = 1;
+				break;
+			case D_bar:
+				wire->value = 0;
+				break;
+			case U:
+				wire->value = bit(primary_fill_rng);
+				break;
+			default:
+				break;
+		}
+	}
 }
 
 vector<string> ATPG::get_selectable_fault_ids() const
@@ -116,9 +146,14 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 	{
 		case TRUE:
 		{
+			// DTC is inserted before this boundary by the next protocol task. Keep
+			// the successful primary cube's U inputs intact until step-level fill.
+			fill_stuck_at_primary_cube();
 			string vec;
 			for (wptr wire : cktin)
 				vec.push_back(itoc(wire->value));
+			if (print_test_vectors)
+				display_io();
 			int current_detect_num = 0;
 			fault_sim_a_vector(vec, current_detect_num);
 			stuck_at_total_detect_num += current_detect_num;
@@ -194,16 +229,6 @@ void ATPG::test()
 	int no_of_redundant_faults = 0;
 	int no_of_calls = 0;
 
-	int cur_seed = 0;
-	if (seed == -1)
-	{ // increase seed
-		srand(cur_seed);
-	}
-	else
-	{
-		srand(seed);
-	}
-
 	fptr fault_under_test = flist_undetect.front();
 
 	/* stuck-at fault sim mode */
@@ -239,6 +264,8 @@ void ATPG::test()
 	}
 
 	/* TDF test generation mode */
+	int cur_seed = 0;
+	srand(seed == -1 ? cur_seed : seed);
 	cur_i = 1;
 	ncktwire = sort_wlist.size();
 	ncktin = cktin.size();
