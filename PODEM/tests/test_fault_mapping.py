@@ -208,8 +208,8 @@ class FaultMappingTests(unittest.TestCase):
             "INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\nOUTPUT(z)\nOUTPUT(w)\n"
             "n1 = AND(a,b)\ny = OR(a,n1)\nn = BUF(c)\nz = BUF(n)\nw = BUF(n)\n"
         )
-        # The legacy simulator skips a redundant tail before flushing its
-        # pending packet. STC must preserve the session's actual detected set.
+        # A redundant tail must not prevent the pending simulation packet
+        # from being flushed and recording the preceding detected fault.
         self.keep_dtc_faults(fault_map, ["n:GO:sa0", "n1:GO:sa0"])
         for stc_enabled in (False, True):
             with self.subTest(stc_enabled=stc_enabled):
@@ -220,14 +220,14 @@ class FaultMappingTests(unittest.TestCase):
                 last = session.step("n:GO:sa0")
                 self.assertEqual(last["target_status"], "detected")
                 self.assertEqual(last["generated_test_vector"], "111")
-                self.assertEqual(last["newly_detected_fault_ids"], [])
+                self.assertEqual(last["newly_detected_fault_ids"], ["n:GO:sa0"])
                 self.assertEqual(session.remaining_fault_ids(), [])
                 result = session.result()
                 self.assertTrue(result["finalized"])
                 self.assertTrue(result["stc_coverage_preserved"])
                 self.assertEqual(result["current_pattern_count"], 1)
                 self.assertEqual(result["patterns_before_stc"], 1)
-                self.assertEqual(result["patterns_after_stc"], 0 if stc_enabled else 1)
+                self.assertEqual(result["patterns_after_stc"], 1)
                 for key in ("detected_collapsed_faults", "detected_equivalent_faults",
                             "redundant_faults", "redundant_equivalent_faults", "aborted_faults",
                             "podem_calls", "primary_podem_calls", "dtc_secondary_calls",

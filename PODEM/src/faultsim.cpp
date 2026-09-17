@@ -109,15 +109,13 @@ void ATPG::fault_sim_a_vector(const string &vec, int &num_of_current_detect)
 		f = *pos;
 		int fault_detected[num_of_faults_in_parallel] = {0}; // for n-det
 
-		if (f->detect == REDUNDANT)
+		/* A redundant tail element must still reach the packet-flush check below. */
+		if (f->detect != REDUNDANT)
 		{
-			continue;
-		} /* ignore redundant faults */
-
-		/* consider only active (aka. excited) fault
-		 * (sa1 with correct output of 0 or sa0 with correct output of 1) */
-		if (f->fault_type != sort_wlist[f->to_swlist]->value)
-		{
+			/* consider only active (aka. excited) fault
+			 * (sa1 with correct output of 0 or sa0 with correct output of 1) */
+			if (f->fault_type != sort_wlist[f->to_swlist]->value)
+			{
 
 			/* if f is a primary output or is directly connected to an primary output
 			 * the fault is detected */
@@ -213,7 +211,8 @@ void ATPG::fault_sim_a_vector(const string &vec, int &num_of_current_detect)
 					}
 				}
 			} // if  gate input fault
-		}		// if fault is active
+			}		// if fault is active
+		} // if fault is not redundant
 
 		/*
 		 * fault simulation of a packet

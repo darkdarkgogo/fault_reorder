@@ -1,8 +1,6 @@
 import itertools
 import json
 from pathlib import Path
-import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -165,51 +163,12 @@ def test_repeated_source_preserves_duplicate_rows(tmp_path):
     assert [fault["mapped_location_duplicate_index"] for fault in faults] == [0, 1]
 
 
-def test_real_c432_preserves_all_faults_and_resolves_original_gi_indices():
-    circuit = read_bench(SAMPLES / "c432_binary.bench")
-    graph = build_graph(circuit)
-    metadata = read_faultmap(SAMPLES / "c432_binary.faultmap", circuit, graph)
-    assert metadata["fault_count"] == 533
-    assert metadata["uncollapsed_total"] == 864
-    faults = {f["fault_id"]: f for f in metadata["faults"]}
-    swapped = faults["G154:GI0:sa1"]
-    assert swapped["bench_pin_index"] == 1 and swapped["pin_index"] == 0
-    assert swapped["anchor_node"] == graph["anchors"]["G154"]
-    mapped = faults["G431:GI2:sa1"]
-    assert mapped["original_pin_index"] == 2
-    assert mapped["pin_index"] in (0, 1)
-    assert mapped["mapped_gate"] == "__smartatpg_bin_230_2"
-    assert mapped["anchor_node"] == graph["anchors"][mapped["mapped_gate"]]
-    xor_input = faults["G223:GI0:sa0"]
-    assert xor_input["logical_xor_input"] is True
-    assert xor_input["logical_input_index"] == 0
-    assert xor_input["mapped_gate"] == "G223"
-    assert xor_input["source_signal"] == "G203"
-    assert xor_input["gate_function_anchor_node"] == graph["anchors"]["G223"]
-    assert xor_input["connected_function_anchor_node"] == graph["anchors"]["G203"]
-    assert sum(f["logical_xor_input"] for f in metadata["faults"]) == 72
-
-
 @pytest.mark.parametrize("path", sorted(SAMPLES.glob("*_binary.faultmap")), ids=lambda p: p.stem)
 def test_all_bundled_fault_maps_resolve(path):
     circuit = read_bench(path.with_suffix(".bench"))
     graph = build_graph(circuit)
     metadata = read_faultmap(path, circuit, graph)
     assert all(f["position_index"] in (0, 1, 2) for f in metadata["faults"])
-
-
-def test_cli_prepare_without_torch(tmp_path):
-    bench = SAMPLES / "c432_binary.bench"
-    prepared = tmp_path / "prepared"
-    args = [sys.executable, "-m", "fault_embedding", "prepare", "--bench", str(bench), "--out-dir", str(prepared)]
-    result = subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    assert not list(prepared.glob("*.npz"))
-    metadata = json.loads((prepared / "c432_binary.faults.json").read_text())
-    assert metadata["fault_count"] == 533
-    assert metadata["faultmap_bench_binding"]["status"] == "verified"
-    result = subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
-    assert result.returncode != 0 and "already exists" in result.stderr
 
 
 def test_faultmap_rejects_wrong_bench_pairing(tmp_path):

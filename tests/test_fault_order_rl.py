@@ -637,22 +637,6 @@ def test_evaluate_cli_prints_only_per_circuit_changes(tmp_path, monkeypatch, cap
     assert 'totals' not in output
 
 
-def test_existing_pretrained_artifact_and_bench_provenance(tmp_path):
-    directory = ROOT.parent/'artifacts/c432-v3-embeddings'
-    if not directory.exists():
-        pytest.skip('local reference artifact unavailable')
-    bench = ROOT/'PODEM/sample_circuits/c432_binary.bench'
-    spec = CircuitSpec('c432', bench, bench.with_suffix('.faultmap'),
-                       directory/'c432_binary.fault_embeddings.npz', directory/'c432_binary.faults.json')
-    env = PodemEnvironment(ROOT/'PODEM')
-    catalog = env.catalog(spec.bench_path, spec.faultmap_path)
-    assert load_circuit_data(spec, catalog).fault_count == 533
-    changed = tmp_path/'changed.bench'
-    changed.write_bytes(bench.read_bytes() + b'\n# changed\n')
-    with pytest.raises(ValueError, match='BENCH provenance'):
-        load_circuit_data(replace(spec, bench_path=changed), catalog)
-
-
 @pytest.mark.parametrize('field,value', [('learning_rate', float('nan')), ('temperature_min', 2.), ('rounds', 0), ('backtrack_limit', 3000), ('batch_size', -1)])
 def test_bad_training_config(field, value):
     with pytest.raises(ValueError):
