@@ -549,19 +549,25 @@ def test_environment_derives_uncollapsed_resolved_coverage(tmp_path, monkeypatch
 
     class Binding:
         @staticmethod
-        def run_stuck_at_ordered(bench_path, faultmap_path, ids, limit, seed):
-            calls.append((bench_path, faultmap_path, ids, limit, seed))
-            return dict(pattern_count=2, detected_collapsed_faults=2,
-                        detected_equivalent_faults=4, uncollapsed_faults=7,
-                        aborted_faults=0, redundant_faults=1,
-                        redundant_equivalent_faults=3, podem_calls=3,
-                        total_backtracks=8)
+        def run_stuck_at_ordered(bench_path, faultmap_path, ids, limit, seed,
+                                 dtc_enabled, stc_enabled):
+            calls.append((bench_path, faultmap_path, ids, limit, seed,
+                          dtc_enabled, stc_enabled))
+            return _compressed_final(
+                pattern_count=2, current_pattern_count=2,
+                patterns_before_stc=2, patterns_after_stc=2,
+                stc_removed_patterns=0, detected_collapsed_faults=2,
+                detected_equivalent_faults=4, uncollapsed_faults=7,
+                redundant_faults=1, redundant_equivalent_faults=3,
+                podem_calls=3, primary_podem_calls=3,
+                dtc_secondary_calls=0, primary_backtracks=8,
+                dtc_backtracks=0, total_backtracks=8)
 
     monkeypatch.setattr(module, 'load_cpp_podem', lambda module_dir: Binding())
     result = PodemEnvironment(tmp_path).run(bench, faultmap, ['a', 'b', 'c'])
     assert result['covered_equivalent_faults'] == 7
     assert result['fault_coverage'] == 1.0
-    assert calls[0][3:] == (5000, 14)
+    assert calls[0][3:] == (200, 14, True, True)
 
 
 def test_environment_passes_empty_faultmap_for_original_bench(tmp_path, monkeypatch):
@@ -619,6 +625,357 @@ def test_environment_rejects_binding_without_equivalent_redundant_count(tmp_path
     monkeypatch.setattr(module, 'load_cpp_podem', lambda module_dir: OldBinding())
     with pytest.raises(RuntimeError, match='redundant_equivalent_faults'):
         PodemEnvironment(tmp_path).run(bench, faultmap, ['a'])
+
+
+def _compressed_final(**changes):
+    result = dict(pattern_count=1, current_pattern_count=2, finalized=True,
+                  patterns_before_stc=2, patterns_after_stc=1,
+                  stc_removed_patterns=1, stc_shuffle_attempts=5,
+                  stc_coverage_preserved=True, detected_collapsed_faults=3,
+                  detected_equivalent_faults=3, uncollapsed_faults=3,
+                  aborted_faults=0, redundant_faults=0,
+                  redundant_equivalent_faults=0, podem_calls=2,
+                  primary_podem_calls=2, dtc_secondary_calls=1,
+                  primary_backtracks=3, dtc_backtracks=2,
+                  total_backtracks=5)
+    result.update(changes)
+    return result
+
+
+def _compressed_step(**changes):
+    result = _compressed_final(pattern_count=1, current_pattern_count=1,
+                               finalized=False, patterns_before_stc=1,
+                               patterns_after_stc=1, stc_removed_patterns=0,
+                               stc_coverage_preserved=False,
+                               stc_shuffle_attempts=0, detected_collapsed_faults=2,
+                               detected_equivalent_faults=2, podem_calls=1,
+                               primary_podem_calls=1, primary_backtracks=1,
+                               dtc_backtracks=2, total_backtracks=3)
+    result.update(selected_fault_id='f0', target_status='detected', generated_pattern=True,
+                  generated_test_vector='01', dtc_attempted_fault_ids=('f1',),
+                  dtc_embedded_fault_ids=('f1',), current_dtc_secondary_calls=1,
+                  current_primary_backtracks=1, current_dtc_backtracks=2,
+                  newly_detected_fault_ids=('f0', 'f1'), remaining_fault_ids=('f2',),
+                  current_podem_calls=1, current_total_backtracks=3)
+    result.update(changes)
+    return result
+
+
+@pytest.fixture
+def compressed_binding(tmp_path, monkeypatch):
+    from fault_order_rl import environment as module
+    bench = tmp_path/'tiny.bench'
+    bench.write_text('INPUT(a)\nOUTPUT(a)\n')
+    protocol = dict(primary_backtrack_limit=200, primary_seed=14,
+                    attempts_per_primary_fault=1, dtc_enabled=True,
+                    dtc_secondary_backtrack_limit=50, stc_enabled=True,
+                    stc_reverse_order_enabled=True, stc_shuffle_seed=7,
+                    stc_no_improvement_limit=5, scoap_enabled=False)
+
+    class Session:
+        def __init__(self, *args):
+            self.args = args
+            self.steps = [_compressed_step(), _compressed_step(
+                selected_fault_id='f2', target_status='redundant', generated_pattern=False,
+                generated_test_vector='', dtc_attempted_fault_ids=(),
+                dtc_embedded_fault_ids=(), newly_detected_fault_ids=(),
+                remaining_fault_ids=(), current_pattern_count=1,
+                pattern_count=1, podem_calls=2, primary_podem_calls=2,
+                current_podem_calls=2, primary_backtracks=3,
+                current_primary_backtracks=3, total_backtracks=5,
+                current_total_backtracks=5, redundant_faults=1,
+                redundant_equivalent_faults=1)]
+            self.final = _compressed_final(pattern_count=1, current_pattern_count=1,
+                                           patterns_before_stc=1,
+                                           patterns_after_stc=1, stc_removed_patterns=0,
+                                           detected_collapsed_faults=2,
+                                           detected_equivalent_faults=2,
+                                           redundant_faults=1, redundant_equivalent_faults=1)
+            self.result_calls = 0
+
+        def config(self):
+            return protocol
+
+        def catalog(self):
+            return dict(faults=[dict(fault_id=f'f{i}') for i in range(3)],
+                        uncollapsed_total=3)
+
+        def remaining_fault_ids(self):
+            return ('f0', 'f1', 'f2')
+
+        def step(self, identifier):
+            return self.steps.pop(0)
+
+        def result(self):
+            self.result_calls += 1
+            return self.final
+
+    class Binding:
+        StuckAtSession = Session
+
+        @staticmethod
+        def run_stuck_at_ordered(*args):
+            return _compressed_final()
+
+    monkeypatch.setattr(module, 'load_cpp_podem', lambda module_dir: Binding())
+    return bench, Session, Binding
+
+
+def test_session_wrapper_validates_compressed_protocol(compressed_binding):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    assert session.config['primary_backtrack_limit'] == 200
+    assert session.remaining_fault_ids == ('f0', 'f1', 'f2')
+    step = session.step('f0')
+    assert step['remaining_fault_ids'] == ('f2',)
+    assert step['newly_detected_fault_ids'] == ('f0', 'f1')
+    assert session.step('f2')['remaining_fault_ids'] == ()
+    final = session.finish()
+    assert final['pattern_count'] == final['patterns_after_stc']
+    assert final['stc_coverage_preserved'] is True
+    assert session.finish() == final
+
+
+@pytest.mark.parametrize('changes,match', [
+    ({'remaining_fault_ids': ('f2', 'f2')}, 'remaining'),
+    ({'remaining_fault_ids': ('unknown',)}, 'remaining'),
+    ({'remaining_fault_ids': ('f0', 'f2')}, 'remaining'),
+    ({'newly_detected_fault_ids': ('f0', 'f2')}, 'newly_detected'),
+    ({'current_pattern_count': 0}, 'pattern'),
+    ({'target_status': 'redundant'}, 'pattern'),
+    ({'current_podem_calls': 2}, 'calls'),
+    ({'current_total_backtracks': 2}, 'backtracks'),
+    ({'finalized': True}, 'finalized'),
+])
+def test_session_wrapper_rejects_bad_step(compressed_binding, changes, match):
+    bench, Session, _ = compressed_binding
+    original = Session.step
+    def bad_step(self, identifier):
+        return dict(original(self, identifier), **changes)
+    Session.step = bad_step
+    with pytest.raises(RuntimeError, match=match):
+        PodemEnvironment().start_session(bench, None).step('f0')
+
+
+@pytest.mark.parametrize('changes,match', [
+    ({'stc_coverage_preserved': False}, 'coverage'),
+    ({'patterns_after_stc': 3, 'pattern_count': 3}, 'STC'),
+    ({'pattern_count': 0}, 'pattern_count'),
+    ({'finalized': 1}, 'finalized'),
+    ({'primary_podem_calls': 1}, 'podem_calls'),
+    ({'total_backtracks': 4}, 'total_backtracks'),
+    ({'redundant_equivalent_faults': None}, 'redundant_equivalent_faults'),
+])
+def test_compressed_protocol_rejects_bad_final(compressed_binding, changes, match):
+    bench, _, Binding = compressed_binding
+    Binding.run_stuck_at_ordered = staticmethod(lambda *args: _compressed_final(**changes))
+    with pytest.raises(RuntimeError, match=match):
+        PodemEnvironment().run(bench, None, ('f0', 'f1', 'f2'))
+
+
+@pytest.mark.parametrize('field,value', [
+    ('dtc_enabled', 1), ('stc_enabled', 1), ('scoap_enabled', 0),
+    ('primary_seed', 14.0), ('attempts_per_primary_fault', True),
+    ('primary_backtrack_limit', 5000), ('stc_shuffle_seed', 8),
+])
+def test_session_wrapper_rejects_protocol_type_or_value(compressed_binding, field, value):
+    bench, Session, _ = compressed_binding
+    original = Session.config
+    Session.config = lambda self: dict(original(self), **{field: value})
+    with pytest.raises(RuntimeError, match='config'):
+        PodemEnvironment().start_session(bench, None)
+
+
+@pytest.mark.parametrize('options', [
+    {'backtrack_limit': 5000}, {'seed': 15},
+    {'backtrack_limit': 200.0}, {'seed': 14.0},
+])
+def test_environment_rejects_protocol_override(compressed_binding, options):
+    with pytest.raises(ValueError, match='protocol'):
+        PodemEnvironment(**options)
+
+
+@pytest.mark.parametrize('identifiers', [('f0', 'f0'), ('f0', 1), ('f0', [])])
+def test_session_wrapper_rejects_invalid_catalog(compressed_binding, identifiers):
+    bench, Session, _ = compressed_binding
+    Session.catalog = lambda self: dict(faults=[dict(fault_id=i) for i in identifiers],
+                                        uncollapsed_total=3)
+    with pytest.raises(RuntimeError, match='catalog'):
+        PodemEnvironment().start_session(bench, None)
+
+
+@pytest.mark.parametrize('changes,match', [
+    ({'remaining_fault_ids': ('f1',)}, 'remaining'),
+    ({'primary_podem_calls': 1, 'podem_calls': 1, 'current_podem_calls': 1}, 'calls'),
+    ({'primary_backtracks': 0, 'current_primary_backtracks': 0,
+      'total_backtracks': 2, 'current_total_backtracks': 2}, 'backtracks'),
+    ({'dtc_backtracks': 1, 'current_dtc_backtracks': 1,
+      'total_backtracks': 4, 'current_total_backtracks': 4}, 'backtracks'),
+    ({'dtc_secondary_calls': 0, 'current_dtc_secondary_calls': 0}, 'calls'),
+    ({'pattern_count': 2, 'current_pattern_count': 2}, 'pattern'),
+])
+def test_session_wrapper_rejects_second_step_regression(compressed_binding, changes, match):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    session.step('f0')
+    session._native.steps[0].update(changes)
+    with pytest.raises(RuntimeError, match=match):
+        session.step('f2')
+
+
+@pytest.mark.parametrize('status', ['redundant', 'aborted'])
+def test_session_wrapper_false_and_maybe_do_not_add_patterns(compressed_binding, status):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    session.step('f0')
+    session._native.steps[0]['target_status'] = status
+    assert session.step('f2')['current_pattern_count'] == 1
+    invalid = PodemEnvironment().start_session(bench, None)
+    invalid.step('f0')
+    invalid._native.steps[0].update(target_status=status,
+                                    current_pattern_count=2, pattern_count=2)
+    with pytest.raises(RuntimeError, match='pattern'):
+        invalid.step('f2')
+
+
+def test_session_wrapper_allows_detection_of_previously_aborted_fault(compressed_binding):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    session._native.steps = [
+        _compressed_step(target_status='aborted', generated_pattern=False,
+                         generated_test_vector='', pattern_count=0, current_pattern_count=0,
+                         detected_collapsed_faults=0, detected_equivalent_faults=0,
+                         aborted_faults=1,
+                         newly_detected_fault_ids=(), remaining_fault_ids=('f1', 'f2'),
+                         dtc_attempted_fault_ids=(), dtc_embedded_fault_ids=(),
+                         dtc_backtracks=0, current_dtc_backtracks=0,
+                         total_backtracks=1, current_total_backtracks=1,
+                         dtc_secondary_calls=0, current_dtc_secondary_calls=0),
+        _compressed_step(selected_fault_id='f1', newly_detected_fault_ids=('f0', 'f1'),
+                         dtc_attempted_fault_ids=('f2',), dtc_embedded_fault_ids=(),
+                         aborted_faults=1,
+                         podem_calls=2, primary_podem_calls=2, current_podem_calls=2),
+    ]
+    session.step('f0')
+    assert session.step('f1')['newly_detected_fault_ids'] == ('f0', 'f1')
+
+
+@pytest.mark.parametrize('changes,match', [
+    ({'detected_collapsed_faults': 1}, 'coverage'),
+    ({'detected_equivalent_faults': 1}, 'coverage'),
+    ({'redundant_faults': 0}, 'coverage'),
+    ({'redundant_equivalent_faults': 0}, 'coverage'),
+    ({'uncollapsed_faults': 4}, 'coverage'),
+    ({'aborted_faults': 1}, 'coverage'),
+    ({'finalized': False}, 'finalized'),
+    ({'primary_podem_calls': 3, 'podem_calls': 3}, 'primary_podem_calls'),
+])
+def test_session_wrapper_finish_preserves_pre_stc_summary(compressed_binding, changes, match):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    session.step('f0')
+    session.step('f2')
+    session._native.final.update(changes)
+    with pytest.raises(RuntimeError, match=match):
+        session.finish()
+
+
+def test_session_wrapper_finish_guard_and_compression(compressed_binding):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    assert session._native.args[1:] == ('', 200, 14, True, True)
+    with pytest.raises(RuntimeError, match='remaining'):
+        session.finish()
+    assert session._native.result_calls == 0
+    with pytest.raises(ValueError, match='remaining'):
+        session.step('unknown')
+    assert len(session._native.steps) == 2
+    session.step('f0')
+    session._native.steps[0].update(
+        target_status='detected', generated_pattern=True, generated_test_vector='10',
+        pattern_count=2, current_pattern_count=2, newly_detected_fault_ids=('f2',),
+        redundant_faults=0, redundant_equivalent_faults=0,
+        detected_collapsed_faults=3, detected_equivalent_faults=3)
+    assert session.step('f2')['current_pattern_count'] == 2
+    session._native.final = _compressed_final()
+    final = session.finish()
+    assert final['pattern_count'] == 1 < final['current_pattern_count']
+    final['pattern_count'] = 99
+    assert session.finish()['pattern_count'] == 1
+    assert session._native.result_calls == 1
+    with pytest.raises(ValueError, match='remaining'):
+        session.step('f2')
+
+
+@pytest.mark.parametrize('field', [
+    'remaining_fault_ids', 'dtc_attempted_fault_ids', 'current_podem_calls',
+    'pattern_count', 'patterns_before_stc', 'stc_coverage_preserved',
+])
+def test_session_wrapper_rejects_missing_fields(compressed_binding, field):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    del session._native.steps[0][field]
+    with pytest.raises(RuntimeError, match=field):
+        session.step('f0')
+
+
+@pytest.mark.parametrize('field,value', [
+    ('current_pattern_count', True), ('primary_backtracks', 1.0),
+    ('dtc_secondary_calls', -1), ('stc_coverage_preserved', 1),
+    ('generated_pattern', 1), ('remaining_fault_ids', 'f2'),
+    ('dtc_attempted_fault_ids', ('unknown',)),
+    ('dtc_embedded_fault_ids', ('f1', 'f1')),
+    ('newly_detected_fault_ids', ('f0', 1)), ('target_status', []),
+])
+def test_session_wrapper_rejects_malformed_values(compressed_binding, field, value):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    session._native.steps[0][field] = value
+    with pytest.raises(RuntimeError):
+        session.step('f0')
+
+
+@pytest.mark.parametrize('changes', [
+    {'detected_collapsed_faults': 1}, {'detected_equivalent_faults': 1},
+    {'uncollapsed_faults': 4}, {'newly_detected_fault_ids': ('f0',)},
+    {'dtc_secondary_calls': 2, 'current_dtc_secondary_calls': 2},
+    {'dtc_attempted_fault_ids': ('f0',)},
+])
+def test_session_wrapper_rejects_detection_or_dtc_inconsistency(compressed_binding, changes):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    session.step('f0')
+    session._native.steps[0].update(changes)
+    with pytest.raises(RuntimeError):
+        session.step('f2')
+
+
+@pytest.mark.parametrize('mapped', [False, True])
+def test_environment_real_session_matches_ordered_run(tmp_path, monkeypatch, mapped):
+    bench = tmp_path/'会话.bench'
+    bench.write_text('INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\ny = AND(a,b,c)\n',
+                     encoding='utf-8')
+    faultmap = None
+    if mapped:
+        monkeypatch.syspath_prepend(str(ROOT/'PODEM/scripts'))
+        from convert_binary_bench import convert_binary_bench
+        binary = tmp_path/'二值.bench'
+        faultmap = tmp_path/'二值.faultmap'
+        convert_binary_bench(bench, binary, faultmap)
+        bench = binary
+    env = PodemEnvironment(ROOT/'PODEM')
+    session = env.start_session(bench, faultmap)
+    initial = session.initial_fault_ids
+    raw_patterns = 0
+    while session.remaining_fault_ids:
+        selected = session.remaining_fault_ids[0]
+        step = session.step(selected)
+        raw_patterns += int(step['generated_pattern'])
+        assert step['current_pattern_count'] == raw_patterns
+    final = session.finish()
+    assert final == env.run(bench, faultmap, initial)
+    assert final == session.finish()
+    assert final['patterns_after_stc'] <= raw_patterns
 
 
 def test_real_mapped_circuit_training_resume_and_export(tmp_path, monkeypatch):
