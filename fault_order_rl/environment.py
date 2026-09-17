@@ -138,6 +138,9 @@ class PodemSession:
         if len(self.initial_fault_ids) != len(set(self.initial_fault_ids)):
             raise RuntimeError("PODEM catalog has duplicate fault IDs")
         self._catalog_set = set(self.initial_fault_ids)
+        self._catalog_rows = {
+            identifier: row for row, identifier in enumerate(self.initial_fault_ids)
+        }
         self.remaining_fault_ids = _ids(
             {"remaining_fault_ids": native.remaining_fault_ids()},
             "remaining_fault_ids", self._catalog_set)
@@ -185,6 +188,9 @@ class PodemSession:
                 raise RuntimeError("PODEM coverage count changed incorrectly: {}".format(field))
         if not set(attempted) <= before - {fault_id}:
             raise RuntimeError("PODEM dtc_attempted IDs were not secondary candidates")
+        attempted_rows = [self._catalog_rows[identifier] for identifier in attempted]
+        if any(left >= right for left, right in zip(attempted_rows, attempted_rows[1:])):
+            raise RuntimeError("PODEM dtc_attempted IDs are not in catalog order")
         if not set(embedded) <= set(attempted):
             raise RuntimeError("PODEM dtc_embedded IDs were not attempted")
         if raw["selected_fault_id"] != fault_id:
@@ -198,6 +204,13 @@ class PodemSession:
                 or raw["target_status"] not in statuses
                 or raw["generated_pattern"] is not statuses[raw["target_status"]]):
             raise RuntimeError("PODEM target status and generated pattern disagree")
+        if not raw["generated_pattern"] and newly:
+            raise RuntimeError("PODEM newly_detected IDs require a generated pattern")
+        # test_tried removes the primary regardless of its simulation outcome.
+        # Every other removal must be explained by this step's fault simulation.
+        removed = before - set(remaining)
+        if removed != {fault_id} | (before & set(newly)):
+            raise RuntimeError("PODEM removed IDs disagree with selected and newly_detected IDs")
         if result["current_pattern_count"] != self._pattern_count + int(raw["generated_pattern"]):
             raise RuntimeError("PODEM raw pattern count changed incorrectly")
         if result["primary_podem_calls"] != self._calls + 1 or _number(raw, "current_podem_calls") != result["podem_calls"]:

@@ -950,6 +950,65 @@ def test_session_wrapper_rejects_detection_or_dtc_inconsistency(compressed_bindi
         session.step('f2')
 
 
+@pytest.mark.parametrize('status,newly,remaining', [
+    ('detected', ('f0',), ()),  # f1 and f2 disappear without detection.
+    ('redundant', ('f0', 'f1'), ('f2',)),
+    ('aborted', ('f0', 'f1'), ('f2',)),
+    ('redundant', (), ()),  # Only the selected fault may leave without a vector.
+    ('aborted', (), ()),
+])
+def test_session_wrapper_reconciles_removed_faults(compressed_binding, status, newly, remaining):
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    generated = status == 'detected'
+    session._native.steps[0].update(
+        target_status=status, generated_pattern=generated,
+        pattern_count=int(generated), current_pattern_count=int(generated),
+        generated_test_vector='01' if generated else '',
+        newly_detected_fault_ids=newly, remaining_fault_ids=remaining,
+        detected_collapsed_faults=len(newly), detected_equivalent_faults=len(newly),
+        dtc_attempted_fault_ids=(), dtc_embedded_fault_ids=(),
+        dtc_secondary_calls=0, current_dtc_secondary_calls=0)
+    with pytest.raises(RuntimeError, match='removed|newly_detected'):
+        session.step('f0')
+
+
+def test_session_wrapper_true_primary_need_not_be_simulation_detected(compressed_binding):
+    # The native primary TRUE result and recorded simulation detection differ
+    # on the known redundant-tail packet-flush defect (deferred to Task 8).
+    bench, _, _ = compressed_binding
+    session = PodemEnvironment().start_session(bench, None)
+    session._native.steps[0].update(newly_detected_fault_ids=('f1',),
+                                    detected_collapsed_faults=1,
+                                    detected_equivalent_faults=1)
+    result = session.step('f0')
+    assert result['generated_pattern'] is True
+    assert result['remaining_fault_ids'] == ('f2',)
+    assert 'f0' not in result['newly_detected_fault_ids']
+
+
+@pytest.mark.parametrize('catalog_order,attempted,valid', [
+    (('f0', 'f1', 'f2'), ('f1', 'f2'), True),
+    (('f0', 'f1', 'f2'), ('f2', 'f1'), False),
+    (('f2', 'f0', 'f1'), ('f2', 'f1'), True),
+    (('f2', 'f0', 'f1'), ('f1', 'f2'), False),
+    (('f0', 'f1', 'f2'), ('f1', 'f1'), False),
+])
+def test_session_wrapper_dtc_attempts_follow_catalog_order(
+        compressed_binding, catalog_order, attempted, valid):
+    bench, Session, _ = compressed_binding
+    Session.catalog = lambda self: dict(
+        faults=[dict(fault_id=i) for i in catalog_order], uncollapsed_total=3)
+    session = PodemEnvironment().start_session(bench, None)
+    session._native.steps[0].update(dtc_attempted_fault_ids=attempted,
+                                    dtc_secondary_calls=2, current_dtc_secondary_calls=2)
+    if valid:
+        assert session.step('f0')['dtc_attempted_fault_ids'] == attempted
+    else:
+        with pytest.raises(RuntimeError, match='dtc_attempted'):
+            session.step('f0')
+
+
 @pytest.mark.parametrize('mapped', [False, True])
 def test_environment_real_session_matches_ordered_run(tmp_path, monkeypatch, mapped):
     bench = tmp_path/'会话.bench'
