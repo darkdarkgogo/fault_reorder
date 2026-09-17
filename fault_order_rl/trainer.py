@@ -18,9 +18,9 @@ from .checkpoint import (atomic_write, capture_rng, load_checkpoint, restore_rng
                          save_checkpoint, write_json, write_npz)
 from .data import _sha256, load_all_circuits, load_manifest
 from .environment import PodemEnvironment
-from .model import FaultScorer
-from .policy import (centered_logits, deterministic_permutation,
-                     plackett_luce_log_prob, sample_permutation)
+from .model import FaultScorer, build_dynamic_features
+from .policy import (deterministic_permutation, select_categorical_action,
+                     trajectory_log_prob)
 
 
 @dataclass
@@ -34,7 +34,7 @@ class TrainConfig:
     temperature_rounds: int = 100
     evaluate_every: int = 10
     seed: int = 14
-    backtrack_limit: int = 5000
+    backtrack_limit: int = 200
     threads: int = 1
     # Zero preserves the historical full-manifest update behavior.
     batch_size: int = 0
@@ -54,8 +54,8 @@ class TrainConfig:
             raise ValueError("seed must be in [0, 2**31)")
         if not isinstance(self.batch_size, int) or self.batch_size < 0:
             raise ValueError("batch_size must be a non-negative integer")
-        if self.backtrack_limit != 5000:
-            raise ValueError("the fault-order experiment requires backtrack_limit=5000")
+        if self.backtrack_limit != 200:
+            raise ValueError("the compressed fault-order experiment requires backtrack_limit=200")
 
     def temperature(self, round_number):
         fraction = min(max(round_number - 1, 0) / max(self.temperature_rounds - 1, 1), 1)
@@ -65,7 +65,7 @@ class TrainConfig:
 def reward_transition(state, metrics, ema_decay):
     """Return new state; never mutate a baseline during episode collection."""
     new = dict(state)
-    patterns = metrics["pattern_count"]
+    patterns = metrics["patterns_after_stc"]
     covered = metrics["covered_equivalent_faults"]
     valid = covered >= state["native_covered_equivalent_faults"]
     if valid:
@@ -95,6 +95,14 @@ def evaluation_key(report):
 def state_dict_equal(first, second):
     return first.keys() == second.keys() and all(
         torch.equal(first[key], second[key]) for key in first)
+
+
+def _normalized_policy_loss(advantage, log_prob, initial_fault_count, batch_size):
+    if initial_fault_count <= 0:
+        raise ValueError("initial_fault_count must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    return -advantage * log_prob / initial_fault_count / batch_size
 
 
 class Trainer:
@@ -134,7 +142,7 @@ class Trainer:
         # All embeddings have already passed validation before any ATPG run.
         records = []
         for circuit in self.circuits:
-            metrics, elapsed = self._run(circuit, np.arange(circuit.fault_count))
+            metrics, elapsed = self._run_native(circuit)
             self.native_metrics[circuit.name] = metrics
             self.states[circuit.name] = {
                 "native_pattern_count": metrics["pattern_count"],
@@ -183,13 +191,63 @@ class Trainer:
         if saved["torch_version"] != str(torch.__version__):
             raise ValueError("checkpoint PyTorch version changed; exact resume cannot be guaranteed")
 
-    def _run(self, circuit, permutation):
-        start = time.perf_counter()
-        result = self.environment.run(circuit.spec.bench_path, circuit.spec.faultmap_path,
-                                      [circuit.fault_ids[int(i)] for i in permutation])
+    def _check_result(self, circuit, result):
         if result["uncollapsed_faults"] != int(circuit.eqv_fault_nums.sum()):
             raise RuntimeError("PODEM fault total differs from validated embeddings")
+        if result.get("stc_coverage_preserved") is not True:
+            raise RuntimeError("PODEM STC coverage was not preserved")
+
+    def _run_native(self, circuit):
+        start = time.perf_counter()
+        session = self.environment.start_session(
+            circuit.spec.bench_path, circuit.spec.faultmap_path)
+        while session.remaining_fault_ids:
+            session.step(session.remaining_fault_ids[0])
+        result = session.finish()
+        self._check_result(circuit, result)
         return result, time.perf_counter() - start
+
+    def _run_policy(self, circuit, model, temperature, stochastic):
+        start = time.perf_counter()
+        session = self.environment.start_session(
+            circuit.spec.bench_path, circuit.spec.faultmap_path)
+        row_by_id = {identifier: row for row, identifier in enumerate(circuit.fault_ids)}
+        decisions, trace = [], []
+        while session.remaining_fault_ids:
+            try:
+                rows = tuple(row_by_id[identifier]
+                             for identifier in session.remaining_fault_ids)
+            except KeyError as exc:
+                raise RuntimeError("PODEM remaining fault is absent from embeddings") from exc
+            features = build_dynamic_features(circuit.embeddings, rows)
+            scores = model(features)
+            selected_row = select_categorical_action(
+                scores, rows, temperature, stochastic)
+            selected_id = circuit.fault_ids[selected_row]
+            local = rows.index(selected_row)
+            step = session.step(selected_id)
+            decisions.append({"remaining_rows": rows, "selected_row": selected_row})
+            trace.append({
+                "selected_fault_id": selected_id,
+                "selected_row": selected_row,
+                "selected_score": float(scores[local].detach()),
+                "remaining_count": len(rows),
+                "remaining_ratio": len(rows) / circuit.fault_count,
+                "target_status": step["target_status"],
+                "generated_test_vector": step["generated_test_vector"],
+                "dtc_attempted_fault_ids": step["dtc_attempted_fault_ids"],
+                "dtc_embedded_fault_ids": step["dtc_embedded_fault_ids"],
+                "newly_detected_fault_ids": step["newly_detected_fault_ids"],
+                "primary_podem_calls": step["primary_podem_calls"],
+                "dtc_secondary_calls": step["dtc_secondary_calls"],
+                "primary_backtracks": step["primary_backtracks"],
+                "dtc_backtracks": step["dtc_backtracks"],
+                "total_backtracks": step["total_backtracks"],
+                "current_pattern_count": step["current_pattern_count"],
+            })
+        result = session.finish()
+        self._check_result(circuit, result)
+        return result, time.perf_counter() - start, decisions, trace
 
     def _record(self, kind, name, round_number, metrics, elapsed):
         return {"kind": kind, "circuit": name, "round": round_number,
@@ -202,15 +260,21 @@ class Trainer:
         model.eval()
         with torch.no_grad():
             for circuit in self.circuits:
-                scores = model(circuit.embeddings)
-                order = deterministic_permutation(scores).numpy()
-                metrics, elapsed = self._run(circuit, order)
+                metrics, elapsed, decisions, trace = self._run_policy(
+                    circuit, model, temperature=1.0, stochastic=False)
                 metrics = dict(metrics, seconds=elapsed)
                 results[circuit.name] = metrics
+                first_rows = tuple(range(circuit.fault_count))
+                scores = model(build_dynamic_features(circuit.embeddings, first_rows))
+                order = deterministic_permutation(scores).numpy()
                 ranks = np.empty(circuit.fault_count, dtype=np.int64)
                 ranks[order] = np.arange(1, circuit.fault_count + 1)
                 exports[circuit.name] = {"fault_ids": np.asarray(circuit.fault_ids),
-                                         "scores": scores.numpy(), "ranks": ranks, "permutation": order}
+                                         "scores": scores.numpy(), "ranks": ranks,
+                                         "permutation": order,
+                                         "selected_rows": np.asarray(
+                                             [d["selected_row"] for d in decisions],
+                                             dtype=np.int64)}
         totals = {key: sum(result[key] for result in results.values()) for key in
                   ("pattern_count", "detected_equivalent_faults", "detected_collapsed_faults",
                    "redundant_equivalent_faults", "covered_equivalent_faults",
@@ -245,7 +309,7 @@ class Trainer:
             number = self.round + 1
             temperature = self.config.temperature(number)
             states = copy.deepcopy(self.states)
-            records, orders = [], {}
+            records, trajectories = [], {}
             candidate = copy.deepcopy(self.model)
             optimizer = self._optimizer(candidate)
             optimizer.load_state_dict(copy.deepcopy(self.optimizer.state_dict()))
@@ -256,20 +320,23 @@ class Trainer:
                 # Every episode in this batch sees the same parameter snapshot.
                 with torch.no_grad():
                     for circuit in batch:
-                        order, _ = sample_permutation(candidate(circuit.embeddings), temperature)
-                        orders[circuit.name] = order.numpy()
-                        metrics, elapsed = self._run(circuit, orders[circuit.name])
+                        metrics, elapsed, decisions, trace = self._run_policy(
+                            circuit, candidate, temperature, stochastic=True)
+                        trajectories[circuit.name] = decisions
                         states[circuit.name], reward = reward_transition(
                             states[circuit.name], metrics, self.config.ema_decay)
                         batch_records.append(dict(
                             self._record("episode", circuit.name, number, metrics, elapsed),
-                            temperature=temperature, batch_index=batch_index, **reward))
+                            temperature=temperature, batch_index=batch_index,
+                            trace=trace, **reward))
                 optimizer.zero_grad()
                 for circuit, record in zip(batch, batch_records):
-                    logits = centered_logits(candidate(circuit.embeddings), temperature)
-                    log_prob = plackett_luce_log_prob(
-                        logits, torch.from_numpy(orders[circuit.name]))
-                    loss = -record["advantage"] * log_prob / circuit.fault_count / len(batch)
+                    log_prob = trajectory_log_prob(
+                        candidate, circuit.embeddings,
+                        trajectories[circuit.name], temperature)
+                    loss = _normalized_policy_loss(
+                        record["advantage"], log_prob,
+                        circuit.fault_count, len(batch))
                     if not torch.isfinite(loss):
                         raise RuntimeError("non-finite policy loss")
                     record["loss_contribution"] = float(loss.detach())
@@ -300,7 +367,7 @@ class Trainer:
                 records.append({"kind": "evaluation", "report": report})
             payload = self._payload(model=candidate, optimizer=optimizer, round_number=number,
                                     states=states, best=best)
-            self._write_round(number, records, orders)
+            self._write_round(number, records, trajectories)
             # This atomic replacement is the commit point. Failed collection,
             # evaluation or optimizer steps cannot alter latest or live state.
             save_checkpoint(self.output / "latest.pt", payload)
@@ -323,12 +390,25 @@ class Trainer:
                 "native_metrics": self.native_metrics, "rng": capture_rng(),
                 "best": overrides.get("best", self.best)}
 
-    def _write_round(self, number, records, orders):
+    def _write_round(self, number, records, trajectories):
         # One immutable JSONL file per committed round. Files beyond latest's
         # round are incomplete attempts and may be replaced when resuming.
         prefix = self.output / "rounds" / ("round-{:06d}".format(number))
-        if orders:
-            write_npz(prefix.with_suffix(".npz"), **orders)
+        if trajectories:
+            arrays = {}
+            for name, decisions in trajectories.items():
+                selected = np.asarray(
+                    [decision["selected_row"] for decision in decisions],
+                    dtype=np.int64)
+                offsets = [0]
+                remaining = []
+                for decision in decisions:
+                    remaining.extend(decision["remaining_rows"])
+                    offsets.append(len(remaining))
+                arrays[name + "__selected_rows"] = selected
+                arrays[name + "__remaining_offsets"] = np.asarray(offsets, dtype=np.int64)
+                arrays[name + "__remaining_rows"] = np.asarray(remaining, dtype=np.int64)
+            write_npz(prefix.with_suffix(".npz"), **arrays)
         encoded = "".join(json.dumps(r, allow_nan=False) + "\n" for r in records).encode("utf-8")
         atomic_write(prefix.with_suffix(".jsonl"), lambda stream: stream.write(encoded))
 
@@ -499,19 +579,24 @@ def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment
             results[circuit.name] = saved_metrics["model"]
             continue
 
-        native, native_elapsed = trainer._run(
-            circuit, np.arange(circuit.fault_count, dtype=np.int64))
+        native, native_elapsed = trainer._run_native(circuit)
         native = dict(native, seconds=native_elapsed)
         trainer.model.eval()
         with torch.no_grad():
-            scores = trainer.model(circuit.embeddings)
+            first_rows = tuple(range(circuit.fault_count))
+            scores = trainer.model(build_dynamic_features(
+                circuit.embeddings, first_rows))
             order = deterministic_permutation(scores).numpy()
-        model_metrics, model_elapsed = trainer._run(circuit, order)
+            model_metrics, model_elapsed, decisions, _ = trainer._run_policy(
+                circuit, trainer.model, temperature=1.0, stochastic=False)
         model_metrics = dict(model_metrics, seconds=model_elapsed)
         ranks = np.empty(circuit.fault_count, dtype=np.int64)
         ranks[order] = np.arange(1, circuit.fault_count + 1)
         write_npz(ranking_path, fault_ids=np.asarray(circuit.fault_ids),
-                  scores=scores.numpy(), ranks=ranks, permutation=order)
+                  scores=scores.numpy(), ranks=ranks, permutation=order,
+                  selected_rows=np.asarray(
+                      [decision["selected_row"] for decision in decisions],
+                      dtype=np.int64))
         write_json(metrics_path, {"identity": identity, "native": native,
                                   "model": model_metrics})
         native_metrics[circuit.name] = native

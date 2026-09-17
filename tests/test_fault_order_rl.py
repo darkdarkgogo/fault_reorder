@@ -26,6 +26,7 @@ from fault_order_rl.trainer import (
     TrainConfig,
     Trainer,
     _complete_report,
+    _normalized_policy_loss,
     _write_evaluation,
     eligible,
     evaluate_checkpoint,
@@ -142,14 +143,16 @@ def test_reward_and_coverage_penalty_do_not_mutate_previous_state():
     state = dict(native_pattern_count=20, previous_pattern_count=18,
                  native_covered_equivalent_faults=100, reward_ema=2.)
     new, reward = reward_transition(
-        state, dict(pattern_count=15, detected_equivalent_faults=95,
+        state, dict(pattern_count=15, patterns_after_stc=15,
+                    detected_equivalent_faults=95,
                     redundant_equivalent_faults=5, covered_equivalent_faults=100), .9)
     assert reward == dict(raw_reward=3, advantage=.05, coverage_valid=True)
     assert new["previous_pattern_count"] == 15
     assert new["native_covered_equivalent_faults"] == 100
     assert new["reward_ema"] == pytest.approx(2.1)
     invalid, penalty = reward_transition(
-        state, dict(pattern_count=2, detected_equivalent_faults=98,
+        state, dict(pattern_count=2, patterns_after_stc=2,
+                    detected_equivalent_faults=98,
                     redundant_equivalent_faults=1, covered_equivalent_faults=99), .9)
     assert penalty == dict(raw_reward=-20, advantage=-1.1, coverage_valid=False)
     assert invalid["previous_pattern_count"] == 18
@@ -161,15 +164,79 @@ class FakeEnvironment:
     """Deterministic order-dependent solver used only by trainer unit tests."""
     fail_name = None
 
-    def run(self, bench, faultmap, ids):
-        if Path(bench).name == self.fail_name:
-            raise RuntimeError("injected solver failure")
-        score = sum((i + 1) * int(identifier[1:]) for i, identifier in enumerate(ids))
-        return dict(pattern_count=3 + score % 7, detected_equivalent_faults=len(ids),
-                    detected_collapsed_faults=len(ids), uncollapsed_faults=len(ids),
-                    aborted_faults=0, redundant_faults=0,
-                    redundant_equivalent_faults=0, covered_equivalent_faults=len(ids),
-                    fault_coverage=1.0, podem_calls=len(ids), total_backtracks=score)
+    counts = {"small": 5, "larger": 8}
+
+    class Session:
+        def __init__(self, owner, name):
+            self.owner = owner
+            self.name = name
+            self.initial = tuple("f" + str(i) for i in range(owner.counts[name]))
+            self.remaining_fault_ids = self.initial
+            self.raw_patterns = 0
+            self.calls = 0
+            self.dtc_calls = 0
+            self.primary_backtracks = 0
+            self.dtc_backtracks = 0
+
+        def step(self, selected):
+            if self.name == self.owner.fail_name:
+                raise RuntimeError("injected solver failure")
+            before = self.remaining_fault_ids
+            row = int(selected[1:])
+            dropped = [selected]
+            next_id = "f" + str(row + 1)
+            attempted = ()
+            if row % 2 == 0 and next_id in before:
+                dropped.append(next_id)
+                attempted = (next_id,)
+            self.remaining_fault_ids = tuple(
+                identifier for identifier in before if identifier not in dropped)
+            self.raw_patterns += 1
+            self.calls += 1
+            self.dtc_calls += len(attempted)
+            self.primary_backtracks += row
+            self.dtc_backtracks += len(attempted)
+            total_backtracks = self.primary_backtracks + self.dtc_backtracks
+            return dict(
+                selected_fault_id=selected, target_status="detected",
+                generated_pattern=True, generated_test_vector="1",
+                dtc_attempted_fault_ids=attempted,
+                dtc_embedded_fault_ids=attempted,
+                newly_detected_fault_ids=tuple(dropped),
+                remaining_fault_ids=self.remaining_fault_ids,
+                current_pattern_count=self.raw_patterns,
+                pattern_count=self.raw_patterns,
+                primary_podem_calls=self.calls, podem_calls=self.calls,
+                dtc_secondary_calls=self.dtc_calls,
+                primary_backtracks=self.primary_backtracks,
+                dtc_backtracks=self.dtc_backtracks,
+                total_backtracks=total_backtracks,
+            )
+
+        def finish(self):
+            after = max(0, self.raw_patterns - 1)
+            total = len(self.initial)
+            return dict(
+                finalized=True, pattern_count=after,
+                current_pattern_count=self.raw_patterns,
+                patterns_before_stc=self.raw_patterns,
+                patterns_after_stc=after,
+                stc_removed_patterns=self.raw_patterns - after,
+                stc_shuffle_attempts=5, stc_coverage_preserved=True,
+                detected_collapsed_faults=total,
+                detected_equivalent_faults=total,
+                uncollapsed_faults=total, aborted_faults=0,
+                redundant_faults=0, redundant_equivalent_faults=0,
+                covered_equivalent_faults=total, fault_coverage=1.0,
+                podem_calls=self.calls, primary_podem_calls=self.calls,
+                dtc_secondary_calls=self.dtc_calls,
+                primary_backtracks=self.primary_backtracks,
+                dtc_backtracks=self.dtc_backtracks,
+                total_backtracks=self.primary_backtracks + self.dtc_backtracks,
+            )
+
+    def start_session(self, bench, faultmap):
+        return self.Session(self, Path(bench).name)
 
 
 @pytest.fixture
@@ -192,6 +259,42 @@ def mock_training(tmp_path, monkeypatch):
 def assert_model_equal(a, b):
     for key in a:
         assert torch.equal(a[key], b[key]), key
+
+
+def test_dynamic_episode_rebuilds_state_after_fault_drop(mock_training, tmp_path):
+    manifest, env = mock_training
+    trainer = Trainer(manifest, TrainConfig(rounds=1), tmp_path/'dynamic', env)
+    circuit = trainer.circuits[0]
+    with torch.no_grad():
+        for parameter in trainer.model.parameters():
+            parameter.zero_()
+    metrics, _, decisions, trace = trainer._run_policy(
+        circuit, trainer.model, temperature=1.0, stochastic=False)
+    assert decisions[0]["remaining_rows"] == tuple(range(circuit.fault_count))
+    assert len(decisions[1]["remaining_rows"]) < circuit.fault_count - 1
+    assert trace[1]["remaining_ratio"] == (
+        len(decisions[1]["remaining_rows"]) / circuit.fault_count)
+    assert metrics["pattern_count"] == metrics["patterns_after_stc"]
+
+
+def test_loss_uses_initial_fault_count_not_decision_count():
+    log_prob = torch.tensor(2.0, requires_grad=True)
+    loss = _normalized_policy_loss(3.0, log_prob, 5, 1)
+    assert torch.allclose(loss, torch.tensor(-1.2))
+    with pytest.raises(ValueError):
+        _normalized_policy_loss(1.0, log_prob, 0, 1)
+    with pytest.raises(ValueError):
+        _normalized_policy_loss(1.0, log_prob, 5, 0)
+
+
+def test_reward_uses_patterns_after_stc():
+    state = dict(native_pattern_count=5, previous_pattern_count=5,
+                 native_covered_equivalent_faults=3, reward_ema=0.0)
+    metrics = dict(pattern_count=3, patterns_before_stc=4,
+                   patterns_after_stc=3, covered_equivalent_faults=3)
+    new, reward = reward_transition(state, metrics, 0.9)
+    assert reward["raw_reward"] == 2
+    assert new["previous_pattern_count"] == 3
 
 
 def test_checkpoint_schema_one_requires_restart(tmp_path):
@@ -219,7 +322,9 @@ def test_shared_update_and_exact_resume(mock_training, tmp_path):
     assert continuous.states == resumed.states
     for name in ('small', 'larger'):
         with np.load(tmp_path/'continuous/rounds/round-000002.npz') as a, np.load(tmp_path/'interrupted/rounds/round-000002.npz') as b:
-            np.testing.assert_array_equal(a[name], b[name])
+            for suffix in ("selected_rows", "remaining_offsets", "remaining_rows"):
+                np.testing.assert_array_equal(
+                    a[name + "__" + suffix], b[name + "__" + suffix])
     evaluated = evaluate_checkpoint(tmp_path/'interrupted/best.pt', tmp_path/'exports', env)
     assert evaluated['eligible']
     for name in ('small', 'larger'):
@@ -1085,7 +1190,7 @@ def test_training_seed_does_not_change_fixed_solver_protocol(mock_training, tmp_
         return env
     monkeypatch.setattr(module, 'PodemEnvironment', factory)
     Trainer(manifest, TrainConfig(seed=93), tmp_path/'seed-test')
-    assert calls == [(5000, 14)]
+    assert calls == [(200, 14)]
 
 
 def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch, capsys):
@@ -1106,7 +1211,7 @@ def test_train_cli_skips_internal_config_without_argument(tmp_path, monkeypatch,
     ])
     assert result == 0
     assert captured['config'].rounds == 1
-    assert captured['config'].backtrack_limit == 5000
+    assert captured['config'].backtrack_limit == 200
     assert json.loads(capsys.readouterr().out)['checkpoint_kind'] == 'best'
 
 
