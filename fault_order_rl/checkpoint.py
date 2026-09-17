@@ -52,7 +52,11 @@ def load_checkpoint(path):
         raise ValueError(
             "checkpoint schema 1 uses detected-only coverage; restart training"
         )
-    if not isinstance(state, dict) or state.get("version") != 2:
+    if isinstance(state, dict) and state.get("version") == 2:
+        raise ValueError(
+            "checkpoint schema 2 uses a static permutation policy; retraining is required"
+        )
+    if not isinstance(state, dict) or state.get("version") != 3:
         raise ValueError("unsupported fault-order checkpoint")
     return state
 

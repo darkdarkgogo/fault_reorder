@@ -25,6 +25,8 @@ from fault_order_rl.policy import (
 from fault_order_rl.trainer import (
     TrainConfig,
     Trainer,
+    POLICY_IDENTITY,
+    SOLVER_PROTOCOL,
     _complete_report,
     _normalized_policy_loss,
     _write_evaluation,
@@ -304,6 +306,13 @@ def test_checkpoint_schema_one_requires_restart(tmp_path):
         load_checkpoint(checkpoint)
 
 
+def test_checkpoint_schema_two_requires_dynamic_retraining(tmp_path):
+    checkpoint = tmp_path/'static.pt'
+    save_checkpoint(checkpoint, {'version': 2})
+    with pytest.raises(ValueError, match='static permutation.*retraining'):
+        load_checkpoint(checkpoint)
+
+
 def test_shared_update_and_exact_resume(mock_training, tmp_path):
     manifest, env = mock_training
     config = TrainConfig(rounds=2, evaluate_every=1)
@@ -312,6 +321,11 @@ def test_shared_update_and_exact_resume(mock_training, tmp_path):
     records = continuous.step()
     assert len([r for r in records if r['kind'] == 'episode']) == 2
     assert all('loss_contribution' in r for r in records if r['kind'] == 'episode')
+    payload = load_checkpoint(tmp_path/'continuous/latest.pt')
+    assert payload['version'] == 3
+    assert payload['policy'] == POLICY_IDENTITY
+    assert payload['input_dimension'] == 515
+    assert payload['solver_protocol'] == SOLVER_PROTOCOL
     continuous.step()
     assert any(not torch.equal(initial[k], continuous.model.state_dict()[k]) for k in initial)
     interrupted = Trainer.create(manifest, config, tmp_path/'interrupted', env)
@@ -330,6 +344,13 @@ def test_shared_update_and_exact_resume(mock_training, tmp_path):
     for name in ('small', 'larger'):
         with np.load(tmp_path/'exports'/ (name+'.ranking.npz')) as arrays:
             assert sorted(arrays['ranks']) == list(range(1, len(arrays['fault_ids'])+1))
+            assert arrays['exit_reasons'].dtype.kind == 'U'
+            assert 'selected_steps' in arrays
+            assert 'patterns_after_stc' in arrays
+        events = [json.loads(line) for line in
+                  (tmp_path/'exports'/(name+'.trajectory.jsonl')).read_text().splitlines()]
+        assert events[-1]['kind'] == 'stc_summary'
+        assert events[-1]['stc_coverage_preserved'] is True
 
 
 def test_minibatch_updates_and_exact_resume(mock_training, tmp_path):

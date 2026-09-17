@@ -17,10 +17,17 @@ import torch
 from .checkpoint import (atomic_write, capture_rng, load_checkpoint, restore_rng,
                          save_checkpoint, write_json, write_npz)
 from .data import _sha256, load_all_circuits, load_manifest
-from .environment import PodemEnvironment
+from .environment import PROTOCOL_CONFIG, PodemEnvironment
 from .model import FaultScorer, build_dynamic_features
 from .policy import (deterministic_permutation, select_categorical_action,
                      trajectory_log_prob)
+
+
+POLICY_IDENTITY = "dynamic_masked_categorical_v1"
+SOLVER_PROTOCOL = {
+    **PROTOCOL_CONFIG,
+    "compression_algorithm_version": "stuck_at_podemx_reverse_shuffle_v1",
+}
 
 
 @dataclass
@@ -103,6 +110,47 @@ def _normalized_policy_loss(advantage, log_prob, initial_fault_count, batch_size
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     return -advantage * log_prob / initial_fault_count / batch_size
+
+
+def _evaluation_export(circuit, scores, order, decisions, trace, metrics):
+    count = circuit.fault_count
+    ranks = np.empty(count, dtype=np.int64)
+    ranks[order] = np.arange(1, count + 1)
+    selected_steps = np.full(count, -1, dtype=np.int64)
+    selected_scores = np.full(count, np.nan, dtype=np.float32)
+    exit_steps = np.full(count, -1, dtype=np.int64)
+    exit_reasons = np.full(count, "", dtype="<U32")
+    for step_index, (decision, event) in enumerate(zip(decisions, trace)):
+        selected = decision["selected_row"]
+        selected_steps[selected] = step_index
+        selected_scores[selected] = event["selected_score"]
+        before = set(decision["remaining_rows"])
+        after = (set(decisions[step_index + 1]["remaining_rows"])
+                 if step_index + 1 < len(decisions) else set())
+        for row in before - after:
+            exit_steps[row] = step_index
+            exit_reasons[row] = (event["target_status"]
+                                 if row == selected else "fault_sim_drop")
+    return {
+        "fault_ids": np.asarray(circuit.fault_ids),
+        "scores": scores.numpy(),
+        "ranks": ranks,
+        "permutation": order,
+        "selected_rows": np.asarray(
+            [decision["selected_row"] for decision in decisions], dtype=np.int64),
+        "selected_scores": selected_scores,
+        "selected_steps": selected_steps,
+        "exit_steps": exit_steps,
+        "exit_reasons": exit_reasons,
+        "patterns_before_stc": np.asarray(metrics["patterns_before_stc"], dtype=np.int64),
+        "patterns_after_stc": np.asarray(metrics["patterns_after_stc"], dtype=np.int64),
+        "primary_podem_calls": np.asarray(metrics["primary_podem_calls"], dtype=np.int64),
+        "dtc_secondary_calls": np.asarray(metrics["dtc_secondary_calls"], dtype=np.int64),
+        "primary_backtracks": np.asarray(metrics["primary_backtracks"], dtype=np.int64),
+        "dtc_backtracks": np.asarray(metrics["dtc_backtracks"], dtype=np.int64),
+        "total_backtracks": np.asarray(metrics["total_backtracks"], dtype=np.int64),
+        "_trajectory": trace,
+    }
 
 
 class Trainer:
@@ -190,6 +238,10 @@ class Trainer:
             raise ValueError("checkpoint PODEM binary changed")
         if saved["torch_version"] != str(torch.__version__):
             raise ValueError("checkpoint PyTorch version changed; exact resume cannot be guaranteed")
+        if saved.get("policy") != POLICY_IDENTITY or saved.get("input_dimension") != 515:
+            raise ValueError("checkpoint dynamic policy identity changed")
+        if saved.get("solver_protocol") != SOLVER_PROTOCOL:
+            raise ValueError("checkpoint solver protocol changed")
 
     def _check_result(self, circuit, result):
         if result["uncollapsed_faults"] != int(circuit.eqv_fault_nums.sum()):
@@ -267,14 +319,8 @@ class Trainer:
                 first_rows = tuple(range(circuit.fault_count))
                 scores = model(build_dynamic_features(circuit.embeddings, first_rows))
                 order = deterministic_permutation(scores).numpy()
-                ranks = np.empty(circuit.fault_count, dtype=np.int64)
-                ranks[order] = np.arange(1, circuit.fault_count + 1)
-                exports[circuit.name] = {"fault_ids": np.asarray(circuit.fault_ids),
-                                         "scores": scores.numpy(), "ranks": ranks,
-                                         "permutation": order,
-                                         "selected_rows": np.asarray(
-                                             [d["selected_row"] for d in decisions],
-                                             dtype=np.int64)}
+                exports[circuit.name] = _evaluation_export(
+                    circuit, scores, order, decisions, trace, metrics)
         totals = {key: sum(result[key] for result in results.values()) for key in
                   ("pattern_count", "detected_equivalent_faults", "detected_collapsed_faults",
                    "redundant_equivalent_faults", "covered_equivalent_faults",
@@ -379,7 +425,9 @@ class Trainer:
         return records
 
     def _payload(self, model=None, optimizer=None, round_number=None, states=None, **overrides):
-        return {"version": 2, "kind": "latest", "run_id": self.run_id,
+        return {"version": 3, "kind": "latest", "run_id": self.run_id,
+                "policy": POLICY_IDENTITY, "input_dimension": 515,
+                "solver_protocol": copy.deepcopy(SOLVER_PROTOCOL),
                 "manifest_path": str(self.manifest.path), "manifest_digest": self.manifest.digest,
                 "artifacts": self.provenance, "solver_digest": self.solver_digest,
                 "torch_version": str(torch.__version__), "config": asdict(self.config),
@@ -502,7 +550,24 @@ def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind
 def _write_evaluation(output, report, exports, include_aggregate=True):
     output = Path(output)
     for name, arrays in exports.items():
+        arrays = dict(arrays)
+        trajectory = arrays.pop("_trajectory", [])
         write_npz(output / (name + ".ranking.npz"), **arrays)
+        metrics = report["circuits"][name]
+        events = [dict(event, kind="decision") for event in trajectory]
+        events.append({
+            "kind": "stc_summary",
+            "patterns_before_stc": metrics["patterns_before_stc"],
+            "patterns_after_stc": metrics["patterns_after_stc"],
+            "stc_removed_patterns": metrics["stc_removed_patterns"],
+            "stc_shuffle_attempts": metrics["stc_shuffle_attempts"],
+            "stc_coverage_preserved": metrics["stc_coverage_preserved"],
+        })
+        encoded_trace = "".join(
+            json.dumps(event, allow_nan=False) + "\n" for event in events
+        ).encode("utf-8")
+        atomic_write(output / (name + ".trajectory.jsonl"),
+                     lambda stream, data=encoded_trace: stream.write(data))
     rows = list(report["comparison_by_circuit"].values())
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=list(rows[0]) if rows else ["circuit"],
@@ -541,6 +606,10 @@ def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment
         raise ValueError("checkpoint PODEM binary changed")
     if saved["torch_version"] != str(torch.__version__):
         raise ValueError("checkpoint PyTorch version changed; evaluation is not reproducible")
+    if saved.get("policy") != POLICY_IDENTITY or saved.get("input_dimension") != 515:
+        raise ValueError("checkpoint dynamic policy identity changed")
+    if saved.get("solver_protocol") != SOLVER_PROTOCOL:
+        raise ValueError("checkpoint solver protocol changed")
     trainer.model.load_state_dict(saved["model"])
     output = Path(output).resolve()
     checkpoint_digest = _sha256(checkpoint)
@@ -549,6 +618,9 @@ def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment
         "evaluation_manifest_digest": trainer.manifest.digest,
         "artifacts": trainer.provenance,
         "solver_digest": trainer.solver_digest,
+        "policy": POLICY_IDENTITY,
+        "input_dimension": 515,
+        "solver_protocol": SOLVER_PROTOCOL,
     }
     status_path = output / "status.json"
     completed = []
@@ -569,8 +641,10 @@ def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment
     for circuit in trainer.circuits:
         metrics_path = output / "circuits" / (circuit.name + ".metrics.json")
         ranking_path = output / (circuit.name + ".ranking.npz")
+        trajectory_path = output / (circuit.name + ".trajectory.jsonl")
         if circuit.name in completed_set:
-            if not metrics_path.is_file() or not ranking_path.is_file():
+            if (not metrics_path.is_file() or not ranking_path.is_file()
+                    or not trajectory_path.is_file()):
                 raise ValueError("completed evaluation artifact is missing: " + circuit.name)
             saved_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             if saved_metrics.get("identity") != identity:
@@ -587,16 +661,27 @@ def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment
             scores = trainer.model(build_dynamic_features(
                 circuit.embeddings, first_rows))
             order = deterministic_permutation(scores).numpy()
-            model_metrics, model_elapsed, decisions, _ = trainer._run_policy(
+            model_metrics, model_elapsed, decisions, trace = trainer._run_policy(
                 circuit, trainer.model, temperature=1.0, stochastic=False)
         model_metrics = dict(model_metrics, seconds=model_elapsed)
-        ranks = np.empty(circuit.fault_count, dtype=np.int64)
-        ranks[order] = np.arange(1, circuit.fault_count + 1)
-        write_npz(ranking_path, fault_ids=np.asarray(circuit.fault_ids),
-                  scores=scores.numpy(), ranks=ranks, permutation=order,
-                  selected_rows=np.asarray(
-                      [decision["selected_row"] for decision in decisions],
-                      dtype=np.int64))
+        arrays = _evaluation_export(
+            circuit, scores, order, decisions, trace, model_metrics)
+        trajectory = arrays.pop("_trajectory")
+        write_npz(ranking_path, **arrays)
+        events = [dict(event, kind="decision") for event in trajectory]
+        events.append({
+            "kind": "stc_summary",
+            "patterns_before_stc": model_metrics["patterns_before_stc"],
+            "patterns_after_stc": model_metrics["patterns_after_stc"],
+            "stc_removed_patterns": model_metrics["stc_removed_patterns"],
+            "stc_shuffle_attempts": model_metrics["stc_shuffle_attempts"],
+            "stc_coverage_preserved": model_metrics["stc_coverage_preserved"],
+        })
+        encoded_trace = "".join(
+            json.dumps(event, allow_nan=False) + "\n" for event in events
+        ).encode("utf-8")
+        atomic_write(trajectory_path,
+                     lambda stream, data=encoded_trace: stream.write(data))
         write_json(metrics_path, {"identity": identity, "native": native,
                                   "model": model_metrics})
         native_metrics[circuit.name] = native
