@@ -6,7 +6,7 @@ import sys
 
 
 PROTOCOL_CONFIG = {
-    "primary_backtrack_limit": 200, "primary_seed": 14,
+    "primary_backtrack_limit": 100, "primary_seed": 14,
     "attempts_per_primary_fault": 1, "dtc_enabled": True,
     "dtc_secondary_backtrack_limit": 50, "stc_enabled": True,
     "stc_reverse_order_enabled": True, "stc_shuffle_seed": 7,
@@ -138,9 +138,6 @@ class PodemSession:
         if len(self.initial_fault_ids) != len(set(self.initial_fault_ids)):
             raise RuntimeError("PODEM catalog has duplicate fault IDs")
         self._catalog_set = set(self.initial_fault_ids)
-        self._catalog_rows = {
-            identifier: row for row, identifier in enumerate(self.initial_fault_ids)
-        }
         self.remaining_fault_ids = _ids(
             {"remaining_fault_ids": native.remaining_fault_ids()},
             "remaining_fault_ids", self._catalog_set)
@@ -158,10 +155,18 @@ class PodemSession:
         self._detected_ids = set()
         self._final = None
 
-    def step(self, fault_id):
+    def step(self, fault_id, ranked_secondary_fault_ids):
         if self._final is not None or fault_id not in self.remaining_fault_ids:
             raise ValueError("selected fault ID is not remaining")
-        raw = dict(self._native.step(fault_id))
+        ranked = _ids(
+            {"ranked_secondary_fault_ids": ranked_secondary_fault_ids},
+            "ranked_secondary_fault_ids", self._catalog_set)
+        expected_secondaries = set(self.remaining_fault_ids) - {fault_id}
+        if set(ranked) != expected_secondaries or len(ranked) != len(expected_secondaries):
+            raise ValueError(
+                "ranked secondary IDs must contain every non-primary remaining fault"
+            )
+        raw = dict(self._native.step(fault_id, list(ranked)))
         missing = [field for field in STEP_FIELDS if field not in raw]
         if missing:
             raise RuntimeError("PODEM step is missing fields: {}".format(missing))
@@ -188,11 +193,14 @@ class PodemSession:
                 raise RuntimeError("PODEM coverage count changed incorrectly: {}".format(field))
         if not set(attempted) <= before - {fault_id}:
             raise RuntimeError("PODEM dtc_attempted IDs were not secondary candidates")
-        attempted_rows = [self._catalog_rows[identifier] for identifier in attempted]
-        if any(left >= right for left, right in zip(attempted_rows, attempted_rows[1:])):
-            raise RuntimeError("PODEM dtc_attempted IDs are not in catalog order")
+        if attempted != ranked[:len(attempted)]:
+            raise RuntimeError("PODEM dtc_attempted IDs are not a ranked prefix")
         if not set(embedded) <= set(attempted):
             raise RuntimeError("PODEM dtc_embedded IDs were not attempted")
+        embedded_positions = [attempted.index(identifier) for identifier in embedded]
+        if any(left >= right for left, right in zip(
+                embedded_positions, embedded_positions[1:])):
+            raise RuntimeError("PODEM dtc_embedded IDs are not in attempted order")
         if raw["selected_fault_id"] != fault_id:
             raise RuntimeError("PODEM selected fault ID changed")
         if not isinstance(raw["generated_pattern"], bool):
@@ -263,12 +271,12 @@ class PodemSession:
 
 
 class PodemEnvironment:
-    def __init__(self, module_dir=None, backtrack_limit=200, seed=14):
+    def __init__(self, module_dir=None, backtrack_limit=100, seed=14):
         if (type(backtrack_limit) is not int or type(seed) is not int
-                or backtrack_limit != 200 or seed != 14):
-            raise ValueError("PODEM production protocol requires backtrack_limit=200 and seed=14")
+                or backtrack_limit != 100 or seed != 14):
+            raise ValueError("PODEM production protocol requires backtrack_limit=100 and seed=14")
         self.module = load_cpp_podem(module_dir)
-        self.backtrack_limit = 200
+        self.backtrack_limit = 100
         self.seed = 14
 
     def catalog(self, bench_path, faultmap_path):
@@ -280,7 +288,7 @@ class PodemEnvironment:
         self._check_files(bench_path, faultmap_path)
         native = self.module.StuckAtSession(
             str(bench_path), self._faultmap_argument(faultmap_path),
-            200, 14, True, True)
+            100, 14, True, True)
         return PodemSession(native)
 
     def run(self, bench_path, faultmap_path, ordered_fault_ids):
@@ -288,7 +296,7 @@ class PodemEnvironment:
         ids = tuple(ordered_fault_ids)
         raw = dict(self.module.run_stuck_at_ordered(
             str(bench_path), self._faultmap_argument(faultmap_path),
-            list(ids), 200, 14, True, True))
+            list(ids), 100, 14, True, True))
         return _validate_result(raw, len(ids), True)
 
     @staticmethod

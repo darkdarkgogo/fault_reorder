@@ -124,9 +124,28 @@ ATPG::AtpgRunResult ATPG::get_stuck_at_result() const
 	return result;
 }
 
-ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
+ATPG::AtpgStepResult ATPG::step_stuck_at(
+	const string &fault_id,
+	const vector<string> &ranked_secondary_fault_ids)
 {
 	prepare_stuck_at_session();
+	const vector<string> selectable_ids = get_selectable_fault_ids();
+	const unordered_set<string> selectable_set(
+		selectable_ids.begin(), selectable_ids.end());
+	if (selectable_set.find(fault_id) == selectable_set.end())
+		throw runtime_error("Fault ID is not selectable: " + fault_id);
+	if (ranked_secondary_fault_ids.size() + 1 != selectable_ids.size())
+		throw runtime_error("Ranked DTC candidates must contain every non-primary selectable fault");
+	unordered_set<string> ranked_set;
+	for (const string &identifier : ranked_secondary_fault_ids)
+	{
+		if (identifier == fault_id || selectable_set.find(identifier) == selectable_set.end())
+			throw runtime_error("Ranked DTC candidate is not a non-primary selectable fault: " + identifier);
+		if (!ranked_set.insert(identifier).second)
+			throw runtime_error("Ranked DTC candidates contain a duplicate fault: " + identifier);
+	}
+	if (ranked_set.size() + 1 != selectable_set.size())
+		throw runtime_error("Ranked DTC candidates do not match the selectable fault set");
 
 	fptr known_fault = nullptr;
 	for (const auto &owned_fault : flist)
@@ -159,7 +178,8 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 	{
 		case TRUE:
 		{
-			const DtcResult dtc = run_stuck_at_dtc(fault_under_test);
+			const DtcResult dtc = run_stuck_at_dtc(
+				fault_under_test, ranked_secondary_fault_ids);
 			step.dtc_attempted_fault_ids = dtc.attempted_fault_ids;
 			step.dtc_embedded_fault_ids = dtc.embedded_fault_ids;
 			stuck_at_dtc_secondary_calls += dtc.secondary_calls;
@@ -217,6 +237,16 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 	step.remaining_fault_ids = get_selectable_fault_ids();
 	step.cumulative_result = get_stuck_at_result();
 	return step;
+}
+
+ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
+{
+	const vector<string> selectable = get_selectable_fault_ids();
+	vector<string> ranked_secondary_fault_ids;
+	for (const string &identifier : selectable)
+		if (identifier != fault_id)
+			ranked_secondary_fault_ids.push_back(identifier);
+	return step_stuck_at(fault_id, ranked_secondary_fault_ids);
 }
 
 ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)

@@ -167,12 +167,15 @@ public:
     return result;
   }
 
-  py::dict step(const std::string &fault_id) {
+  py::dict step(
+      const std::string &fault_id,
+      const std::vector<std::string> &ranked_secondary_fault_ids) {
     ATPG::AtpgStepResult step_result;
     {
       py::gil_scoped_release release;
       std::lock_guard<std::mutex> lock(mutex_);
-      step_result = atpg_.step_stuck_at(fault_id);
+      step_result = atpg_.step_stuck_at(
+          fault_id, ranked_secondary_fault_ids);
     }
     py::dict result = summary_to_dict(step_result.cumulative_result);
     result["selected_fault_id"] = step_result.selected_fault_id;
@@ -193,6 +196,20 @@ public:
     result["current_total_backtracks"] =
         step_result.cumulative_result.total_backtracks;
     return result;
+  }
+
+  py::dict step_legacy(const std::string &fault_id) {
+    std::vector<std::string> secondaries;
+    {
+      py::gil_scoped_release release;
+      std::lock_guard<std::mutex> lock(mutex_);
+      const std::vector<std::string> remaining =
+          atpg_.get_selectable_fault_ids();
+      for (const std::string &identifier : remaining)
+        if (identifier != fault_id)
+          secondaries.push_back(identifier);
+    }
+    return step(fault_id, secondaries);
   }
 
   py::dict result() {
@@ -225,18 +242,20 @@ PYBIND11_MODULE(cpp_podem, module) {
              py::arg("circuit_path"), py::arg("fault_map_path") = "");
   module.def("run_stuck_at_ordered", &run_stuck_at_ordered,
              py::arg("circuit_path"), py::arg("fault_map_path"),
-             py::arg("ordered_fault_ids"), py::arg("backtrack_limit") = 200,
+             py::arg("ordered_fault_ids"), py::arg("backtrack_limit") = 100,
              py::arg("seed") = 14, py::arg("dtc_enabled") = true,
              py::arg("stc_enabled") = true);
   py::class_<StuckAtSession>(module, "StuckAtSession")
       .def(py::init<const std::string &, const std::string &, int, int,
                     bool, bool>(),
            py::arg("circuit_path"), py::arg("fault_map_path") = "",
-           py::arg("backtrack_limit") = 200, py::arg("seed") = 14,
+           py::arg("backtrack_limit") = 100, py::arg("seed") = 14,
            py::arg("dtc_enabled") = true, py::arg("stc_enabled") = true)
       .def("catalog", &StuckAtSession::catalog)
       .def("config", &StuckAtSession::config)
       .def("remaining_fault_ids", &StuckAtSession::remaining_fault_ids)
-      .def("step", &StuckAtSession::step, py::arg("fault_id"))
+      .def("step", &StuckAtSession::step,
+           py::arg("fault_id"), py::arg("ranked_secondary_fault_ids"))
+      .def("step", &StuckAtSession::step_legacy, py::arg("fault_id"))
       .def("result", &StuckAtSession::result);
 }

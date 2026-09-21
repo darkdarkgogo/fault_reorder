@@ -9,14 +9,14 @@ manifest="${2:-configs/anchor_validation_6.json}"
 manifest_name="$(basename -- "$manifest" .json)"
 output_base="${3:-$run_dir/evaluation-$manifest_name}"
 best_checkpoint="$run_dir/best.pt"
-latest_checkpoint="$run_dir/latest.pt"
+final_checkpoint="$run_dir/final.pt"
 
 if [[ ! -f "$best_checkpoint" ]]; then
   echo "error: best checkpoint does not exist: $best_checkpoint" >&2
   exit 1
 fi
-if [[ ! -f "$latest_checkpoint" ]]; then
-  echo "error: latest checkpoint does not exist: $latest_checkpoint" >&2
+if [[ ! -f "$final_checkpoint" ]]; then
+  echo "error: final checkpoint does not exist: $final_checkpoint" >&2
   exit 1
 fi
 if [[ ! -f "$manifest" ]]; then
@@ -30,6 +30,6 @@ python3 -m fault_order_rl evaluate \
   --output "${output_base}-best"
 
 python3 -m fault_order_rl evaluate \
-  --checkpoint "$latest_checkpoint" \
+  --checkpoint "$final_checkpoint" \
   --manifest "$manifest" \
-  --output "${output_base}-latest"
+  --output "${output_base}-final"

@@ -1,4 +1,4 @@
-"""Dynamic categorical actions and legacy listwise ranking operations."""
+"""Dynamic full rankings and executed-prefix policy statistics."""
 
 import numpy as np
 import torch
@@ -19,42 +19,56 @@ def centered_logits(scores, temperature):
     return logits
 
 
-def select_categorical_action(scores, remaining_rows, temperature, stochastic,
-                              generator=None):
-    """Select a catalog row from current candidates, with stable evaluation ties."""
+def sample_ranking(scores, remaining_rows, temperature, stochastic,
+                   generator=None):
+    """Return every remaining catalog row in sampled or stable score order."""
     logits = centered_logits(scores, temperature)
-    rows = torch.as_tensor(remaining_rows, device=scores.device)
+    rows = torch.as_tensor(remaining_rows, device=scores.device, dtype=torch.long)
     if rows.ndim != 1 or rows.numel() != scores.numel():
-        raise ValueError("remaining rows must match the one-dimensional scores")
-    if rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
-        raise ValueError("remaining rows must contain integer indices")
-    if (rows < 0).any() or torch.unique(rows).numel() != rows.numel():
+        raise ValueError("remaining rows must match scores")
+    if torch.unique(rows).numel() != rows.numel() or (rows < 0).any():
         raise ValueError("remaining rows must be non-negative and unique")
     if stochastic:
-        local = torch.multinomial(torch.softmax(logits, 0), 1,
-                                  generator=generator).item()
-    else:
-        maximum = torch.max(scores)
-        tied_rows = rows[scores == maximum]
-        return int(torch.min(tied_rows).item())
-    return int(rows[local].item())
+        local_order, _ = sample_permutation(scores, temperature, generator)
+        return rows[local_order]
+    values = scores.detach().cpu().numpy()
+    catalog_rows = rows.detach().cpu().numpy()
+    order = np.lexsort((catalog_rows, -values))
+    return rows[torch.from_numpy(order).to(device=rows.device)]
 
 
-def trajectory_log_prob(model, embeddings, decisions, temperature):
-    """Replay saved remaining sets under autograd and sum categorical log-probs."""
-    if not decisions:
-        raise ValueError("trajectory must contain at least one decision")
-    step_log_probs = []
-    for decision in decisions:
-        rows = torch.as_tensor(decision["remaining_rows"], device=embeddings.device)
-        features = build_dynamic_features(embeddings, rows)
-        selected = decision["selected_row"]
-        local_indices = (rows == selected).nonzero(as_tuple=True)[0]
-        if local_indices.numel() != 1:
-            raise ValueError("selected row must occur exactly once in remaining rows")
-        logits = centered_logits(model(features), temperature)
-        step_log_probs.append(torch.log_softmax(logits, 0)[local_indices[0]])
-    return torch.stack(step_log_probs).sum()
+def executed_prefix_stats(model, embeddings, remaining_rows, executed_rows,
+                          temperature):
+    """Recompute joint prefix log-probability, mean entropy and state value."""
+    remaining = torch.as_tensor(
+        remaining_rows, device=embeddings.device, dtype=torch.long)
+    executed = torch.as_tensor(
+        executed_rows, device=embeddings.device, dtype=torch.long)
+    if executed.ndim != 1 or executed.numel() == 0:
+        raise ValueError("executed prefix must be non-empty")
+    if torch.unique(executed).numel() != executed.numel():
+        raise ValueError("executed prefix must contain unique rows")
+    features = build_dynamic_features(embeddings, remaining)
+    scores, value = model(features)
+    logits = centered_logits(scores, temperature)
+    available = list(range(remaining.numel()))
+    log_probs, entropies = [], []
+    for selected_row in executed.tolist():
+        matches = [index for index in available
+                   if int(remaining[index]) == selected_row]
+        if len(matches) != 1:
+            raise ValueError("executed row is not available in remaining rows")
+        selected_local = matches[0]
+        available_tensor = torch.as_tensor(
+            available, device=logits.device, dtype=torch.long)
+        conditional = logits[available_tensor]
+        conditional_log_probs = torch.log_softmax(conditional, dim=0)
+        conditional_probs = torch.exp(conditional_log_probs)
+        position = available.index(selected_local)
+        log_probs.append(conditional_log_probs[position])
+        entropies.append(-(conditional_probs * conditional_log_probs).sum())
+        available.remove(selected_local)
+    return (torch.stack(log_probs).sum(), torch.stack(entropies).mean(), value)
 
 
 def sample_permutation(scores, temperature, generator=None):
@@ -70,28 +84,3 @@ def sample_permutation(scores, temperature, generator=None):
     gumbel = -torch.log(-torch.log(uniform))
     permutation = torch.argsort(logits + gumbel, descending=True)
     return permutation, logits
-
-
-def deterministic_permutation(scores):
-    if scores.ndim != 1 or scores.numel() == 0:
-        raise ValueError("scores must be a non-empty one-dimensional tensor")
-    values = scores.detach().cpu().numpy()
-    if not np.isfinite(values).all():
-        raise ValueError("scores contain non-finite values")
-    rows = np.arange(values.shape[0], dtype=np.int64)
-    order = np.lexsort((rows, -values))
-    return torch.from_numpy(order).to(device=scores.device, dtype=torch.long)
-
-
-def plackett_luce_log_prob(logits, permutation):
-    if logits.ndim != 1 or permutation.ndim != 1:
-        raise ValueError("logits and permutation must be one-dimensional")
-    if logits.numel() == 0 or logits.numel() != permutation.numel():
-        raise ValueError("permutation length must equal the non-empty logits length")
-    ordered_indices = permutation.detach().cpu().numpy()
-    if not np.array_equal(np.sort(ordered_indices), np.arange(logits.numel())):
-        raise ValueError("permutation must contain every row exactly once")
-    ordered = logits[permutation]
-    reverse_denominators = torch.logcumsumexp(torch.flip(ordered, dims=(0,)), dim=0)
-    denominators = torch.flip(reverse_denominators, dims=(0,))
-    return (ordered - denominators).sum()

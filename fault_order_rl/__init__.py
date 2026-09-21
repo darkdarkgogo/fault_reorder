@@ -1,11 +1,10 @@
-"""Shared fault ordering with listwise policy gradient."""
+"""Dynamic full-ranking actor-critic PPO for fault ordering."""
 
-from .model import FaultScorer
-from .policy import deterministic_permutation, plackett_luce_log_prob, sample_permutation
+from .model import FaultActorCritic
+from .policy import executed_prefix_stats, sample_ranking
 
 __all__ = [
-    "FaultScorer",
-    "deterministic_permutation",
-    "plackett_luce_log_prob",
-    "sample_permutation",
+    "FaultActorCritic",
+    "executed_prefix_stats",
+    "sample_ranking",
 ]

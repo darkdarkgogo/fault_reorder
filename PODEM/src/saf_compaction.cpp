@@ -1,5 +1,7 @@
 #include "atpg.h"
 
+#include <unordered_map>
+
 namespace {
 int good_value(int value)
 {
@@ -94,20 +96,28 @@ int ATPG::stuck_at_podemx_secondary(fptr fault, int &backtracks)
 	return status;
 }
 
-ATPG::DtcResult ATPG::run_stuck_at_dtc(fptr primary)
+ATPG::DtcResult ATPG::run_stuck_at_dtc(
+	fptr primary,
+	const vector<string> &ranked_secondary_fault_ids)
 {
 	DtcResult result;
 	if (!dynamic_test_compression)
 		return result;
 
-	vector<fptr> candidates;
+	unordered_map<string, fptr> selectable_by_id;
 	for (fptr fault : flist_undetect)
 		if (fault != primary && !fault->test_tried && fault->detect != REDUNDANT)
-			candidates.push_back(fault);
-	// fault_no is assigned at catalog construction and survives primary reorders.
-	sort(candidates.begin(), candidates.end(), [](fptr left, fptr right) {
-		return left->fault_no < right->fault_no;
-	});
+			selectable_by_id.emplace(fault_identifier(fault), fault);
+	vector<fptr> candidates;
+	for (const string &identifier : ranked_secondary_fault_ids)
+	{
+		auto found = selectable_by_id.find(identifier);
+		if (found == selectable_by_id.end())
+			throw runtime_error("Ranked DTC candidate is no longer selectable: " + identifier);
+		candidates.push_back(found->second);
+	}
+	if (candidates.size() != selectable_by_id.size())
+		throw runtime_error("Ranked DTC candidates do not cover the selectable secondaries");
 	vector<fptr> preserved{primary};
 	for (fptr secondary : candidates)
 	{

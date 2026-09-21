@@ -1,4 +1,4 @@
-"""CPU listwise REINFORCE with transactional rounds and coverage guards."""
+"""Dynamic full-ranking actor-critic PPO training for fault reordering."""
 
 import copy
 import csv
@@ -18,71 +18,60 @@ from .checkpoint import (atomic_write, capture_rng, load_checkpoint, restore_rng
                          save_checkpoint, write_json, write_npz)
 from .data import _sha256, load_all_circuits, load_manifest
 from .environment import PROTOCOL_CONFIG, PodemEnvironment
-from .model import FaultScorer, build_dynamic_features
-from .policy import (deterministic_permutation, select_categorical_action,
-                     trajectory_log_prob)
+from .model import FaultActorCritic, build_dynamic_features
+from .policy import executed_prefix_stats, sample_ranking
+from .reward import (compute_gae, normalize_advantages, ppo_objective,
+                     step_reward, target_return, terminal_correction)
 
 
-POLICY_IDENTITY = "dynamic_masked_categorical_v1"
+POLICY_IDENTITY = "dynamic_ranked_dtc_actor_critic_ppo_v1"
 SOLVER_PROTOCOL = {
     **PROTOCOL_CONFIG,
-    "compression_algorithm_version": "stuck_at_podemx_reverse_shuffle_v1",
+    "compression_algorithm_version": "stuck_at_podemx_ranked_dtc_v2",
 }
+DEFAULT_VALIDATION_MANIFEST = (
+    Path(__file__).resolve().parents[1] / "configs" / "anchor_validation_6.json"
+)
 
 
 @dataclass
 class TrainConfig:
-    rounds: int = 100
+    rounds: int = 5
     learning_rate: float = 1e-4
     gradient_clip: float = 1.0
-    ema_decay: float = 0.9
-    temperature_start: float = 1.0
-    temperature_min: float = 0.1
-    temperature_rounds: int = 100
-    evaluate_every: int = 10
+    alpha: float = 0.1
+    beta: float = 10.0
+    gamma: float = 1.0
+    gae_lambda: float = 0.95
+    ppo_clip: float = 0.2
+    value_coef: float = 0.5
+    entropy_coef: float = 0.01
+    ppo_epochs: int = 4
+    temperature: float = 1.0
     seed: int = 14
-    backtrack_limit: int = 200
+    backtrack_limit: int = 100
     threads: int = 1
-    # Zero preserves the historical full-manifest update behavior.
-    batch_size: int = 0
 
     def validate(self):
-        for key in ("rounds", "temperature_rounds", "evaluate_every", "backtrack_limit", "threads"):
-            if not isinstance(getattr(self, key), int) or getattr(self, key) <= 0:
+        for key in ("rounds", "ppo_epochs", "backtrack_limit", "threads"):
+            value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(key + " must be a positive integer")
-        for key in ("learning_rate", "gradient_clip", "temperature_start", "temperature_min"):
+        for key in ("learning_rate", "gradient_clip", "beta", "temperature"):
             if not math.isfinite(getattr(self, key)) or getattr(self, key) <= 0:
                 raise ValueError(key + " must be finite and positive")
-        if not 0 <= self.ema_decay < 1 or not math.isfinite(self.ema_decay):
-            raise ValueError("ema_decay must be in [0, 1)")
-        if self.temperature_min > self.temperature_start:
-            raise ValueError("temperature_min exceeds temperature_start")
+        for key in ("alpha", "value_coef", "entropy_coef"):
+            if not math.isfinite(getattr(self, key)) or getattr(self, key) < 0:
+                raise ValueError(key + " must be finite and non-negative")
+        for key in ("gamma", "gae_lambda", "ppo_clip"):
+            if not math.isfinite(getattr(self, key)) or not 0 <= getattr(self, key) <= 1:
+                raise ValueError(key + " must be in [0, 1]")
         if not 0 <= self.seed < 2**31:
             raise ValueError("seed must be in [0, 2**31)")
-        if not isinstance(self.batch_size, int) or self.batch_size < 0:
-            raise ValueError("batch_size must be a non-negative integer")
-        if self.backtrack_limit != 200:
-            raise ValueError("the compressed fault-order experiment requires backtrack_limit=200")
-
-    def temperature(self, round_number):
-        fraction = min(max(round_number - 1, 0) / max(self.temperature_rounds - 1, 1), 1)
-        return self.temperature_start * (self.temperature_min / self.temperature_start) ** fraction
-
-
-def reward_transition(state, metrics, ema_decay):
-    """Return new state; never mutate a baseline during episode collection."""
-    new = dict(state)
-    patterns = metrics["patterns_after_stc"]
-    covered = metrics["covered_equivalent_faults"]
-    valid = covered >= state["native_covered_equivalent_faults"]
-    if valid:
-        reward = state["previous_pattern_count"] - patterns
-        new["previous_pattern_count"] = patterns
-    else:
-        reward = -max(state["native_pattern_count"], state["previous_pattern_count"], patterns, 1)
-    advantage = (reward - state["reward_ema"]) / max(state["native_pattern_count"], 1)
-    new["reward_ema"] = ema_decay * state["reward_ema"] + (1 - ema_decay) * reward
-    return new, {"raw_reward": reward, "advantage": advantage, "coverage_valid": valid}
+        if self.backtrack_limit != 100:
+            raise ValueError("the production protocol requires backtrack_limit=100")
+        if self.rounds != 5:
+            raise ValueError("the strict training protocol requires exactly 5 rounds")
 
 
 def eligible(report, states):
@@ -94,495 +83,13 @@ def eligible(report, states):
 
 
 def evaluation_key(report):
-    totals = report["totals"]
-    return (totals["pattern_count"], -totals["covered_equivalent_faults"],
-            totals["podem_calls"], totals["total_backtracks"], report["round"])
+    """Coverage-first best-model key required by the strict design."""
+    return (report["coverage_shortfall"], report["totals"]["pattern_count"])
 
 
 def state_dict_equal(first, second):
     return first.keys() == second.keys() and all(
         torch.equal(first[key], second[key]) for key in first)
-
-
-def _normalized_policy_loss(advantage, log_prob, initial_fault_count, batch_size):
-    if initial_fault_count <= 0:
-        raise ValueError("initial_fault_count must be positive")
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-    return -advantage * log_prob / initial_fault_count / batch_size
-
-
-def _evaluation_export(circuit, scores, order, decisions, trace, metrics):
-    count = circuit.fault_count
-    ranks = np.empty(count, dtype=np.int64)
-    ranks[order] = np.arange(1, count + 1)
-    selected_steps = np.full(count, -1, dtype=np.int64)
-    selected_scores = np.full(count, np.nan, dtype=np.float32)
-    exit_steps = np.full(count, -1, dtype=np.int64)
-    exit_reasons = np.full(count, "", dtype="<U32")
-    for step_index, (decision, event) in enumerate(zip(decisions, trace)):
-        selected = decision["selected_row"]
-        selected_steps[selected] = step_index
-        selected_scores[selected] = event["selected_score"]
-        before = set(decision["remaining_rows"])
-        after = (set(decisions[step_index + 1]["remaining_rows"])
-                 if step_index + 1 < len(decisions) else set())
-        for row in before - after:
-            exit_steps[row] = step_index
-            exit_reasons[row] = (event["target_status"]
-                                 if row == selected else "fault_sim_drop")
-    return {
-        "fault_ids": np.asarray(circuit.fault_ids),
-        "scores": scores.numpy(),
-        "ranks": ranks,
-        "permutation": order,
-        "selected_rows": np.asarray(
-            [decision["selected_row"] for decision in decisions], dtype=np.int64),
-        "selected_scores": selected_scores,
-        "selected_steps": selected_steps,
-        "exit_steps": exit_steps,
-        "exit_reasons": exit_reasons,
-        "patterns_before_stc": np.asarray(metrics["patterns_before_stc"], dtype=np.int64),
-        "patterns_after_stc": np.asarray(metrics["patterns_after_stc"], dtype=np.int64),
-        "primary_podem_calls": np.asarray(metrics["primary_podem_calls"], dtype=np.int64),
-        "dtc_secondary_calls": np.asarray(metrics["dtc_secondary_calls"], dtype=np.int64),
-        "primary_backtracks": np.asarray(metrics["primary_backtracks"], dtype=np.int64),
-        "dtc_backtracks": np.asarray(metrics["dtc_backtracks"], dtype=np.int64),
-        "total_backtracks": np.asarray(metrics["total_backtracks"], dtype=np.int64),
-        "_trajectory": trace,
-    }
-
-
-class Trainer:
-    def __init__(self, manifest, config, output, environment=None):
-        config.validate()
-        self.config = config
-        self.manifest = load_manifest(manifest)
-        self.environment = environment or PodemEnvironment(
-            self.manifest.module_dir, config.backtrack_limit, 14)
-        self.circuits = load_all_circuits(self.manifest, self.environment)
-        self.output = Path(output).resolve()
-        self.provenance = {c.name: c.artifact_digest for c in self.circuits}
-        module_path = getattr(getattr(self.environment, "module", None), "__file__", None)
-        self.solver_digest = _sha256(module_path) if module_path else None
-        torch.set_num_threads(config.threads)
-        torch.use_deterministic_algorithms(True)
-        self.model = FaultScorer()
-        self.optimizer = self._optimizer(self.model)
-        self.round = 0
-        self.states = {}
-        self.native_metrics = {}
-        self.best = None
-        self.run_id = uuid.uuid4().hex
-
-    def _optimizer(self, model):
-        return torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
-
-    @classmethod
-    def create(cls, manifest, config, output, environment=None):
-        output = Path(output).resolve()
-        if output.exists() and any(output.iterdir()):
-            raise ValueError("output directory is not empty; use --resume or a new directory")
-        random.seed(config.seed)
-        np.random.seed(config.seed)
-        torch.manual_seed(config.seed)
-        self = cls(manifest, config, output, environment)
-        # All embeddings have already passed validation before any ATPG run.
-        records = []
-        for circuit in self.circuits:
-            metrics, elapsed = self._run_native(circuit)
-            self.native_metrics[circuit.name] = metrics
-            self.states[circuit.name] = {
-                "native_pattern_count": metrics["pattern_count"],
-                "previous_pattern_count": metrics["pattern_count"],
-                "native_covered_equivalent_faults": metrics["covered_equivalent_faults"],
-                "reward_ema": 0.0,
-            }
-            records.append(self._record("baseline", circuit.name, 0, metrics, elapsed))
-        report, _ = self.evaluate_model(self.model, 0, self.states)
-        self.best = self._choose_best(None, self.model, report, self.states)
-        records.append({"kind": "evaluation", "report": report})
-        self._write_round(0, records, {})
-        save_checkpoint(self.output / "latest.pt", self._payload())
-        self._publish_best()
-        return self
-
-    @classmethod
-    def resume(cls, checkpoint, rounds=None, environment=None):
-        checkpoint = Path(checkpoint).resolve()
-        saved = load_checkpoint(checkpoint)
-        if saved.get("kind") != "latest":
-            raise ValueError("resume requires a latest training checkpoint")
-        config = TrainConfig(**saved["config"])
-        if rounds is not None:
-            if rounds < saved["round"]:
-                raise ValueError("--rounds is a total target, below the completed round")
-            config.rounds = rounds
-        self = cls(saved["manifest_path"], config, checkpoint.parent, environment)
-        self._check_compatibility(saved)
-        self.model.load_state_dict(saved["model"])
-        self.optimizer.load_state_dict(saved["optimizer"])
-        self.round = saved["round"]
-        self.states = saved["states"]
-        self.native_metrics = saved["native_metrics"]
-        self.best = saved["best"]
-        self.run_id = saved["run_id"]
-        restore_rng(saved["rng"])
-        self._publish_best()  # repair an interrupted derived-artifact write
-        return self
-
-    def _check_compatibility(self, saved):
-        if saved["manifest_digest"] != self.manifest.digest or saved["artifacts"] != self.provenance:
-            raise ValueError("checkpoint manifest or embedding artifacts changed")
-        if saved["solver_digest"] != self.solver_digest:
-            raise ValueError("checkpoint PODEM binary changed")
-        if saved["torch_version"] != str(torch.__version__):
-            raise ValueError("checkpoint PyTorch version changed; exact resume cannot be guaranteed")
-        if saved.get("policy") != POLICY_IDENTITY or saved.get("input_dimension") != 515:
-            raise ValueError("checkpoint dynamic policy identity changed")
-        if saved.get("solver_protocol") != SOLVER_PROTOCOL:
-            raise ValueError("checkpoint solver protocol changed")
-
-    def _check_result(self, circuit, result):
-        if result["uncollapsed_faults"] != int(circuit.eqv_fault_nums.sum()):
-            raise RuntimeError("PODEM fault total differs from validated embeddings")
-        if result.get("stc_coverage_preserved") is not True:
-            raise RuntimeError("PODEM STC coverage was not preserved")
-
-    def _run_native(self, circuit):
-        start = time.perf_counter()
-        session = self.environment.start_session(
-            circuit.spec.bench_path, circuit.spec.faultmap_path)
-        while session.remaining_fault_ids:
-            session.step(session.remaining_fault_ids[0])
-        result = session.finish()
-        self._check_result(circuit, result)
-        return result, time.perf_counter() - start
-
-    def _run_policy(self, circuit, model, temperature, stochastic):
-        start = time.perf_counter()
-        session = self.environment.start_session(
-            circuit.spec.bench_path, circuit.spec.faultmap_path)
-        row_by_id = {identifier: row for row, identifier in enumerate(circuit.fault_ids)}
-        decisions, trace = [], []
-        while session.remaining_fault_ids:
-            try:
-                rows = tuple(row_by_id[identifier]
-                             for identifier in session.remaining_fault_ids)
-            except KeyError as exc:
-                raise RuntimeError("PODEM remaining fault is absent from embeddings") from exc
-            features = build_dynamic_features(circuit.embeddings, rows)
-            scores = model(features)
-            selected_row = select_categorical_action(
-                scores, rows, temperature, stochastic)
-            selected_id = circuit.fault_ids[selected_row]
-            local = rows.index(selected_row)
-            step = session.step(selected_id)
-            decisions.append({"remaining_rows": rows, "selected_row": selected_row})
-            trace.append({
-                "selected_fault_id": selected_id,
-                "selected_row": selected_row,
-                "selected_score": float(scores[local].detach()),
-                "remaining_count": len(rows),
-                "remaining_ratio": len(rows) / circuit.fault_count,
-                "target_status": step["target_status"],
-                "generated_test_vector": step["generated_test_vector"],
-                "dtc_attempted_fault_ids": step["dtc_attempted_fault_ids"],
-                "dtc_embedded_fault_ids": step["dtc_embedded_fault_ids"],
-                "newly_detected_fault_ids": step["newly_detected_fault_ids"],
-                "primary_podem_calls": step["primary_podem_calls"],
-                "dtc_secondary_calls": step["dtc_secondary_calls"],
-                "primary_backtracks": step["primary_backtracks"],
-                "dtc_backtracks": step["dtc_backtracks"],
-                "total_backtracks": step["total_backtracks"],
-                "current_pattern_count": step["current_pattern_count"],
-            })
-        result = session.finish()
-        self._check_result(circuit, result)
-        return result, time.perf_counter() - start, decisions, trace
-
-    def _record(self, kind, name, round_number, metrics, elapsed):
-        return {"kind": kind, "circuit": name, "round": round_number,
-                "seed": 14, "training_seed": self.config.seed,
-                "checkpoint_identity": self.run_id + ":" + str(round_number),
-                "seconds": elapsed, **metrics}
-
-    def evaluate_model(self, model, round_number, states):
-        results, exports = {}, {}
-        model.eval()
-        with torch.no_grad():
-            for circuit in self.circuits:
-                metrics, elapsed, decisions, trace = self._run_policy(
-                    circuit, model, temperature=1.0, stochastic=False)
-                metrics = dict(metrics, seconds=elapsed)
-                results[circuit.name] = metrics
-                first_rows = tuple(range(circuit.fault_count))
-                scores = model(build_dynamic_features(circuit.embeddings, first_rows))
-                order = deterministic_permutation(scores).numpy()
-                exports[circuit.name] = _evaluation_export(
-                    circuit, scores, order, decisions, trace, metrics)
-        totals = {key: sum(result[key] for result in results.values()) for key in
-                  ("pattern_count", "detected_equivalent_faults", "detected_collapsed_faults",
-                   "redundant_equivalent_faults", "covered_equivalent_faults",
-                   "uncollapsed_faults", "podem_calls", "total_backtracks",
-                   "aborted_faults", "redundant_faults")}
-        totals["fault_coverage"] = (
-            totals["covered_equivalent_faults"] / totals["uncollapsed_faults"])
-        report = {"round": round_number, "circuits": results, "totals": totals}
-        report["eligible"] = eligible(report, states)
-        return report, exports
-
-    def _round_batches(self):
-        indices = list(range(len(self.circuits)))
-        if self.config.batch_size:
-            random.shuffle(indices)
-        size = self.config.batch_size or len(indices)
-        return [indices[start:start + size] for start in range(0, len(indices), size)]
-
-    @staticmethod
-    def _choose_best(best, model, report, states):
-        if best is not None and not eligible(best["report"], states):
-            best = None
-        if eligible(report, states) and (best is None or evaluation_key(report) < evaluation_key(best["report"])):
-            best = {"model": copy.deepcopy(model.state_dict()), "report": copy.deepcopy(report)}
-        return best
-
-    def step(self):
-        if self.round >= self.config.rounds:
-            raise ValueError("training already reached the configured round target")
-        rng_before = capture_rng()
-        try:
-            number = self.round + 1
-            temperature = self.config.temperature(number)
-            states = copy.deepcopy(self.states)
-            records, trajectories = [], {}
-            candidate = copy.deepcopy(self.model)
-            optimizer = self._optimizer(candidate)
-            optimizer.load_state_dict(copy.deepcopy(self.optimizer.state_dict()))
-            candidate.train()
-            for batch_index, circuit_indices in enumerate(self._round_batches()):
-                batch = [self.circuits[index] for index in circuit_indices]
-                batch_records = []
-                # Every episode in this batch sees the same parameter snapshot.
-                with torch.no_grad():
-                    for circuit in batch:
-                        metrics, elapsed, decisions, trace = self._run_policy(
-                            circuit, candidate, temperature, stochastic=True)
-                        trajectories[circuit.name] = decisions
-                        states[circuit.name], reward = reward_transition(
-                            states[circuit.name], metrics, self.config.ema_decay)
-                        batch_records.append(dict(
-                            self._record("episode", circuit.name, number, metrics, elapsed),
-                            temperature=temperature, batch_index=batch_index,
-                            trace=trace, **reward))
-                optimizer.zero_grad()
-                for circuit, record in zip(batch, batch_records):
-                    log_prob = trajectory_log_prob(
-                        candidate, circuit.embeddings,
-                        trajectories[circuit.name], temperature)
-                    loss = _normalized_policy_loss(
-                        record["advantage"], log_prob,
-                        circuit.fault_count, len(batch))
-                    if not torch.isfinite(loss):
-                        raise RuntimeError("non-finite policy loss")
-                    record["loss_contribution"] = float(loss.detach())
-                    record["log_probability"] = float(log_prob.detach())
-                    loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    candidate.parameters(), self.config.gradient_clip)
-                if not torch.isfinite(grad_norm):
-                    raise RuntimeError("non-finite policy gradient")
-                optimizer.step()
-                if not all(torch.isfinite(p).all() for p in candidate.parameters()):
-                    raise RuntimeError("non-finite model after optimizer update")
-                records.extend(batch_records)
-                records.append({
-                    "kind": "update",
-                    "round": number,
-                    "batch_index": batch_index,
-                    "gradient_norm": float(grad_norm),
-                    "circuits": len(batch),
-                    "circuit_names": [circuit.name for circuit in batch],
-                })
-            best = self.best
-            if best is not None and not eligible(best["report"], states):
-                best = None
-            if number % self.config.evaluate_every == 0 or number == self.config.rounds:
-                report, _ = self.evaluate_model(candidate, number, states)
-                best = self._choose_best(best, candidate, report, states)
-                records.append({"kind": "evaluation", "report": report})
-            payload = self._payload(model=candidate, optimizer=optimizer, round_number=number,
-                                    states=states, best=best)
-            self._write_round(number, records, trajectories)
-            # This atomic replacement is the commit point. Failed collection,
-            # evaluation or optimizer steps cannot alter latest or live state.
-            save_checkpoint(self.output / "latest.pt", payload)
-        except BaseException:
-            restore_rng(rng_before)
-            raise
-        self.model, self.optimizer, self.states, self.best, self.round = candidate, optimizer, states, best, number
-        self._publish_best()
-        return records
-
-    def _payload(self, model=None, optimizer=None, round_number=None, states=None, **overrides):
-        return {"version": 3, "kind": "latest", "run_id": self.run_id,
-                "policy": POLICY_IDENTITY, "input_dimension": 515,
-                "solver_protocol": copy.deepcopy(SOLVER_PROTOCOL),
-                "manifest_path": str(self.manifest.path), "manifest_digest": self.manifest.digest,
-                "artifacts": self.provenance, "solver_digest": self.solver_digest,
-                "torch_version": str(torch.__version__), "config": asdict(self.config),
-                "round": self.round if round_number is None else round_number,
-                "model": (self.model if model is None else model).state_dict(),
-                "optimizer": (self.optimizer if optimizer is None else optimizer).state_dict(),
-                "states": self.states if states is None else states,
-                "native_metrics": self.native_metrics, "rng": capture_rng(),
-                "best": overrides.get("best", self.best)}
-
-    def _write_round(self, number, records, trajectories):
-        # One immutable JSONL file per committed round. Files beyond latest's
-        # round are incomplete attempts and may be replaced when resuming.
-        prefix = self.output / "rounds" / ("round-{:06d}".format(number))
-        if trajectories:
-            arrays = {}
-            for name, decisions in trajectories.items():
-                selected = np.asarray(
-                    [decision["selected_row"] for decision in decisions],
-                    dtype=np.int64)
-                offsets = [0]
-                remaining = []
-                for decision in decisions:
-                    remaining.extend(decision["remaining_rows"])
-                    offsets.append(len(remaining))
-                arrays[name + "__selected_rows"] = selected
-                arrays[name + "__remaining_offsets"] = np.asarray(offsets, dtype=np.int64)
-                arrays[name + "__remaining_rows"] = np.asarray(remaining, dtype=np.int64)
-            write_npz(prefix.with_suffix(".npz"), **arrays)
-        encoded = "".join(json.dumps(r, allow_nan=False) + "\n" for r in records).encode("utf-8")
-        atomic_write(prefix.with_suffix(".jsonl"), lambda stream: stream.write(encoded))
-
-    def _publish_best(self):
-        payload = self._payload()
-        payload.pop("optimizer")
-        payload.pop("rng")
-        payload.pop("best")
-        payload["kind"] = "best"
-        payload["available"] = self.best is not None
-        if self.best is not None:
-            payload["model"] = self.best["model"]
-            payload["round"] = self.best["report"]["round"]
-            payload["evaluation"] = self.best["report"]
-        else:
-            payload.pop("model")
-        save_checkpoint(self.output / "best.pt", payload)
-
-    def train(self):
-        while self.round < self.config.rounds:
-            records = self.step()
-            episodes = [r for r in records if r["kind"] == "episode"]
-            print("round {}/{}: patterns={}, reward={}".format(
-                self.round, self.config.rounds, sum(r["pattern_count"] for r in episodes),
-                sum(r["raw_reward"] for r in episodes)), flush=True)
-        if self.best is not None:
-            return evaluate_checkpoint(self.output / "best.pt", self.output / "evaluation",
-                                       environment=self.environment)
-        report, exports = self.evaluate_model(self.model, self.round, self.states)
-        report = _complete_report(report, self.output / "latest.pt", self.native_metrics,
-                                  self.states, "latest")
-        _write_evaluation(self.output / "evaluation", report, exports)
-        return report
-
-
-def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind):
-    report["checkpoint"] = str(checkpoint)
-    report["checkpoint_sha256"] = _sha256(checkpoint)
-    report["checkpoint_kind"] = checkpoint_kind
-    report["native_metrics"] = native_metrics
-    report["native_pattern_total"] = sum(m["pattern_count"] for m in native_metrics.values())
-    report["pattern_reduction"] = report["native_pattern_total"] - report["totals"]["pattern_count"]
-    comparisons = {}
-    for name, metrics in report["circuits"].items():
-        native = native_metrics[name]
-        reduction = native["pattern_count"] - metrics["pattern_count"]
-        if native["pattern_count"]:
-            reduction_percent = 100.0 * reduction / native["pattern_count"]
-        elif metrics["pattern_count"] == 0:
-            reduction_percent = 0.0
-        else:
-            reduction_percent = None
-        native_coverage = native["fault_coverage"]
-        model_coverage = metrics["fault_coverage"]
-        coverage_increase = model_coverage - native_coverage
-        comparisons[name] = {
-            "circuit": name,
-            "checkpoint_kind": checkpoint_kind,
-            "round": report["round"],
-            "native_fault_coverage": native_coverage,
-            "model_fault_coverage": model_coverage,
-            "fault_coverage_increase": coverage_increase,
-            "fault_coverage_increase_percentage_points": 100.0 * coverage_increase,
-            "native_covered_equivalent_faults": native["covered_equivalent_faults"],
-            "model_covered_equivalent_faults": metrics["covered_equivalent_faults"],
-            "covered_fault_increase": (
-                metrics["covered_equivalent_faults"]
-                - native["covered_equivalent_faults"]
-            ),
-            "native_pattern_count": native["pattern_count"],
-            "model_pattern_count": metrics["pattern_count"],
-            "pattern_reduction": reduction,
-            "pattern_reduction_percent": reduction_percent,
-            "coverage_eligible": (
-                metrics["covered_equivalent_faults"]
-                >= native["covered_equivalent_faults"]
-            ),
-        }
-    report["comparison_by_circuit"] = comparisons
-    shortfalls = {
-        name: max(0, state["native_covered_equivalent_faults"]
-                  - report["circuits"][name]["covered_equivalent_faults"])
-        for name, state in states.items()
-    }
-    report["coverage_eligible"] = report["eligible"]
-    report["coverage_shortfall"] = sum(shortfalls.values())
-    report["coverage_shortfall_by_circuit"] = shortfalls
-    return report
-
-
-def _write_evaluation(output, report, exports, include_aggregate=True):
-    output = Path(output)
-    for name, arrays in exports.items():
-        arrays = dict(arrays)
-        trajectory = arrays.pop("_trajectory", [])
-        write_npz(output / (name + ".ranking.npz"), **arrays)
-        metrics = report["circuits"][name]
-        events = [dict(event, kind="decision") for event in trajectory]
-        events.append({
-            "kind": "stc_summary",
-            "patterns_before_stc": metrics["patterns_before_stc"],
-            "patterns_after_stc": metrics["patterns_after_stc"],
-            "stc_removed_patterns": metrics["stc_removed_patterns"],
-            "stc_shuffle_attempts": metrics["stc_shuffle_attempts"],
-            "stc_coverage_preserved": metrics["stc_coverage_preserved"],
-        })
-        encoded_trace = "".join(
-            json.dumps(event, allow_nan=False) + "\n" for event in events
-        ).encode("utf-8")
-        atomic_write(output / (name + ".trajectory.jsonl"),
-                     lambda stream, data=encoded_trace: stream.write(data))
-    rows = list(report["comparison_by_circuit"].values())
-    stream = io.StringIO(newline="")
-    writer = csv.DictWriter(stream, fieldnames=list(rows[0]) if rows else ["circuit"],
-                            lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(rows)
-    encoded = stream.getvalue().encode("utf-8")
-    atomic_write(output / "comparison_by_circuit.csv",
-                 lambda destination: destination.write(encoded))
-    summary = copy.deepcopy(report)
-    if not include_aggregate:
-        for key in ("totals", "native_pattern_total", "pattern_reduction",
-                    "coverage_shortfall"):
-            summary.pop(key, None)
-    write_json(output / "summary.json", summary)
 
 
 def _evaluation_totals(results):
@@ -600,161 +107,809 @@ def _evaluation_totals(results):
     return totals
 
 
-def _evaluate_external_manifest(saved, checkpoint, output, manifest, environment):
-    trainer = Trainer(manifest, TrainConfig(**saved["config"]), output, environment)
-    if saved["solver_digest"] != trainer.solver_digest:
-        raise ValueError("checkpoint PODEM binary changed")
-    if saved["torch_version"] != str(torch.__version__):
-        raise ValueError("checkpoint PyTorch version changed; evaluation is not reproducible")
-    if saved.get("policy") != POLICY_IDENTITY or saved.get("input_dimension") != 515:
-        raise ValueError("checkpoint dynamic policy identity changed")
-    if saved.get("solver_protocol") != SOLVER_PROTOCOL:
-        raise ValueError("checkpoint solver protocol changed")
-    trainer.model.load_state_dict(saved["model"])
-    output = Path(output).resolve()
-    checkpoint_digest = _sha256(checkpoint)
-    identity = {
-        "checkpoint_sha256": checkpoint_digest,
-        "evaluation_manifest_digest": trainer.manifest.digest,
-        "artifacts": trainer.provenance,
-        "solver_digest": trainer.solver_digest,
-        "policy": POLICY_IDENTITY,
-        "input_dimension": 515,
-        "solver_protocol": SOLVER_PROTOCOL,
+def _coverage_summary(report, states):
+    shortfalls = {
+        name: max(0, state["native_covered_equivalent_faults"]
+                  - report["circuits"][name]["covered_equivalent_faults"])
+        for name, state in states.items()
     }
-    status_path = output / "status.json"
-    completed = []
-    if status_path.is_file():
-        status = json.loads(status_path.read_text(encoding="utf-8"))
-        if status.get("identity") != identity:
-            raise ValueError("evaluation output belongs to a different checkpoint or manifest")
-        completed = list(status.get("completed", []))
-    elif output.exists() and any(output.iterdir()):
-        raise ValueError("evaluation output is non-empty and has no resumable status")
+    report["coverage_shortfall_by_circuit"] = shortfalls
+    report["coverage_shortfall"] = sum(shortfalls.values())
+    report["eligible"] = report["coverage_shortfall"] == 0
+    return report
 
-    results, native_metrics = {}, {}
-    circuit_names = [circuit.name for circuit in trainer.circuits]
-    completed_set = set(completed)
-    unknown = completed_set - set(circuit_names)
-    if unknown:
-        raise ValueError("evaluation status contains unknown circuits")
-    for circuit in trainer.circuits:
-        metrics_path = output / "circuits" / (circuit.name + ".metrics.json")
-        ranking_path = output / (circuit.name + ".ranking.npz")
-        trajectory_path = output / (circuit.name + ".trajectory.jsonl")
-        if circuit.name in completed_set:
-            if (not metrics_path.is_file() or not ranking_path.is_file()
-                    or not trajectory_path.is_file()):
-                raise ValueError("completed evaluation artifact is missing: " + circuit.name)
-            saved_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-            if saved_metrics.get("identity") != identity:
-                raise ValueError("circuit metrics identity changed: " + circuit.name)
-            native_metrics[circuit.name] = saved_metrics["native"]
-            results[circuit.name] = saved_metrics["model"]
-            continue
 
-        native, native_elapsed = trainer._run_native(circuit)
-        native = dict(native, seconds=native_elapsed)
-        trainer.model.eval()
+def _evaluation_export(circuit, scores, order, decisions, trace, metrics):
+    count = circuit.fault_count
+    ranks = np.empty(count, dtype=np.int64)
+    ranks[order] = np.arange(1, count + 1)
+    selected_steps = np.full(count, -1, dtype=np.int64)
+    selected_scores = np.full(count, np.nan, dtype=np.float32)
+    exit_steps = np.full(count, -1, dtype=np.int64)
+    exit_reasons = np.full(count, "", dtype="<U32")
+    for step_index, (decision, event) in enumerate(zip(decisions, trace)):
+        selected = decision["requested_rows"][0]
+        selected_steps[selected] = step_index
+        selected_scores[selected] = event["selected_score"]
+        before = set(decision["remaining_rows"])
+        after = (set(decisions[step_index + 1]["remaining_rows"])
+                 if step_index + 1 < len(decisions) else set())
+        for row in before - after:
+            exit_steps[row] = step_index
+            exit_reasons[row] = (event["target_status"]
+                                 if row == selected else "fault_sim_drop")
+    return {
+        "fault_ids": np.asarray(circuit.fault_ids),
+        "scores": scores.detach().cpu().numpy(),
+        "ranks": ranks,
+        "permutation": order,
+        "selected_rows": np.asarray(
+            [decision["requested_rows"][0] for decision in decisions],
+            dtype=np.int64),
+        "selected_scores": selected_scores,
+        "selected_steps": selected_steps,
+        "exit_steps": exit_steps,
+        "exit_reasons": exit_reasons,
+        "patterns_before_stc": np.asarray(metrics["patterns_before_stc"], dtype=np.int64),
+        "patterns_after_stc": np.asarray(metrics["patterns_after_stc"], dtype=np.int64),
+        "primary_podem_calls": np.asarray(metrics["primary_podem_calls"], dtype=np.int64),
+        "dtc_secondary_calls": np.asarray(metrics["dtc_secondary_calls"], dtype=np.int64),
+        "primary_backtracks": np.asarray(metrics["primary_backtracks"], dtype=np.int64),
+        "dtc_backtracks": np.asarray(metrics["dtc_backtracks"], dtype=np.int64),
+        "total_backtracks": np.asarray(metrics["total_backtracks"], dtype=np.int64),
+        "_trajectory": trace,
+    }
+
+
+class Trainer:
+    def __init__(self, manifest, config, output, environment=None,
+                 validation_manifest=None, validation_environment=None):
+        config.validate()
+        self.config = config
+        self.manifest = load_manifest(manifest)
+        self.environment = environment or PodemEnvironment(
+            self.manifest.module_dir, config.backtrack_limit, 14)
+        self.circuits = load_all_circuits(self.manifest, self.environment)
+        self.output = Path(output).resolve()
+        self.provenance = {c.name: c.artifact_digest for c in self.circuits}
+
+        self.validation_manifest = None
+        self.validation_environment = None
+        self.validation_circuits = []
+        self.validation_provenance = {}
+        if validation_manifest is not None:
+            self.validation_manifest = load_manifest(validation_manifest)
+            if self.validation_manifest.path == self.manifest.path:
+                raise ValueError("training and validation manifests must be different")
+            self.validation_environment = validation_environment or environment or PodemEnvironment(
+                self.validation_manifest.module_dir, config.backtrack_limit, 14)
+            self.validation_circuits = load_all_circuits(
+                self.validation_manifest, self.validation_environment)
+            self.validation_provenance = {
+                c.name: c.artifact_digest for c in self.validation_circuits
+            }
+            overlap = set(self.provenance.values()) & set(
+                self.validation_provenance.values())
+            training_paths = {
+                path.resolve()
+                for circuit in self.circuits
+                for path in (
+                    circuit.spec.bench_path, circuit.spec.faultmap_path,
+                    circuit.spec.embeddings_path, circuit.spec.metadata_path,
+                    circuit.spec.aig_bench_path, circuit.spec.aigmap_path)
+                if path is not None
+            }
+            validation_paths = {
+                path.resolve()
+                for circuit in self.validation_circuits
+                for path in (
+                    circuit.spec.bench_path, circuit.spec.faultmap_path,
+                    circuit.spec.embeddings_path, circuit.spec.metadata_path,
+                    circuit.spec.aig_bench_path, circuit.spec.aigmap_path)
+                if path is not None
+            }
+            if overlap or training_paths & validation_paths:
+                raise ValueError("training and validation artifacts must be independent")
+
+        module_path = getattr(getattr(self.environment, "module", None), "__file__", None)
+        self.solver_digest = _sha256(module_path) if module_path else None
+        validation_module_path = getattr(
+            getattr(self.validation_environment, "module", None), "__file__", None)
+        self.validation_solver_digest = (
+            _sha256(validation_module_path) if validation_module_path else None)
+        torch.set_num_threads(config.threads)
+        torch.use_deterministic_algorithms(True)
+        self.model = FaultActorCritic()
+        self.optimizer = self._optimizer(self.model)
+        self.round = 0
+        self.next_circuit_index = 0
+        self.states = {}
+        self.validation_states = {}
+        self.native_metrics = {}
+        self.validation_native_metrics = {}
+        self.best = None
+        self.run_id = uuid.uuid4().hex
+
+    def _optimizer(self, model):
+        return torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
+
+    @classmethod
+    def create(cls, manifest, config, output, environment=None,
+               validation_manifest=None, validation_environment=None):
+        output = Path(output).resolve()
+        if output.exists() and any(output.iterdir()):
+            raise ValueError("output directory is not empty; use --resume or a new directory")
+        random.seed(config.seed)
+        np.random.seed(config.seed)
+        torch.manual_seed(config.seed)
+        validation_manifest = (
+            DEFAULT_VALIDATION_MANIFEST if validation_manifest is None
+            else validation_manifest)
+        self = cls(manifest, config, output, environment, validation_manifest,
+                   validation_environment)
+        for circuit in self.circuits:
+            metrics, _ = self._run_native(circuit, self.environment)
+            self.native_metrics[circuit.name] = metrics
+            self.states[circuit.name] = {
+                "native_covered_equivalent_faults": metrics[
+                    "covered_equivalent_faults"]
+            }
+        for circuit in self.validation_circuits:
+            metrics, _ = self._run_native(circuit, self.validation_environment)
+            self.validation_native_metrics[circuit.name] = metrics
+            self.validation_states[circuit.name] = {
+                "native_covered_equivalent_faults": metrics[
+                    "covered_equivalent_faults"]
+            }
+        save_checkpoint(self.output / "latest.pt", self._payload())
+        return self
+
+    @classmethod
+    def resume(cls, checkpoint, rounds=None, environment=None,
+               validation_environment=None):
+        checkpoint = Path(checkpoint).resolve()
+        saved = load_checkpoint(checkpoint)
+        if saved.get("kind") != "latest":
+            raise ValueError("resume requires a latest training checkpoint")
+        config = TrainConfig(**saved["config"])
+        if rounds is not None:
+            if rounds != config.rounds:
+                raise ValueError("resume cannot change the fixed five-round target")
+        self = cls(
+            saved["manifest_path"], config, checkpoint.parent, environment,
+            saved["validation_manifest_path"], validation_environment)
+        self._check_compatibility(saved)
+        self.model.load_state_dict(saved["model"])
+        self.optimizer.load_state_dict(saved["optimizer"])
+        self.round = saved["round"]
+        self.next_circuit_index = saved["next_circuit_index"]
+        self.states = saved["states"]
+        self.validation_states = saved["validation_states"]
+        self.native_metrics = saved["native_metrics"]
+        self.validation_native_metrics = saved["validation_native_metrics"]
+        self.best = saved["best"]
+        self.run_id = saved["run_id"]
+        restore_rng(saved["rng"])
+        if self.best is not None:
+            self._publish_best()
+        if self.round == self.config.rounds and self.next_circuit_index == 0:
+            self._publish_final()
+        return self
+
+    def _check_compatibility(self, saved):
+        checks = (
+            (saved["manifest_digest"], self.manifest.digest,
+             "checkpoint training manifest changed"),
+            (saved["artifacts"], self.provenance,
+             "checkpoint training artifacts changed"),
+            (saved["training_circuit_order"],
+             [circuit.name for circuit in self.circuits],
+             "checkpoint training circuit order changed"),
+            (saved["validation_manifest_digest"], self.validation_manifest.digest,
+             "checkpoint validation manifest changed"),
+            (saved["validation_artifacts"], self.validation_provenance,
+             "checkpoint validation artifacts changed"),
+            (saved["solver_digest"], self.solver_digest,
+             "checkpoint PODEM binary changed"),
+            (saved["validation_solver_digest"], self.validation_solver_digest,
+             "checkpoint validation PODEM binary changed"),
+            (saved["torch_version"], str(torch.__version__),
+             "checkpoint PyTorch version changed"),
+            (saved.get("policy"), POLICY_IDENTITY,
+             "checkpoint policy identity changed"),
+            (saved.get("solver_protocol"), SOLVER_PROTOCOL,
+             "checkpoint solver protocol changed"),
+        )
+        for actual, expected, message in checks:
+            if actual != expected:
+                raise ValueError(message)
+
+    def _check_result(self, circuit, result):
+        if result["uncollapsed_faults"] != int(circuit.eqv_fault_nums.sum()):
+            raise RuntimeError("PODEM fault total differs from validated embeddings")
+        if result.get("stc_coverage_preserved") is not True:
+            raise RuntimeError("PODEM STC coverage was not preserved")
+        if result["patterns_after_stc"] > result["uncollapsed_faults"]:
+            raise RuntimeError("PODEM pattern count exceeds initial equivalent faults")
+
+    def _run_native(self, circuit, environment):
+        start = time.perf_counter()
+        session = environment.start_session(
+            circuit.spec.bench_path, circuit.spec.faultmap_path)
+        while session.remaining_fault_ids:
+            ranking = tuple(session.remaining_fault_ids)
+            session.step(ranking[0], ranking[1:])
+        result = session.finish()
+        self._check_result(circuit, result)
+        return result, time.perf_counter() - start
+
+    def _run_policy(self, circuit, model, temperature, stochastic,
+                    environment=None):
+        environment = environment or self.environment
+        start = time.perf_counter()
+        session = environment.start_session(
+            circuit.spec.bench_path, circuit.spec.faultmap_path)
+        row_by_id = {
+            identifier: row for row, identifier in enumerate(circuit.fault_ids)}
+        eqv_by_id = {
+            identifier: int(circuit.eqv_fault_nums[row])
+            for row, identifier in enumerate(circuit.fault_ids)}
+        initial_eqv = int(circuit.eqv_fault_nums.sum())
+        previous_patterns = 0
+        decisions, trace = [], []
+        while session.remaining_fault_ids:
+            try:
+                rows = tuple(row_by_id[identifier]
+                             for identifier in session.remaining_fault_ids)
+            except KeyError as exc:
+                raise RuntimeError(
+                    "PODEM remaining fault is absent from embeddings") from exc
+            features = build_dynamic_features(circuit.embeddings, rows)
+            scores, value = model(features)
+            ranking_tensor = sample_ranking(
+                scores, rows, temperature, stochastic)
+            requested_rows = tuple(int(row) for row in ranking_tensor.tolist())
+            requested_ids = tuple(circuit.fault_ids[row] for row in requested_rows)
+            step = session.step(requested_ids[0], requested_ids[1:])
+            executed_ids = (requested_ids[0],) + tuple(
+                step["dtc_attempted_fault_ids"])
+            executed_rows = tuple(row_by_id[identifier]
+                                  for identifier in executed_ids)
+            with torch.no_grad():
+                old_log_prob, entropy, replayed_value = executed_prefix_stats(
+                    model, circuit.embeddings, rows, executed_rows, temperature)
+            if not torch.allclose(value.detach(), replayed_value.detach()):
+                raise RuntimeError("actor-critic value changed within one decision")
+            pattern_increment = step["current_pattern_count"] - previous_patterns
+            newly_detected_eqv = sum(
+                eqv_by_id[identifier]
+                for identifier in step["newly_detected_fault_ids"])
+            reward = step_reward(
+                pattern_increment, newly_detected_eqv, initial_eqv,
+                self.config.alpha)
+            selected_local = rows.index(requested_rows[0])
+            decisions.append({
+                "remaining_rows": rows,
+                "requested_rows": requested_rows,
+                "executed_rows": executed_rows,
+                "old_log_prob": float(old_log_prob),
+                "old_value": float(replayed_value),
+                "entropy": float(entropy),
+                "reward": reward,
+                "pattern_increment": pattern_increment,
+                "newly_detected_eqv": newly_detected_eqv,
+            })
+            trace.append({
+                "selected_fault_id": requested_ids[0],
+                "selected_row": requested_rows[0],
+                "selected_score": float(scores[selected_local].detach()),
+                "requested_fault_ids": requested_ids,
+                "executed_fault_ids": executed_ids,
+                "remaining_count": len(rows),
+                "remaining_ratio": len(rows) / circuit.fault_count,
+                "target_status": step["target_status"],
+                "generated_test_vector": step["generated_test_vector"],
+                "dtc_attempted_fault_ids": step["dtc_attempted_fault_ids"],
+                "dtc_embedded_fault_ids": step["dtc_embedded_fault_ids"],
+                "newly_detected_fault_ids": step["newly_detected_fault_ids"],
+                "pattern_increment": pattern_increment,
+                "newly_detected_eqv": newly_detected_eqv,
+                "step_reward": reward,
+                "primary_podem_calls": step["primary_podem_calls"],
+                "dtc_secondary_calls": step["dtc_secondary_calls"],
+                "primary_backtracks": step["primary_backtracks"],
+                "dtc_backtracks": step["dtc_backtracks"],
+                "total_backtracks": step["total_backtracks"],
+                "current_pattern_count": step["current_pattern_count"],
+            })
+            previous_patterns = step["current_pattern_count"]
+        result = session.finish()
+        self._check_result(circuit, result)
+        return result, time.perf_counter() - start, decisions, trace
+
+    def _finish_trajectory(self, circuit, metrics, decisions, baseline):
+        shortfall = max(
+            0, baseline["native_covered_equivalent_faults"]
+            - metrics["covered_equivalent_faults"])
+        target = target_return(
+            metrics["patterns_after_stc"], int(circuit.eqv_fault_nums.sum()),
+            shortfall, self.config.beta)
+        correction = terminal_correction(
+            [decision["reward"] for decision in decisions], target)
+        decisions[-1]["reward"] += correction
+        values = [decision["old_value"] for decision in decisions]
+        returns, advantages = compute_gae(
+            [decision["reward"] for decision in decisions], values,
+            self.config.gamma, self.config.gae_lambda)
+        for decision, return_value, advantage in zip(
+                decisions, returns.tolist(), advantages.tolist()):
+            decision["return"] = return_value
+            decision["advantage"] = advantage
+        return {
+            "coverage_shortfall": shortfall,
+            "target_return": target,
+            "terminal_correction": correction,
+            "reward_sum": sum(decision["reward"] for decision in decisions),
+        }
+
+    def _ppo_update(self, model, optimizer, circuit, decisions):
+        old_log_probs = torch.tensor(
+            [decision["old_log_prob"] for decision in decisions],
+            dtype=torch.float32)
+        returns = torch.tensor(
+            [decision["return"] for decision in decisions], dtype=torch.float32)
+        advantages = normalize_advantages(torch.tensor(
+            [decision["advantage"] for decision in decisions],
+            dtype=torch.float32))
+        epochs = []
+        model.train()
+        for epoch in range(self.config.ppo_epochs):
+            new_log_probs, entropies, values = [], [], []
+            for decision in decisions:
+                log_prob, entropy, value = executed_prefix_stats(
+                    model, circuit.embeddings, decision["remaining_rows"],
+                    decision["executed_rows"], self.config.temperature)
+                new_log_probs.append(log_prob)
+                entropies.append(entropy)
+                values.append(value)
+            loss, details = ppo_objective(
+                torch.stack(new_log_probs), old_log_probs, advantages,
+                torch.stack(values), returns, torch.stack(entropies),
+                self.config.ppo_clip, self.config.value_coef,
+                self.config.entropy_coef)
+            if not torch.isfinite(loss):
+                raise RuntimeError("non-finite PPO loss")
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), self.config.gradient_clip)
+            if not torch.isfinite(grad_norm):
+                raise RuntimeError("non-finite PPO gradient")
+            optimizer.step()
+            if not all(torch.isfinite(parameter).all()
+                       for parameter in model.parameters()):
+                raise RuntimeError("non-finite model after PPO update")
+            epochs.append({
+                "epoch": epoch + 1,
+                "loss": float(loss.detach()),
+                "gradient_norm": float(grad_norm),
+                **{key: float(value.detach())
+                   for key, value in details.items()},
+            })
+        return epochs
+
+    def evaluate_model(self, model, round_number, circuits=None,
+                       environment=None, states=None):
+        circuits = self.validation_circuits if circuits is None else circuits
+        environment = self.validation_environment if environment is None else environment
+        states = self.validation_states if states is None else states
+        results, exports = {}, {}
+        model.eval()
         with torch.no_grad():
-            first_rows = tuple(range(circuit.fault_count))
-            scores = trainer.model(build_dynamic_features(
-                circuit.embeddings, first_rows))
-            order = deterministic_permutation(scores).numpy()
-            model_metrics, model_elapsed, decisions, trace = trainer._run_policy(
-                circuit, trainer.model, temperature=1.0, stochastic=False)
-        model_metrics = dict(model_metrics, seconds=model_elapsed)
-        arrays = _evaluation_export(
-            circuit, scores, order, decisions, trace, model_metrics)
-        trajectory = arrays.pop("_trajectory")
-        write_npz(ranking_path, **arrays)
+            for circuit in circuits:
+                metrics, elapsed, decisions, trace = self._run_policy(
+                    circuit, model, self.config.temperature, False, environment)
+                metrics = dict(metrics, seconds=elapsed)
+                results[circuit.name] = metrics
+                first_rows = tuple(range(circuit.fault_count))
+                scores, _ = model(build_dynamic_features(
+                    circuit.embeddings, first_rows))
+                order = sample_ranking(
+                    scores, first_rows, self.config.temperature,
+                    False).detach().cpu().numpy()
+                exports[circuit.name] = _evaluation_export(
+                    circuit, scores, order, decisions, trace, metrics)
+        report = {
+            "round": round_number,
+            "circuits": results,
+            "totals": _evaluation_totals(results),
+        }
+        return _coverage_summary(report, states), exports
+
+    @staticmethod
+    def _choose_best(best, model, report):
+        if best is None or evaluation_key(report) < evaluation_key(best["report"]):
+            return {
+                "model": copy.deepcopy(model.state_dict()),
+                "report": copy.deepcopy(report),
+                "key": evaluation_key(report),
+            }
+        return best
+
+    def _record(self, circuit, circuit_index, round_number, metrics, elapsed,
+                trajectory, decisions, reward_summary, ppo_epochs):
+        advantages = np.asarray(
+            [decision["advantage"] for decision in decisions],
+            dtype=np.float64)
+        return {
+            "kind": "episode",
+            "circuit": circuit.name,
+            "circuit_index": circuit_index,
+            "round": round_number,
+            "episode_steps": len(decisions),
+            "initial_equivalent_faults": int(circuit.eqv_fault_nums.sum()),
+            "seed": 14,
+            "training_seed": self.config.seed,
+            "checkpoint_identity": self.run_id + ":" + str(round_number),
+            "seconds": elapsed,
+            "trajectory": trajectory,
+            "ppo_epochs": ppo_epochs,
+            "coverage_valid": reward_summary["coverage_shortfall"] == 0,
+            "episode_return": reward_summary["target_return"],
+            "advantage_mean": float(advantages.mean()),
+            "advantage_std": float(advantages.std()),
+            **reward_summary,
+            **metrics,
+        }
+
+    def step(self):
+        if self.round >= self.config.rounds:
+            raise ValueError("training already reached the configured round target")
+        number = self.round + 1
+        records = []
+        for index in range(self.next_circuit_index, len(self.circuits)):
+            rng_before = capture_rng()
+            circuit = self.circuits[index]
+            try:
+                candidate = copy.deepcopy(self.model)
+                optimizer = self._optimizer(candidate)
+                optimizer.load_state_dict(copy.deepcopy(
+                    self.optimizer.state_dict()))
+                candidate.eval()
+                with torch.no_grad():
+                    metrics, elapsed, decisions, trace = self._run_policy(
+                        circuit, candidate, self.config.temperature, True,
+                        self.environment)
+                reward_summary = self._finish_trajectory(
+                    circuit, metrics, decisions, self.states[circuit.name])
+                ppo_epochs = self._ppo_update(
+                    candidate, optimizer, circuit, decisions)
+                record = self._record(
+                    circuit, index, number, metrics, elapsed, trace,
+                    decisions, reward_summary, ppo_epochs)
+                self._write_circuit(number, index, record, decisions)
+                payload = self._payload(
+                    model=candidate, optimizer=optimizer,
+                    next_circuit_index=index + 1)
+                save_checkpoint(self.output / "latest.pt", payload)
+            except BaseException:
+                restore_rng(rng_before)
+                raise
+            self.model = candidate
+            self.optimizer = optimizer
+            self.next_circuit_index = index + 1
+            records.append(record)
+
+        report, exports = self.evaluate_model(self.model, number)
+        best = self._choose_best(self.best, self.model, report)
+        payload = self._payload(
+            round_number=number, next_circuit_index=0, best=best)
+        self._write_validation(number, report, exports)
+        save_checkpoint(self.output / "latest.pt", payload)
+        self.round = number
+        self.next_circuit_index = 0
+        self.best = best
+        self._publish_best()
+        return records + [{"kind": "validation", "report": report}]
+
+    def _payload(self, model=None, optimizer=None, round_number=None,
+                 next_circuit_index=None, best=None):
+        model = self.model if model is None else model
+        optimizer = self.optimizer if optimizer is None else optimizer
+        return {
+            "version": 4,
+            "kind": "latest",
+            "run_id": self.run_id,
+            "policy": POLICY_IDENTITY,
+            "input_dimension": 515,
+            "solver_protocol": copy.deepcopy(SOLVER_PROTOCOL),
+            "manifest_path": str(self.manifest.path),
+            "manifest_digest": self.manifest.digest,
+            "artifacts": self.provenance,
+            "validation_manifest_path": str(self.validation_manifest.path),
+            "validation_manifest_digest": self.validation_manifest.digest,
+            "validation_artifacts": self.validation_provenance,
+            "solver_digest": self.solver_digest,
+            "validation_solver_digest": self.validation_solver_digest,
+            "torch_version": str(torch.__version__),
+            "config": asdict(self.config),
+            "round": self.round if round_number is None else round_number,
+            "active_round": (
+                (self.round if round_number is None else round_number) + 1
+                if (self.round if round_number is None else round_number)
+                < self.config.rounds else None),
+            "next_circuit_index": (
+                self.next_circuit_index if next_circuit_index is None
+                else next_circuit_index),
+            "training_circuit_order": [
+                circuit.name for circuit in self.circuits],
+            "validation_circuit_order": [
+                circuit.name for circuit in self.validation_circuits],
+            "model": copy.deepcopy(model.state_dict()),
+            "optimizer": copy.deepcopy(optimizer.state_dict()),
+            "states": copy.deepcopy(self.states),
+            "validation_states": copy.deepcopy(self.validation_states),
+            "native_metrics": copy.deepcopy(self.native_metrics),
+            "validation_native_metrics": copy.deepcopy(
+                self.validation_native_metrics),
+            "rng": capture_rng(),
+            "best": copy.deepcopy(self.best if best is None else best),
+        }
+
+    def _write_circuit(self, number, index, record, decisions):
+        directory = self.output / "rounds" / "round-{:06d}".format(number)
+        stem = directory / "circuit-{:06d}".format(index)
+        arrays = {}
+        for key in ("remaining_rows", "requested_rows", "executed_rows"):
+            values, offsets = [], [0]
+            for decision in decisions:
+                values.extend(decision[key])
+                offsets.append(len(values))
+            arrays[key] = np.asarray(values, dtype=np.int64)
+            arrays[key + "_offsets"] = np.asarray(offsets, dtype=np.int64)
+        arrays["old_log_probs"] = np.asarray(
+            [decision["old_log_prob"] for decision in decisions], dtype=np.float32)
+        arrays["old_values"] = np.asarray(
+            [decision["old_value"] for decision in decisions], dtype=np.float32)
+        arrays["rewards"] = np.asarray(
+            [decision["reward"] for decision in decisions], dtype=np.float32)
+        arrays["returns"] = np.asarray(
+            [decision["return"] for decision in decisions], dtype=np.float32)
+        arrays["advantages"] = np.asarray(
+            [decision["advantage"] for decision in decisions], dtype=np.float32)
+        write_npz(stem.with_suffix(".npz"), **arrays)
+        write_json(stem.with_suffix(".json"), record)
+
+    def _write_validation(self, number, report, exports):
+        output = self.output / "validation" / "round-{:06d}".format(number)
+        validation_report = _add_native_comparison(
+            report, self.validation_native_metrics,
+            self.validation_states, "validation")
+        validation_report["validation_manifest"] = str(
+            self.validation_manifest.path)
+        validation_report["validation_manifest_digest"] = (
+            self.validation_manifest.digest)
+        _write_evaluation(output, validation_report, exports)
+
+    def _derived_payload(self, kind, model_state, round_number, evaluation):
+        payload = self._payload()
+        payload.pop("optimizer")
+        payload.pop("rng")
+        payload.pop("best")
+        payload["kind"] = kind
+        payload["model"] = copy.deepcopy(model_state)
+        payload["round"] = round_number
+        payload["next_circuit_index"] = 0
+        payload["evaluation"] = copy.deepcopy(evaluation)
+        payload["validation_key"] = evaluation_key(evaluation)
+        return payload
+
+    def _publish_best(self):
+        if self.best is None:
+            return
+        payload = self._derived_payload(
+            "best", self.best["model"], self.best["report"]["round"],
+            self.best["report"])
+        save_checkpoint(self.output / "best.pt", payload)
+
+    def _publish_final(self, report=None):
+        if report is None:
+            report, _ = self.evaluate_model(self.model, self.round)
+        payload = self._derived_payload(
+            "final", self.model.state_dict(), self.round, report)
+        save_checkpoint(self.output / "final.pt", payload)
+
+    def train(self):
+        while self.round < self.config.rounds:
+            records = self.step()
+            episodes = [record for record in records
+                        if record["kind"] == "episode"]
+            validation = records[-1]["report"]
+            print(
+                "round {}/{}: train_patterns={}, validation_shortfall={}, "
+                "validation_patterns={}".format(
+                    self.round, self.config.rounds,
+                    sum(record["pattern_count"] for record in episodes),
+                    validation["coverage_shortfall"],
+                    validation["totals"]["pattern_count"]),
+                flush=True)
+        final_report, _ = self.evaluate_model(self.model, self.round)
+        self._publish_final(final_report)
+        best_report = copy.deepcopy(self.best["report"])
+        return _complete_report(
+            best_report, self.output / "best.pt",
+            self.validation_native_metrics, self.validation_states, "best")
+
+
+def _add_native_comparison(report, native_metrics, states, checkpoint_kind):
+    report = copy.deepcopy(report)
+    report["checkpoint_kind"] = checkpoint_kind
+    report["native_metrics"] = native_metrics
+    report["native_pattern_total"] = sum(
+        metrics["pattern_count"] for metrics in native_metrics.values())
+    report["pattern_reduction"] = (
+        report["native_pattern_total"] - report["totals"]["pattern_count"])
+    comparisons = {}
+    for name, metrics in report["circuits"].items():
+        native = native_metrics[name]
+        reduction = native["pattern_count"] - metrics["pattern_count"]
+        reduction_percent = (
+            100.0 * reduction / native["pattern_count"]
+            if native["pattern_count"] else 0.0)
+        coverage_increase = metrics["fault_coverage"] - native["fault_coverage"]
+        comparisons[name] = {
+            "circuit": name,
+            "checkpoint_kind": checkpoint_kind,
+            "round": report["round"],
+            "native_fault_coverage": native["fault_coverage"],
+            "model_fault_coverage": metrics["fault_coverage"],
+            "fault_coverage_increase": coverage_increase,
+            "fault_coverage_increase_percentage_points": 100.0 * coverage_increase,
+            "native_covered_equivalent_faults": native[
+                "covered_equivalent_faults"],
+            "model_covered_equivalent_faults": metrics[
+                "covered_equivalent_faults"],
+            "covered_fault_increase": (
+                metrics["covered_equivalent_faults"]
+                - native["covered_equivalent_faults"]),
+            "native_pattern_count": native["pattern_count"],
+            "model_pattern_count": metrics["pattern_count"],
+            "pattern_reduction": reduction,
+            "pattern_reduction_percent": reduction_percent,
+            "coverage_eligible": (
+                metrics["covered_equivalent_faults"]
+                >= native["covered_equivalent_faults"]),
+        }
+    report["comparison_by_circuit"] = comparisons
+    _coverage_summary(report, states)
+    report["coverage_eligible"] = report["eligible"]
+    return report
+
+
+def _complete_report(report, checkpoint, native_metrics, states, checkpoint_kind):
+    report = _add_native_comparison(
+        report, native_metrics, states, checkpoint_kind)
+    report["checkpoint"] = str(checkpoint)
+    report["checkpoint_sha256"] = _sha256(checkpoint)
+    return report
+
+
+def _write_evaluation(output, report, exports):
+    output = Path(output)
+    for name, arrays in exports.items():
+        arrays = dict(arrays)
+        trajectory = arrays.pop("_trajectory", [])
+        write_npz(output / (name + ".ranking.npz"), **arrays)
+        metrics = report["circuits"][name]
         events = [dict(event, kind="decision") for event in trajectory]
         events.append({
             "kind": "stc_summary",
-            "patterns_before_stc": model_metrics["patterns_before_stc"],
-            "patterns_after_stc": model_metrics["patterns_after_stc"],
-            "stc_removed_patterns": model_metrics["stc_removed_patterns"],
-            "stc_shuffle_attempts": model_metrics["stc_shuffle_attempts"],
-            "stc_coverage_preserved": model_metrics["stc_coverage_preserved"],
+            "patterns_before_stc": metrics["patterns_before_stc"],
+            "patterns_after_stc": metrics["patterns_after_stc"],
+            "stc_removed_patterns": metrics["stc_removed_patterns"],
+            "stc_shuffle_attempts": metrics["stc_shuffle_attempts"],
+            "stc_coverage_preserved": metrics["stc_coverage_preserved"],
         })
-        encoded_trace = "".join(
+        encoded = "".join(
             json.dumps(event, allow_nan=False) + "\n" for event in events
         ).encode("utf-8")
-        atomic_write(trajectory_path,
-                     lambda stream, data=encoded_trace: stream.write(data))
-        write_json(metrics_path, {"identity": identity, "native": native,
-                                  "model": model_metrics})
-        native_metrics[circuit.name] = native
-        results[circuit.name] = model_metrics
-        completed.append(circuit.name)
-        completed_set.add(circuit.name)
-        write_json(status_path, {
-            "identity": identity,
-            "complete": False,
-            "completed": completed,
-            "pending": [name for name in circuit_names if name not in completed_set],
-        })
+        atomic_write(output / (name + ".trajectory.jsonl"),
+                     lambda stream, data=encoded: stream.write(data))
+    rows = list(report.get("comparison_by_circuit", {}).values())
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        stream, fieldnames=list(rows[0]) if rows else ["circuit"],
+        lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    encoded = stream.getvalue().encode("utf-8")
+    atomic_write(output / "comparison_by_circuit.csv",
+                 lambda destination: destination.write(encoded))
+    write_json(output / "summary.json", report)
 
-    states = {
-        name: {"native_covered_equivalent_faults": metrics["covered_equivalent_faults"]}
-        for name, metrics in native_metrics.items()
-    }
-    report = {"round": saved["round"], "circuits": results,
-              "totals": _evaluation_totals(results)}
-    report["eligible"] = eligible(report, states)
-    report["training_manifest"] = saved["manifest_path"]
-    report["training_manifest_digest"] = saved["manifest_digest"]
-    report["evaluation_manifest"] = str(trainer.manifest.path)
-    report["evaluation_manifest_digest"] = trainer.manifest.digest
-    report = _complete_report(report, checkpoint, native_metrics, states, saved["kind"])
-    _write_evaluation(output, report, {}, include_aggregate=False)
-    write_json(status_path, {"identity": identity, "complete": True,
-                             "completed": circuit_names, "pending": []})
-    return report
+
+def _standalone_evaluator(saved, output, manifest, environment):
+    trainer = Trainer(
+        manifest, TrainConfig(**saved["config"]), output, environment,
+        validation_manifest=None)
+    if saved["solver_digest"] != trainer.solver_digest:
+        raise ValueError("checkpoint PODEM binary changed")
+    if saved["torch_version"] != str(torch.__version__):
+        raise ValueError("checkpoint PyTorch version changed")
+    if saved.get("policy") != POLICY_IDENTITY:
+        raise ValueError("checkpoint policy identity changed")
+    if saved.get("solver_protocol") != SOLVER_PROTOCOL:
+        raise ValueError("checkpoint solver protocol changed")
+    trainer.model.load_state_dict(saved["model"])
+    return trainer
 
 
 def evaluate_checkpoint(checkpoint, output, environment=None, manifest=None):
     checkpoint = Path(checkpoint).resolve()
     saved = load_checkpoint(checkpoint)
     checkpoint_kind = saved.get("kind")
-    if checkpoint_kind not in ("best", "latest"):
-        raise ValueError("evaluation requires a best.pt or latest.pt checkpoint")
-    if checkpoint_kind == "best" and not saved.get("available"):
-        raise ValueError("no coverage-eligible best checkpoint; continue training from latest.pt")
-    # latest.pt is the commit point. A crash between committing latest and
-    # publishing its derived best file must never permit a stale standalone
-    # evaluation with obsolete coverage requirements.
+    if checkpoint_kind not in ("best", "latest", "final"):
+        raise ValueError("evaluation requires best.pt, latest.pt, or final.pt")
     latest_path = checkpoint.parent / "latest.pt"
     if checkpoint_kind == "best" and latest_path.is_file():
         latest = load_checkpoint(latest_path)
         if latest.get("run_id") == saved.get("run_id"):
             expected = latest.get("best")
-            current = (expected is not None
-                       and saved.get("round") == expected["report"]["round"]
-                       and saved.get("evaluation") == expected["report"]
-                       and saved.get("states") == latest.get("states")
-                       and state_dict_equal(saved["model"], expected["model"]))
+            current = (
+                expected is not None
+                and saved.get("round") == expected["report"]["round"]
+                and saved.get("evaluation") == expected["report"]
+                and saved.get("validation_key") == expected["key"]
+                and state_dict_equal(saved["model"], expected["model"])
+            )
             if not current:
-                raise ValueError("best.pt is stale relative to latest.pt; resume latest.pt once to repair it")
+                raise ValueError(
+                    "best.pt is stale relative to latest.pt; resume latest.pt to repair it")
+    saved_validation = manifest is None
+    evaluation_manifest = (
+        Path(manifest).resolve() if manifest is not None
+        else Path(saved["validation_manifest_path"]).resolve())
     rng = capture_rng()
     try:
-        if manifest is not None:
-            return _evaluate_external_manifest(
-                saved, checkpoint, output, manifest, environment)
-        trainer = Trainer(saved["manifest_path"], TrainConfig(**saved["config"]), output, environment)
-        trainer._check_compatibility(saved)
-        trainer.model.load_state_dict(saved["model"])
-        report, exports = trainer.evaluate_model(trainer.model, saved["round"], saved["states"])
-        if checkpoint_kind == "best" and not report["eligible"]:
-            raise RuntimeError("fresh best evaluation failed coverage requirements")
-        if checkpoint_kind == "best":
+        trainer = _standalone_evaluator(
+            saved, output, evaluation_manifest, environment)
+        if saved_validation and (
+                trainer.manifest.digest != saved["validation_manifest_digest"]
+                or trainer.provenance != saved["validation_artifacts"]
+                or trainer.solver_digest != saved["validation_solver_digest"]):
+            raise ValueError(
+                "checkpoint validation manifest, artifacts, or solver changed")
+        native_metrics = {}
+        states = {}
+        for circuit in trainer.circuits:
+            metrics, _ = trainer._run_native(circuit, trainer.environment)
+            native_metrics[circuit.name] = metrics
+            states[circuit.name] = {
+                "native_covered_equivalent_faults": metrics[
+                    "covered_equivalent_faults"]
+            }
+        report, exports = trainer.evaluate_model(
+            trainer.model, saved["round"], trainer.circuits,
+            trainer.environment, states)
+        expected_report = saved.get("evaluation")
+        if saved_validation and checkpoint_kind in ("best", "final"):
+            if expected_report is None:
+                raise ValueError("checkpoint is missing its validation report")
             for name, metrics in report["circuits"].items():
-                expected = saved["evaluation"]["circuits"][name]
-                if any(metrics[key] != expected[key] for key in expected if key != "seconds"):
-                    raise RuntimeError("fresh best evaluation differs from saved deterministic metrics")
+                expected_metrics = expected_report["circuits"].get(name)
+                if expected_metrics is None or any(
+                        metrics[key] != value
+                        for key, value in expected_metrics.items()
+                        if key != "seconds"):
+                    raise RuntimeError(
+                        "fresh validation differs from the saved checkpoint report")
+        report["training_manifest"] = saved["manifest_path"]
+        report["training_manifest_digest"] = saved["manifest_digest"]
+        report["evaluation_manifest"] = str(trainer.manifest.path)
+        report["evaluation_manifest_digest"] = trainer.manifest.digest
         report = _complete_report(
-            report, checkpoint, saved["native_metrics"], saved["states"], checkpoint_kind)
-        _write_evaluation(output, report, exports)
+            report, checkpoint, native_metrics, states, checkpoint_kind)
+        _write_evaluation(Path(output).resolve(), report, exports)
         return report
     finally:
         restore_rng(rng)

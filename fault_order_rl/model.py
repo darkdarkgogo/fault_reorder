@@ -1,4 +1,4 @@
-"""Dynamic fault features and shared neural scorer."""
+"""Dynamic fault features and the shared actor-critic network."""
 
 import torch
 from torch import nn
@@ -25,17 +25,22 @@ def build_dynamic_features(embeddings, remaining_rows):
     return torch.cat((candidates, context, ratio), dim=1)
 
 
-class FaultScorer(nn.Module):
+class FaultActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
         self.input_dimension = 515
-        self.network = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.LayerNorm(self.input_dimension),
             nn.Linear(self.input_dimension, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),
+        )
+        self.actor_head = nn.Linear(128, 1)
+        self.critic_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
         )
 
     def forward(self, features):
@@ -47,7 +52,13 @@ class FaultScorer(nn.Module):
             )
         if not torch.isfinite(features).all():
             raise ValueError("fault features contain non-finite values")
-        scores = self.network(features).squeeze(-1)
-        if not torch.isfinite(scores).all():
-            raise ValueError("fault scorer produced non-finite scores")
-        return scores
+        encoded = self.encoder(features)
+        scores = self.actor_head(encoded).squeeze(-1)
+        value = self.critic_head(encoded.mean(dim=0)).squeeze(-1)
+        if not torch.isfinite(scores).all() or not torch.isfinite(value):
+            raise ValueError("fault actor-critic produced non-finite outputs")
+        return scores, value
+
+
+# Source compatibility for callers which import the historical class name.
+FaultScorer = FaultActorCritic

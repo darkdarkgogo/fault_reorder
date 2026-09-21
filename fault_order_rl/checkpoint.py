@@ -50,13 +50,17 @@ def load_checkpoint(path):
     state = torch.load(str(path), **options)
     if isinstance(state, dict) and state.get("version") == 1:
         raise ValueError(
-            "checkpoint schema 1 uses detected-only coverage; restart training"
+            "checkpoint schema 1 uses detected-only coverage; retraining is required"
         )
     if isinstance(state, dict) and state.get("version") == 2:
         raise ValueError(
             "checkpoint schema 2 uses a static permutation policy; retraining is required"
         )
-    if not isinstance(state, dict) or state.get("version") != 3:
+    if isinstance(state, dict) and state.get("version") == 3:
+        raise ValueError(
+            "checkpoint schema 3 uses REINFORCE and catalog-ordered DTC; retraining is required"
+        )
+    if not isinstance(state, dict) or state.get("version") != 4:
         raise ValueError("unsupported fault-order checkpoint")
     return state
 

@@ -7,7 +7,8 @@ import sys
 
 from .data import load_all_circuits, load_manifest
 from .environment import PodemEnvironment
-from .trainer import TrainConfig, Trainer, evaluate_checkpoint
+from .trainer import (DEFAULT_VALIDATION_MANIFEST, TrainConfig, Trainer,
+                      evaluate_checkpoint)
 
 
 def _print_evaluation_by_circuit(report):
@@ -41,7 +42,11 @@ def _print_evaluation_by_circuit(report):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Shared fault ordering with listwise REINFORCE")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Dynamic full-ranking actor-critic PPO: fixed 5 rounds, "
+            "Primary backtrack=100, DTC secondary backtrack=50, schema=4"
+        ))
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate", help="Validate all artifacts without ATPG episodes")
     validate.add_argument("--manifest", type=Path, required=True)
@@ -50,11 +55,10 @@ def main(argv=None):
     source.add_argument("--manifest", type=Path)
     source.add_argument("--resume", type=Path)
     train.add_argument("--output", type=Path)
-    defaults = TrainConfig()
-    for name, value in vars(defaults).items():
-        if name == "backtrack_limit":
-            continue
-        train.add_argument("--" + name.replace("_", "-"), type=type(value), default=None)
+    train.add_argument(
+        "--validation-manifest", type=Path,
+        default=DEFAULT_VALIDATION_MANIFEST,
+        help="Independent validation split used only for best selection")
     evaluate = commands.add_parser(
         "evaluate", help="Fresh deterministic best/latest evaluation and rank export")
     evaluate.add_argument("--checkpoint", type=Path, required=True)
@@ -68,20 +72,16 @@ def main(argv=None):
             circuits = load_all_circuits(manifest, PodemEnvironment(manifest.module_dir))
             print(json.dumps({"validated": len(circuits), "faults": {c.name: c.fault_count for c in circuits}}, indent=2))
         elif args.command == "train":
-            argument_values = vars(args)
-            supplied = {
-                name: argument_values[name]
-                for name in vars(defaults)
-                if name in argument_values and argument_values[name] is not None
-            }
             if args.resume:
-                if args.output is not None or set(supplied) - {"rounds"}:
-                    raise ValueError("resume preserves saved configuration/output; only --rounds may extend the target")
-                trainer = Trainer.resume(args.resume, args.rounds)
+                if args.output is not None:
+                    raise ValueError("resume preserves the saved output and fixed configuration")
+                trainer = Trainer.resume(args.resume)
             else:
                 if args.output is None:
                     raise ValueError("new training requires --output")
-                trainer = Trainer.create(args.manifest, TrainConfig(**supplied), args.output)
+                trainer = Trainer.create(
+                    args.manifest, TrainConfig(), args.output,
+                    validation_manifest=args.validation_manifest)
             report = trainer.train()
             print(json.dumps({"checkpoint_kind": report.get("checkpoint_kind", "best"),
                               "round": report["round"],

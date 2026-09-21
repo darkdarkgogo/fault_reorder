@@ -61,7 +61,7 @@ using namespace std;
 
 struct StuckAtProtocolConfig
 {
-	int primary_backtrack_limit{200};
+	int primary_backtrack_limit{100};
 	int primary_seed{14};
 	int attempts_per_primary_fault{1};
 	bool dtc_enabled{true};
@@ -191,6 +191,9 @@ public:
 		return stuck_at_protocol_config;
 	}
 	vector<string> get_selectable_fault_ids() const;
+	AtpgStepResult step_stuck_at(
+		const string &fault_id,
+		const vector<string> &ranked_secondary_fault_ids);
 	AtpgStepResult step_stuck_at(const string &fault_id);
 	AtpgRunResult get_stuck_at_result() const;
 	AtpgRunResult finalize_stuck_at_session();
@@ -357,7 +360,9 @@ private:
 	int backward_imply(wptr, const int &);
 
 	/* declared in saf_compaction.cpp; these never update fault status */
-	DtcResult run_stuck_at_dtc(fptr primary);
+	DtcResult run_stuck_at_dtc(
+		fptr primary,
+		const vector<string> &ranked_secondary_fault_ids);
 	int stuck_at_podemx_secondary(fptr fault, int &backtracks);
 	bool stuck_at_cube_detects(fptr fault);
 

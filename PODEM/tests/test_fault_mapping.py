@@ -78,6 +78,22 @@ class FaultMappingTests(unittest.TestCase):
         self.keep_dtc_faults(fault_map, ids)
         return binary, fault_map
 
+    def test_ranked_dtc_follows_supplied_secondary_prefix(self):
+        binary, fault_map = self.make_dtc_fixture()
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        self.assertEqual(session.config()["primary_backtrack_limit"], 100)
+        remaining = session.remaining_fault_ids()
+        primary = "x:GO:sa0"
+        ranking = [identifier for identifier in reversed(remaining)
+                   if identifier != primary]
+        step = session.step(primary, ranking)
+        attempted = step["dtc_attempted_fault_ids"]
+        self.assertEqual(attempted, ranking[:len(attempted)])
+
+        invalid = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        with self.assertRaisesRegex(RuntimeError, "every non-primary"):
+            invalid.step(primary, ranking[:-1])
+
     def complete_stc_session(self, binary, fault_map, **options):
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map), **options)
         trace = []
