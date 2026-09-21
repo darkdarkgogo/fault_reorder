@@ -63,7 +63,7 @@ Validation manifest             = 默认 configs/anchor_validation_6.json
 现有 PODEM protocol 保持：
 
 ```text
-Primary backtrack limit         = 200
+Primary backtrack limit         = 100
 Primary seed                    = 14
 每个 primary fault 尝试次数       = 1
 Stuck-at DTC                    = enabled
