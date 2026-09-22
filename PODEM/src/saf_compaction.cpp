@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cstdio>
+#include <queue>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 int good_value(int value)
@@ -11,24 +13,41 @@ int good_value(int value)
 }
 }
 
-// Rebuild the fault-free implication before injecting each fault. In particular,
-// a D left on a PI by the preceding fault must not contaminate this evaluation.
-// This is scalar cube implication, not fault simulation: no fault is dropped.
-bool ATPG::stuck_at_cube_detects(fptr fault)
+void ATPG::restore_stuck_at_good_cube(const vector<int> &accepted_pi_cube)
 {
+	if (accepted_pi_cube.size() != cktin.size())
+		throw runtime_error("Accepted stuck-at PI cube has the wrong size");
 	for (wptr wire : sort_wlist)
 	{
 		wire->remove_changed();
 		wire->remove_scheduled();
-		if (wire->is_input())
-			wire->value = good_value(wire->value);
-		else
-		{
-			wire->value = U;
-			evaluate(wire->inode.front());
-			wire->remove_changed();
-		}
+		wire->remove_all_assigned();
+		wire->remove_all_assigned(true);
 	}
+	for (size_t index = 0; index < cktin.size(); ++index)
+	{
+		cktin[index]->value = good_value(accepted_pi_cube[index]);
+		cktin[index]->set_changed();
+	}
+	for (wptr wire : sort_wlist)
+		if (!wire->is_input())
+			wire->value = U;
+	sim();
+	for (wptr wire : sort_wlist)
+	{
+		wire->remove_changed();
+		wire->remove_scheduled();
+	}
+}
+
+// Rebuild the fault-free implication before injecting each fault. A D or
+// D-bar left by the preceding injection must never contaminate this check.
+bool ATPG::stuck_at_cube_detects(fptr fault)
+{
+	vector<int> cube;
+	for (wptr wire : cktin)
+		cube.push_back(good_value(wire->value));
+	restore_stuck_at_good_cube(cube);
 	if (wptr injected = fault_evaluate(fault))
 		forward_imply(injected);
 	return check_test();
@@ -93,125 +112,176 @@ int ATPG::stuck_at_podemx_secondary(fptr fault, int &backtracks)
 		++backtracks;
 	}
 	unmark_propagate_tree(fault->node);
+	for (const Decision &decision : decisions)
+		decision.wire->remove_all_assigned();
 	for (wptr wire : cktin)
 		wire->value = good_value(wire->value);
 	return status;
 }
 
-ATPG::DtcResult ATPG::run_stuck_at_dtc(
-	fptr primary,
-	const vector<string> &ranked_secondary_fault_ids)
+bool ATPG::find_next_stuck_at_dtc_batch(DtcBatchState &batch)
 {
-	DtcResult result;
-	if (!dynamic_test_compression)
-		return result;
-
-	unordered_map<string, fptr> selectable_by_id;
-	for (fptr fault : flist_undetect)
-		if (fault != primary && !fault->test_tried && fault->detect != REDUNDANT)
-			selectable_by_id.emplace(fault_identifier(fault), fault);
-	vector<fptr> candidates;
-	for (const string &identifier : ranked_secondary_fault_ids)
+	if (stuck_at_step_phase != StuckAtStepPhase::awaiting_dtc_order)
+		throw runtime_error("Stuck-at DTC batch discovery requires an active step");
+	const int budget = static_cast<int>(cktin.size()) <=
+		stuck_at_protocol_config.dtc_bfs_small_input_threshold
+		? stuck_at_protocol_config.dtc_bfs_small_select_fault_try
+		: stuck_at_protocol_config.dtc_bfs_default_select_fault_try;
+	for (; stuck_at_next_po_index < cktout.size(); ++stuck_at_next_po_index)
 	{
-		auto found = selectable_by_id.find(identifier);
-		if (found == selectable_by_id.end())
-			throw runtime_error("Ranked DTC candidate is no longer selectable: " + identifier);
-		candidates.push_back(found->second);
-	}
-	if (candidates.size() != selectable_by_id.size())
-		throw runtime_error("Ranked DTC candidates do not cover the selectable secondaries");
-	using Clock = std::chrono::steady_clock;
-	const Clock::time_point dtc_started = Clock::now();
-	fprintf(
-		stderr,
-		"[ATPG][DTC] start primary=%s candidates=%zu backtrack_limit=%d\n",
-		fault_identifier(primary).c_str(), candidates.size(), podemx_backtrack_limit);
-	fflush(stderr);
-	vector<fptr> preserved{primary};
-	for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
-	{
-		fptr secondary = candidates[candidate_index];
-		const size_t candidate_number = candidate_index + 1;
-		const bool log_candidate = candidate_number <= 5 || candidate_number % 1000 == 0;
-		const Clock::time_point candidate_started = Clock::now();
-		if (log_candidate)
+		wptr unknown_po = cktout[stuck_at_next_po_index];
+		if (unknown_po->value != U)
+			continue;
+		queue<wptr> pending;
+		unordered_set<wptr> visited;
+		unordered_set<string> candidate_ids;
+		vector<fptr> candidates;
+		pending.push(unknown_po);
+		int visited_count = 0;
+		while (!pending.empty() && visited_count < budget)
 		{
-			fprintf(
-				stderr,
-				"[ATPG][DTC] candidate begin primary=%s candidate=%s index=%zu total=%zu\n",
-				fault_identifier(primary).c_str(), fault_identifier(secondary).c_str(),
-				candidate_number, candidates.size());
-			fflush(stderr);
+			wptr wire = pending.front();
+			pending.pop();
+			if (!visited.insert(wire).second || wire->value != U)
+				continue;
+			++visited_count;
+			for (fptr fault : wire->udflist)
+			{
+				const string identifier = fault_identifier(fault);
+				if (fault == stuck_at_active_primary || fault->test_tried ||
+					fault->detect == REDUNDANT ||
+					stuck_at_attempted_ids.find(identifier) != stuck_at_attempted_ids.end())
+					continue;
+				if (candidate_ids.insert(identifier).second)
+					candidates.push_back(fault);
+			}
+			if (!wire->inode.empty())
+				for (wptr input : wire->inode.front()->iwire)
+					if (input->value == U && visited.find(input) == visited.end())
+						pending.push(input);
 		}
-		struct Snapshot { int value; bool assigned; bool assigned_v2; bool changed; bool scheduled; };
-		vector<Snapshot> snapshot;
-		for (wptr wire : sort_wlist)
-			snapshot.push_back({wire->value, wire->is_all_assigned(),
-				wire->is_all_assigned(true), wire->is_changed(), wire->is_scheduled()});
-		result.attempted_fault_ids.push_back(fault_identifier(secondary));
-		++result.secondary_calls;
+		if (!candidates.empty())
+		{
+			batch.unknown_po = unknown_po;
+			batch.candidates = candidates;
+			batch.batch_index = stuck_at_active_batch_index++;
+			batch.select_fault_try = budget;
+			batch.visited_wire_count = visited_count;
+			return true;
+		}
+	}
+	return false;
+}
+
+ATPG::StuckAtPhaseResult ATPG::make_stuck_at_dtc_phase() const
+{
+	StuckAtPhaseResult result;
+	result.phase = "dtc";
+	result.selected_fault_id = stuck_at_active_step.selected_fault_id;
+	result.unknown_po_id = stuck_at_active_unknown_po == nullptr
+		? "" : stuck_at_active_unknown_po->name;
+	for (fptr candidate : stuck_at_active_candidates)
+		result.dtc_candidate_fault_ids.push_back(fault_identifier(candidate));
+	result.dtc_batch_index = stuck_at_active_batch_index - 1;
+	result.select_fault_try = stuck_at_active_select_fault_try;
+	result.visited_wire_count = stuck_at_active_visited_wire_count;
+	return result;
+}
+
+ATPG::StuckAtPhaseResult ATPG::rank_stuck_at_dtc_candidates(
+	const vector<string> &ranked_candidate_fault_ids)
+{
+	if (stuck_at_step_phase != StuckAtStepPhase::awaiting_dtc_order ||
+		stuck_at_active_unknown_po == nullptr)
+		throw runtime_error("No stuck-at DTC batch is awaiting a ranking");
+	unordered_map<string, fptr> expected;
+	for (fptr candidate : stuck_at_active_candidates)
+		expected.emplace(fault_identifier(candidate), candidate);
+	if (ranked_candidate_fault_ids.size() != expected.size())
+		throw runtime_error("Ranked DTC IDs must exactly cover the current BFS batch");
+	vector<fptr> ranked;
+	unordered_set<string> seen;
+	for (const string &identifier : ranked_candidate_fault_ids)
+	{
+		auto found = expected.find(identifier);
+		if (found == expected.end() || !seen.insert(identifier).second)
+			throw runtime_error("Ranked DTC IDs must be a permutation of the current BFS batch");
+		ranked.push_back(found->second);
+	}
+
+	using Clock = std::chrono::steady_clock;
+	const Clock::time_point batch_started = Clock::now();
+	const string primary_id = fault_identifier(stuck_at_active_primary);
+	fprintf(stderr,
+		"[ATPG][DTC] batch start primary=%s po=%s candidates=%zu budget=%d visited=%d\n",
+		primary_id.c_str(), stuck_at_active_unknown_po->name.c_str(), ranked.size(),
+		stuck_at_active_select_fault_try, stuck_at_active_visited_wire_count);
+	fflush(stderr);
+	const size_t attempted_before = stuck_at_active_step.dtc_attempted_fault_ids.size();
+	const size_t embedded_before = stuck_at_active_step.dtc_embedded_fault_ids.size();
+	for (fptr secondary : ranked)
+	{
+		const string identifier = fault_identifier(secondary);
+		if (!stuck_at_attempted_ids.insert(identifier).second)
+			throw runtime_error("A stuck-at DTC secondary was attempted more than once");
+		stuck_at_active_step.dtc_attempted_fault_ids.push_back(identifier);
+		++stuck_at_active_dtc_calls;
 		int backtracks = 0;
 		bool embedded = stuck_at_podemx_secondary(secondary, backtracks) == TRUE;
-		result.backtracks += backtracks;
+		stuck_at_active_dtc_backtracks += backtracks;
+		vector<int> proposed_cube;
+		for (wptr wire : cktin)
+			proposed_cube.push_back(good_value(wire->value));
 		if (embedded)
 		{
-			for (fptr fault : preserved)
-				if (!stuck_at_cube_detects(fault))
+			for (fptr preserved : stuck_at_preserved_faults)
+			{
+				restore_stuck_at_good_cube(proposed_cube);
+				if (!stuck_at_cube_detects(preserved))
 				{
 					embedded = false;
 					break;
 				}
+			}
 		}
 		if (embedded)
 		{
-			preserved.push_back(secondary);
-			result.embedded_fault_ids.push_back(fault_identifier(secondary));
-			for (wptr wire : cktin)
-				wire->value = good_value(wire->value);
+			stuck_at_accepted_pi_cube = proposed_cube;
+			stuck_at_preserved_faults.push_back(secondary);
+			stuck_at_active_step.dtc_embedded_fault_ids.push_back(identifier);
 		}
-		else
-		{
-			// Restore both the PI cube and all scalar implication/decision flags;
-			// neither failed nor limited secondary searches have lasting state.
-			for (size_t i = 0; i < sort_wlist.size(); ++i)
-			{
-				wptr wire = sort_wlist[i];
-				const Snapshot &saved = snapshot[i];
-				wire->value = saved.value;
-				wire->remove_all_assigned();
-				wire->remove_all_assigned(true);
-				wire->remove_changed();
-				wire->remove_scheduled();
-				if (saved.assigned) wire->set_all_assigned();
-				if (saved.assigned_v2) wire->set_all_assigned(true);
-				if (saved.changed) wire->set_changed();
-				if (saved.scheduled) wire->set_scheduled();
-			}
-		}
-		if (log_candidate)
-		{
-			fprintf(
-				stderr,
-				"[ATPG][DTC] candidate done primary=%s candidate=%s index=%zu total=%zu embedded=%s backtracks=%d elapsed_s=%.3f\n",
-				fault_identifier(primary).c_str(), fault_identifier(secondary).c_str(),
-				candidate_number, candidates.size(), embedded ? "true" : "false",
-				backtracks,
-				std::chrono::duration<double>(Clock::now() - candidate_started).count());
-			fflush(stderr);
-		}
+		restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);
+		if (stuck_at_active_unknown_po->value != U)
+			break;
 	}
-	fprintf(
-		stderr,
-		"[ATPG][DTC] done primary=%s attempted=%d embedded=%zu backtracks=%d elapsed_s=%.3f\n",
-		fault_identifier(primary).c_str(), result.secondary_calls,
-		result.embedded_fault_ids.size(), result.backtracks,
-		std::chrono::duration<double>(Clock::now() - dtc_started).count());
+	fprintf(stderr,
+		"[ATPG][DTC] batch done primary=%s po=%s attempted=%zu embedded=%zu elapsed_s=%.3f\n",
+		primary_id.c_str(), stuck_at_active_unknown_po->name.c_str(),
+		stuck_at_active_step.dtc_attempted_fault_ids.size() - attempted_before,
+		stuck_at_active_step.dtc_embedded_fault_ids.size() - embedded_before,
+		std::chrono::duration<double>(Clock::now() - batch_started).count());
 	fflush(stderr);
+
+	++stuck_at_next_po_index;
+	DtcBatchState next;
+	if (find_next_stuck_at_dtc_batch(next))
+	{
+		stuck_at_active_unknown_po = next.unknown_po;
+		stuck_at_active_candidates = next.candidates;
+		stuck_at_active_select_fault_try = next.select_fault_try;
+		stuck_at_active_visited_wire_count = next.visited_wire_count;
+		return make_stuck_at_dtc_phase();
+	}
+	StuckAtPhaseResult result;
+	result.phase = "complete";
+	result.step_result = complete_stuck_at_step();
 	return result;
 }
 
 ATPG::AtpgRunResult ATPG::finalize_stuck_at_session()
 {
+	if (stuck_at_step_phase != StuckAtStepPhase::idle)
+		throw runtime_error("Cannot finalize while a stuck-at DTC batch is awaiting a ranking");
 	if (stuck_at_final_result.finalized || !get_selectable_fault_ids().empty())
 		return get_stuck_at_result();
 

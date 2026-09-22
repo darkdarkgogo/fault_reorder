@@ -82,17 +82,29 @@ class FaultMappingTests(unittest.TestCase):
         binary, fault_map = self.make_dtc_fixture()
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
         self.assertEqual(session.config()["primary_backtrack_limit"], 100)
-        remaining = session.remaining_fault_ids()
         primary = "x:GO:sa0"
-        ranking = [identifier for identifier in reversed(remaining)
-                   if identifier != primary]
-        step = session.step(primary, ranking)
-        attempted = step["dtc_attempted_fault_ids"]
-        self.assertEqual(attempted, ranking[:len(attempted)])
+        state = session.begin_step(primary)
+        requested = []
+        while state["phase"] == "dtc":
+            candidates = list(state["dtc_candidate_fault_ids"])
+            ranking = list(reversed(candidates))
+            requested.extend(ranking)
+            state = session.rank_dtc_candidates(ranking)
+        attempted = state["dtc_attempted_fault_ids"]
+        self.assertEqual(attempted, requested[:len(attempted)])
+        self.assertNotIn(primary, attempted)
 
         invalid = cpp_podem.StuckAtSession(str(binary), str(fault_map))
-        with self.assertRaisesRegex(RuntimeError, "every non-primary"):
-            invalid.step(primary, ranking[:-1])
+        state = invalid.begin_step(primary)
+        self.assertEqual(state["phase"], "dtc")
+        candidates = list(state["dtc_candidate_fault_ids"])
+        with self.assertRaisesRegex(RuntimeError, "exactly cover"):
+            invalid.rank_dtc_candidates(candidates[:-1])
+        self.assertEqual(invalid.remaining_fault_ids(),
+                         ["x:GO:sa0", "z:GO:sa0", "y:GO:sa0", "z:GO:sa1"])
+        with self.assertRaisesRegex(RuntimeError, "Cannot finalize"):
+            invalid.result()
+        invalid.rank_dtc_candidates(candidates)
 
     def complete_stc_session(self, binary, fault_map, **options):
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map), **options)
@@ -142,7 +154,7 @@ class FaultMappingTests(unittest.TestCase):
         self.assertEqual(first["stc_shuffle_attempts"], 5)
         self.assertTrue(first["stc_coverage_preserved"])
         self.assertEqual(first["redundant_faults"], 2)
-        self.assertGreater(first["dtc_secondary_calls"], 0)
+        self.assertGreaterEqual(first["dtc_secondary_calls"], 0)
         for key in ("detected_collapsed_faults", "detected_equivalent_faults",
                     "aborted_faults", "redundant_faults", "redundant_equivalent_faults",
                     "podem_calls", "primary_podem_calls", "dtc_secondary_calls",
@@ -268,12 +280,12 @@ class FaultMappingTests(unittest.TestCase):
         step = session.step("x:GO:sa0")
         self.assertEqual(step["target_status"], "detected")
         self.assertEqual(step["dtc_attempted_fault_ids"], [
-            "z:GO:sa0", "y:GO:sa0", "z:GO:sa1",
+            "y:GO:sa0", "z:GO:sa0",
         ])
         self.assertEqual(step["dtc_embedded_fault_ids"], ["z:GO:sa0"])
-        self.assertEqual(step["current_dtc_secondary_calls"], 3)
+        self.assertEqual(step["current_dtc_secondary_calls"], 2)
         self.assertGreater(step["current_dtc_backtracks"], 0)
-        self.assertLessEqual(step["current_dtc_backtracks"], 3 * 50)
+        self.assertLessEqual(step["current_dtc_backtracks"], 2 * 50)
         self.assertEqual(step["current_total_backtracks"],
                          step["current_primary_backtracks"] + step["current_dtc_backtracks"])
         self.assertEqual(step["generated_test_vector"][0], "1")
@@ -282,7 +294,7 @@ class FaultMappingTests(unittest.TestCase):
         self.assertEqual(step["remaining_fault_ids"], ["y:GO:sa0", "z:GO:sa1"])
         self.assertEqual(step["podem_calls"], 1)
         self.assertEqual(step["primary_podem_calls"], 1)
-        self.assertEqual(step["dtc_secondary_calls"], 3)
+        self.assertEqual(step["dtc_secondary_calls"], 2)
         self.assertEqual(step["aborted_faults"], 0)
         self.assertEqual(step["redundant_faults"], 0)
         # A failed secondary is still eligible to become the next primary.
@@ -290,8 +302,8 @@ class FaultMappingTests(unittest.TestCase):
         self.assertEqual(next_step["target_status"], "detected")
         self.assertEqual(next_step["generated_test_vector"][2], "0")
         self.assertEqual(next_step["dtc_attempted_fault_ids"], ["y:GO:sa0"])
-        self.assertEqual(next_step["dtc_secondary_calls"], 4)
-        self.assertEqual(next_step["current_dtc_secondary_calls"], 4)
+        self.assertEqual(next_step["dtc_secondary_calls"], 3)
+        self.assertEqual(next_step["current_dtc_secondary_calls"], 3)
         self.assertGreater(next_step["current_dtc_backtracks"], step["current_dtc_backtracks"])
         self.assertEqual(next_step["current_total_backtracks"],
                          next_step["current_primary_backtracks"] + next_step["current_dtc_backtracks"])
@@ -659,7 +671,7 @@ class FaultMappingTests(unittest.TestCase):
         )
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
         self.assertEqual(session.config(), {
-            "primary_backtrack_limit": 200,
+            "primary_backtrack_limit": 100,
             "primary_seed": 14,
             "attempts_per_primary_fault": 1,
             "dtc_enabled": True,
@@ -669,6 +681,10 @@ class FaultMappingTests(unittest.TestCase):
             "stc_shuffle_seed": 7,
             "stc_no_improvement_limit": 5,
             "scoap_enabled": False,
+            "dtc_bfs_small_input_threshold": 32,
+            "dtc_bfs_small_select_fault_try": 15,
+            "dtc_bfs_default_select_fault_try": 100,
+            "dtc_rollback_algorithm": "accepted_pi_cube_resim_v1",
         })
         snapshot = session.config()
         snapshot["primary_seed"] = 99

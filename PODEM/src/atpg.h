@@ -16,6 +16,7 @@
 #include <random>
 #include <iostream>
 #include <fstream>
+#include <unordered_set>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -71,6 +72,10 @@ struct StuckAtProtocolConfig
 	int stc_shuffle_seed{7};
 	int stc_no_improvement_limit{5};
 	bool scoap_enabled{false};
+	int dtc_bfs_small_input_threshold{32};
+	int dtc_bfs_small_select_fault_try{15};
+	int dtc_bfs_default_select_fault_try{100};
+	string dtc_rollback_algorithm{"accepted_pi_cube_resim_v1"};
 };
 
 /* this is an ATPG solver */
@@ -133,6 +138,17 @@ public:
 		vector<string> remaining_fault_ids;
 		AtpgRunResult cumulative_result;
 	};
+	struct StuckAtPhaseResult
+	{
+		string phase;
+		string selected_fault_id;
+		string unknown_po_id;
+		vector<string> dtc_candidate_fault_ids;
+		int dtc_batch_index{};
+		int select_fault_try{};
+		int visited_wire_count{};
+		AtpgStepResult step_result;
+	};
 
 	ATPG();
 
@@ -191,9 +207,9 @@ public:
 		return stuck_at_protocol_config;
 	}
 	vector<string> get_selectable_fault_ids() const;
-	AtpgStepResult step_stuck_at(
-		const string &fault_id,
-		const vector<string> &ranked_secondary_fault_ids);
+	StuckAtPhaseResult begin_stuck_at_step(const string &fault_id);
+	StuckAtPhaseResult rank_stuck_at_dtc_candidates(
+		const vector<string> &ranked_candidate_fault_ids);
 	AtpgStepResult step_stuck_at(const string &fault_id);
 	AtpgRunResult get_stuck_at_result() const;
 	AtpgRunResult finalize_stuck_at_session();
@@ -251,6 +267,8 @@ private:
 	mt19937 stc_shuffle_rng{7};
 	void prepare_stuck_at_session();
 	void fill_stuck_at_primary_cube();
+	AtpgStepResult complete_stuck_at_step();
+	void reset_stuck_at_active_step();
 
 	/* used in input.cpp to parse circuit*/
 	int debug;				 /* != 0 if debugging;  this is a switch of debug mode */
@@ -360,11 +378,37 @@ private:
 	int backward_imply(wptr, const int &);
 
 	/* declared in saf_compaction.cpp; these never update fault status */
-	DtcResult run_stuck_at_dtc(
-		fptr primary,
-		const vector<string> &ranked_secondary_fault_ids);
+	struct DtcBatchState
+	{
+		wptr unknown_po{};
+		vector<fptr> candidates;
+		int batch_index{};
+		int select_fault_try{};
+		int visited_wire_count{};
+	};
+	bool find_next_stuck_at_dtc_batch(DtcBatchState &batch);
+	void restore_stuck_at_good_cube(const vector<int> &accepted_pi_cube);
 	int stuck_at_podemx_secondary(fptr fault, int &backtracks);
 	bool stuck_at_cube_detects(fptr fault);
+	StuckAtPhaseResult make_stuck_at_dtc_phase() const;
+
+	enum class StuckAtStepPhase { idle, awaiting_dtc_order };
+	StuckAtStepPhase stuck_at_step_phase{StuckAtStepPhase::idle};
+	fptr stuck_at_active_primary{};
+	wptr stuck_at_active_unknown_po{};
+	vector<fptr> stuck_at_active_candidates;
+	vector<fptr> stuck_at_preserved_faults;
+	vector<int> stuck_at_accepted_pi_cube;
+	vector<string> stuck_at_step_before_ids;
+	unordered_set<string> stuck_at_attempted_ids;
+	AtpgStepResult stuck_at_active_step{};
+	int stuck_at_active_dtc_calls{};
+	int stuck_at_active_dtc_backtracks{};
+	int stuck_at_active_primary_backtracks{};
+	int stuck_at_active_batch_index{};
+	int stuck_at_active_select_fault_try{};
+	int stuck_at_active_visited_wire_count{};
+	size_t stuck_at_next_po_index{};
 
 	/* New flags */
 	bool dynamic_test_compression = false;

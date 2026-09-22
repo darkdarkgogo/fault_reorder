@@ -72,6 +72,50 @@ py::dict protocol_to_dict(const StuckAtProtocolConfig &config) {
   result["stc_shuffle_seed"] = config.stc_shuffle_seed;
   result["stc_no_improvement_limit"] = config.stc_no_improvement_limit;
   result["scoap_enabled"] = config.scoap_enabled;
+  result["dtc_bfs_small_input_threshold"] =
+      config.dtc_bfs_small_input_threshold;
+  result["dtc_bfs_small_select_fault_try"] =
+      config.dtc_bfs_small_select_fault_try;
+  result["dtc_bfs_default_select_fault_try"] =
+      config.dtc_bfs_default_select_fault_try;
+  result["dtc_rollback_algorithm"] = config.dtc_rollback_algorithm;
+  return result;
+}
+
+py::dict step_to_dict(const ATPG::AtpgStepResult &step) {
+  py::dict result = summary_to_dict(step.cumulative_result);
+  result["selected_fault_id"] = step.selected_fault_id;
+  result["target_status"] = step.target_status;
+  result["generated_pattern"] = step.generated_pattern;
+  result["generated_test_vector"] = step.generated_test_vector;
+  result["dtc_attempted_fault_ids"] = step.dtc_attempted_fault_ids;
+  result["dtc_embedded_fault_ids"] = step.dtc_embedded_fault_ids;
+  result["current_dtc_secondary_calls"] = step.current_dtc_secondary_calls;
+  result["current_primary_backtracks"] = step.current_primary_backtracks;
+  result["current_dtc_backtracks"] = step.current_dtc_backtracks;
+  result["newly_detected_fault_ids"] = step.newly_detected_fault_ids;
+  result["remaining_fault_ids"] = step.remaining_fault_ids;
+  result["current_podem_calls"] = step.cumulative_result.podem_calls;
+  result["current_total_backtracks"] = step.cumulative_result.total_backtracks;
+  return result;
+}
+
+py::dict phase_to_dict(const ATPG::StuckAtPhaseResult &phase) {
+  if (phase.phase == "complete") {
+    py::dict result = step_to_dict(phase.step_result);
+    result["phase"] = "complete";
+    return result;
+  }
+  if (phase.phase != "dtc")
+    throw std::runtime_error("Native stuck-at session returned an invalid phase");
+  py::dict result;
+  result["phase"] = "dtc";
+  result["selected_fault_id"] = phase.selected_fault_id;
+  result["unknown_po_id"] = phase.unknown_po_id;
+  result["dtc_candidate_fault_ids"] = phase.dtc_candidate_fault_ids;
+  result["dtc_batch_index"] = phase.dtc_batch_index;
+  result["select_fault_try"] = phase.select_fault_try;
+  result["visited_wire_count"] = phase.visited_wire_count;
   return result;
 }
 
@@ -206,49 +250,36 @@ public:
     return result;
   }
 
-  py::dict step(
-      const std::string &fault_id,
-      const std::vector<std::string> &ranked_secondary_fault_ids) {
+  py::dict begin_step(const std::string &fault_id) {
+    ATPG::StuckAtPhaseResult phase;
+    {
+      py::gil_scoped_release release;
+      std::lock_guard<std::mutex> lock(mutex_);
+      phase = atpg_.begin_stuck_at_step(fault_id);
+    }
+    return phase_to_dict(phase);
+  }
+
+  py::dict rank_dtc_candidates(
+      const std::vector<std::string> &ranked_candidate_fault_ids) {
+    ATPG::StuckAtPhaseResult phase;
+    {
+      py::gil_scoped_release release;
+      std::lock_guard<std::mutex> lock(mutex_);
+      phase = atpg_.rank_stuck_at_dtc_candidates(
+          ranked_candidate_fault_ids);
+    }
+    return phase_to_dict(phase);
+  }
+
+  py::dict step(const std::string &fault_id) {
     ATPG::AtpgStepResult step_result;
     {
       py::gil_scoped_release release;
       std::lock_guard<std::mutex> lock(mutex_);
-      step_result = atpg_.step_stuck_at(
-          fault_id, ranked_secondary_fault_ids);
+      step_result = atpg_.step_stuck_at(fault_id);
     }
-    py::dict result = summary_to_dict(step_result.cumulative_result);
-    result["selected_fault_id"] = step_result.selected_fault_id;
-    result["target_status"] = step_result.target_status;
-    result["generated_pattern"] = step_result.generated_pattern;
-    result["generated_test_vector"] = step_result.generated_test_vector;
-    result["dtc_attempted_fault_ids"] = step_result.dtc_attempted_fault_ids;
-    result["dtc_embedded_fault_ids"] = step_result.dtc_embedded_fault_ids;
-    result["current_dtc_secondary_calls"] = step_result.current_dtc_secondary_calls;
-    result["current_primary_backtracks"] = step_result.current_primary_backtracks;
-    result["current_dtc_backtracks"] = step_result.current_dtc_backtracks;
-    result["newly_detected_fault_ids"] = step_result.newly_detected_fault_ids;
-    result["remaining_fault_ids"] = step_result.remaining_fault_ids;
-    result["current_pattern_count"] =
-        step_result.cumulative_result.current_pattern_count;
-    result["current_podem_calls"] =
-        step_result.cumulative_result.podem_calls;
-    result["current_total_backtracks"] =
-        step_result.cumulative_result.total_backtracks;
-    return result;
-  }
-
-  py::dict step_legacy(const std::string &fault_id) {
-    std::vector<std::string> secondaries;
-    {
-      py::gil_scoped_release release;
-      std::lock_guard<std::mutex> lock(mutex_);
-      const std::vector<std::string> remaining =
-          atpg_.get_selectable_fault_ids();
-      for (const std::string &identifier : remaining)
-        if (identifier != fault_id)
-          secondaries.push_back(identifier);
-    }
-    return step(fault_id, secondaries);
+    return step_to_dict(step_result);
   }
 
   py::dict result() {
@@ -293,8 +324,9 @@ PYBIND11_MODULE(cpp_podem, module) {
       .def("catalog", &StuckAtSession::catalog)
       .def("config", &StuckAtSession::config)
       .def("remaining_fault_ids", &StuckAtSession::remaining_fault_ids)
-      .def("step", &StuckAtSession::step,
-           py::arg("fault_id"), py::arg("ranked_secondary_fault_ids"))
-      .def("step", &StuckAtSession::step_legacy, py::arg("fault_id"))
+      .def("begin_step", &StuckAtSession::begin_step, py::arg("fault_id"))
+      .def("rank_dtc_candidates", &StuckAtSession::rank_dtc_candidates,
+           py::arg("ranked_candidate_fault_ids"))
+      .def("step", &StuckAtSession::step, py::arg("fault_id"))
       .def("result", &StuckAtSession::result);
 }

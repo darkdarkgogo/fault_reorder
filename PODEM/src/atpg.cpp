@@ -40,6 +40,7 @@ void ATPG::configure_ordered_stuck_at(const StuckAtProtocolConfig &config)
 	stuck_at_dtc_secondary_calls = 0;
 	stuck_at_primary_backtracks = 0;
 	stuck_at_dtc_backtracks = 0;
+	reset_stuck_at_active_step();
 }
 
 void ATPG::prepare_stuck_at_session()
@@ -62,6 +63,17 @@ void ATPG::prepare_stuck_at_session()
 	// configure_ordered_stuck_at(). No stuck-at path uses the C global RNG.
 	primary_fill_rng.seed(seed);
 	stc_shuffle_rng.seed(stcseed);
+	for (wptr wire : sort_wlist)
+		wire->udflist.clear();
+	vector<vector<fptr>> faults_by_wire(sort_wlist.size());
+	for (fptr fault : flist_undetect)
+		if (fault->to_swlist >= 0 &&
+			static_cast<size_t>(fault->to_swlist) < faults_by_wire.size())
+			faults_by_wire[fault->to_swlist].push_back(fault);
+	for (size_t index = 0; index < faults_by_wire.size(); ++index)
+		for (auto fault = faults_by_wire[index].rbegin();
+			fault != faults_by_wire[index].rend(); ++fault)
+			sort_wlist[index]->udflist.push_front(*fault);
 	stuck_at_session_prepared = true;
 }
 
@@ -126,29 +138,31 @@ ATPG::AtpgRunResult ATPG::get_stuck_at_result() const
 	return result;
 }
 
-ATPG::AtpgStepResult ATPG::step_stuck_at(
-	const string &fault_id,
-	const vector<string> &ranked_secondary_fault_ids)
+void ATPG::reset_stuck_at_active_step()
+{
+	stuck_at_step_phase = StuckAtStepPhase::idle;
+	stuck_at_active_primary = nullptr;
+	stuck_at_active_unknown_po = nullptr;
+	stuck_at_active_candidates.clear();
+	stuck_at_preserved_faults.clear();
+	stuck_at_accepted_pi_cube.clear();
+	stuck_at_step_before_ids.clear();
+	stuck_at_attempted_ids.clear();
+	stuck_at_active_step = AtpgStepResult{};
+	stuck_at_active_dtc_calls = 0;
+	stuck_at_active_dtc_backtracks = 0;
+	stuck_at_active_primary_backtracks = 0;
+	stuck_at_active_batch_index = 0;
+	stuck_at_active_select_fault_try = 0;
+	stuck_at_active_visited_wire_count = 0;
+	stuck_at_next_po_index = 0;
+}
+
+ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step(const string &fault_id)
 {
 	prepare_stuck_at_session();
-	const vector<string> selectable_ids = get_selectable_fault_ids();
-	const unordered_set<string> selectable_set(
-		selectable_ids.begin(), selectable_ids.end());
-	if (selectable_set.find(fault_id) == selectable_set.end())
-		throw runtime_error("Fault ID is not selectable: " + fault_id);
-	if (ranked_secondary_fault_ids.size() + 1 != selectable_ids.size())
-		throw runtime_error("Ranked DTC candidates must contain every non-primary selectable fault");
-	unordered_set<string> ranked_set;
-	for (const string &identifier : ranked_secondary_fault_ids)
-	{
-		if (identifier == fault_id || selectable_set.find(identifier) == selectable_set.end())
-			throw runtime_error("Ranked DTC candidate is not a non-primary selectable fault: " + identifier);
-		if (!ranked_set.insert(identifier).second)
-			throw runtime_error("Ranked DTC candidates contain a duplicate fault: " + identifier);
-	}
-	if (ranked_set.size() + 1 != selectable_set.size())
-		throw runtime_error("Ranked DTC candidates do not match the selectable fault set");
-
+	if (stuck_at_step_phase != StuckAtStepPhase::idle)
+		throw runtime_error("A stuck-at step is already awaiting a DTC ranking");
 	fptr known_fault = nullptr;
 	for (const auto &owned_fault : flist)
 	{
@@ -160,6 +174,10 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(
 	}
 	if (known_fault == nullptr)
 		throw runtime_error("Unknown fault ID: " + fault_id);
+	const vector<string> selectable_ids = get_selectable_fault_ids();
+	const unordered_set<string> selectable_set(selectable_ids.begin(), selectable_ids.end());
+	if (selectable_set.find(fault_id) == selectable_set.end())
+		throw runtime_error("Fault ID is not selectable: " + fault_id);
 
 	fptr fault_under_test = nullptr;
 	vector<string> before_ids;
@@ -172,8 +190,11 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(
 	if (fault_under_test == nullptr)
 		throw runtime_error("Fault ID is not selectable: " + fault_id);
 
-	AtpgStepResult step;
-	step.selected_fault_id = fault_id;
+	reset_stuck_at_active_step();
+	stuck_at_step_phase = StuckAtStepPhase::awaiting_dtc_order;
+	stuck_at_active_primary = fault_under_test;
+	stuck_at_step_before_ids = before_ids;
+	stuck_at_active_step.selected_fault_id = fault_id;
 	int current_backtracks = 0;
 	using Clock = std::chrono::steady_clock;
 	const Clock::time_point primary_started = Clock::now();
@@ -193,53 +214,83 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(
 		fault_id.c_str(), primary_status, current_backtracks,
 		std::chrono::duration<double>(Clock::now() - primary_started).count());
 	fflush(stderr);
+	stuck_at_active_primary_backtracks = current_backtracks;
+	stuck_at_total_backtracks += current_backtracks;
+	stuck_at_primary_backtracks += current_backtracks;
+	stuck_at_podem_calls++;
 	switch (podem_result)
 	{
 		case TRUE:
 		{
-			const DtcResult dtc = run_stuck_at_dtc(
-				fault_under_test, ranked_secondary_fault_ids);
-			step.dtc_attempted_fault_ids = dtc.attempted_fault_ids;
-			step.dtc_embedded_fault_ids = dtc.embedded_fault_ids;
-			stuck_at_dtc_secondary_calls += dtc.secondary_calls;
-			stuck_at_dtc_backtracks += dtc.backtracks;
-			stuck_at_total_backtracks += dtc.backtracks;
-			fill_stuck_at_primary_cube();
-			string vec;
+			stuck_at_active_step.target_status = "detected";
+			stuck_at_active_step.generated_pattern = true;
 			for (wptr wire : cktin)
-				vec.push_back(itoc(wire->value));
-			step.generated_test_vector = vec;
-			if (print_test_vectors)
-				display_io();
-			int current_detect_num = 0;
-			fault_sim_a_vector(vec, current_detect_num);
-			vectors.push_back(vec);
-			stuck_at_total_detect_num += current_detect_num;
-			in_vector_no++;
-			step.target_status = "detected";
-			step.generated_pattern = true;
+				stuck_at_accepted_pi_cube.push_back(
+					wire->value == D ? 1 : wire->value == D_bar ? 0 : wire->value);
+			restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);
+			stuck_at_preserved_faults.push_back(fault_under_test);
+			if (dynamic_test_compression)
+			{
+				DtcBatchState batch;
+				if (find_next_stuck_at_dtc_batch(batch))
+				{
+					stuck_at_active_unknown_po = batch.unknown_po;
+					stuck_at_active_candidates = batch.candidates;
+					stuck_at_active_select_fault_try = batch.select_fault_try;
+					stuck_at_active_visited_wire_count = batch.visited_wire_count;
+					return make_stuck_at_dtc_phase();
+				}
+			}
 			break;
 		}
 		case FALSE:
 			fault_under_test->detect = REDUNDANT;
 			stuck_at_redundant_faults++;
 			stuck_at_redundant_equivalent_faults += fault_under_test->eqv_fault_num;
-			step.target_status = "redundant";
+			stuck_at_active_step.target_status = "redundant";
 			break;
 		case MAYBE:
 			stuck_at_aborted_faults++;
-			step.target_status = "aborted";
+			stuck_at_active_step.target_status = "aborted";
 			break;
 		default:
+			reset_stuck_at_active_step();
 			throw runtime_error("PODEM returned an unsupported status");
 	}
-	fault_under_test->test_tried = true;
-	stuck_at_total_backtracks += current_backtracks;
-	stuck_at_primary_backtracks += current_backtracks;
-	stuck_at_podem_calls++;
-	step.current_dtc_secondary_calls = stuck_at_dtc_secondary_calls;
-	step.current_primary_backtracks = stuck_at_primary_backtracks;
-	step.current_dtc_backtracks = stuck_at_dtc_backtracks;
+	StuckAtPhaseResult result;
+	result.phase = "complete";
+	result.step_result = complete_stuck_at_step();
+	return result;
+}
+
+ATPG::AtpgStepResult ATPG::complete_stuck_at_step()
+{
+	if (stuck_at_step_phase != StuckAtStepPhase::awaiting_dtc_order ||
+		stuck_at_active_primary == nullptr)
+		throw runtime_error("No active stuck-at step can be completed");
+	if (stuck_at_active_step.generated_pattern)
+	{
+		restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);
+		fill_stuck_at_primary_cube();
+		string vec;
+		for (wptr wire : cktin)
+			vec.push_back(itoc(wire->value));
+		stuck_at_active_step.generated_test_vector = vec;
+		if (print_test_vectors)
+			display_io();
+		int current_detect_num = 0;
+		fault_sim_a_vector(vec, current_detect_num);
+		vectors.push_back(vec);
+		stuck_at_total_detect_num += current_detect_num;
+		in_vector_no++;
+	}
+	stuck_at_active_primary->test_tried = true;
+	stuck_at_dtc_secondary_calls += stuck_at_active_dtc_calls;
+	stuck_at_dtc_backtracks += stuck_at_active_dtc_backtracks;
+	stuck_at_total_backtracks += stuck_at_active_dtc_backtracks;
+	stuck_at_active_step.current_dtc_secondary_calls = stuck_at_dtc_secondary_calls;
+	stuck_at_active_step.current_primary_backtracks = stuck_at_primary_backtracks;
+	stuck_at_active_step.current_dtc_backtracks = stuck_at_dtc_backtracks;
 
 	const vector<string> undetected_ids = [&]() {
 		vector<string> ids;
@@ -248,24 +299,26 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(
 		return ids;
 	}();
 	const unordered_set<string> after_set(undetected_ids.begin(), undetected_ids.end());
-	for (const string &identifier : before_ids)
+	for (const string &identifier : stuck_at_step_before_ids)
 	{
 		if (after_set.find(identifier) == after_set.end())
-			step.newly_detected_fault_ids.push_back(identifier);
+			stuck_at_active_step.newly_detected_fault_ids.push_back(identifier);
 	}
-	step.remaining_fault_ids = get_selectable_fault_ids();
-	step.cumulative_result = get_stuck_at_result();
-	return step;
+	stuck_at_active_step.remaining_fault_ids = get_selectable_fault_ids();
+	stuck_at_active_step.cumulative_result = get_stuck_at_result();
+	AtpgStepResult result = stuck_at_active_step;
+	reset_stuck_at_active_step();
+	return result;
 }
 
 ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 {
-	const vector<string> selectable = get_selectable_fault_ids();
-	vector<string> ranked_secondary_fault_ids;
-	for (const string &identifier : selectable)
-		if (identifier != fault_id)
-			ranked_secondary_fault_ids.push_back(identifier);
-	return step_stuck_at(fault_id, ranked_secondary_fault_ids);
+	StuckAtPhaseResult state = begin_stuck_at_step(fault_id);
+	while (state.phase == "dtc")
+		state = rank_stuck_at_dtc_candidates(state.dtc_candidate_fault_ids);
+	if (state.phase != "complete")
+		throw runtime_error("Stuck-at step ended in an unsupported phase");
+	return state.step_result;
 }
 
 ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
