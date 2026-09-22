@@ -212,11 +212,17 @@ ATPG::StuckAtPhaseResult ATPG::rank_stuck_at_dtc_candidates(
 	using Clock = std::chrono::steady_clock;
 	const Clock::time_point batch_started = Clock::now();
 	const string primary_id = fault_identifier(stuck_at_active_primary);
-	fprintf(stderr,
-		"[ATPG][DTC] batch start primary=%s po=%s candidates=%zu budget=%d visited=%d\n",
-		primary_id.c_str(), stuck_at_active_unknown_po->name.c_str(), ranked.size(),
-		stuck_at_active_select_fault_try, stuck_at_active_visited_wire_count);
-	fflush(stderr);
+	const int batch_index = stuck_at_active_batch_index - 1;
+	const bool log_batch = batch_index < 5 || (batch_index + 1) % 100 == 0;
+	if (log_batch)
+	{
+		fprintf(stderr,
+			"[ATPG][DTC] batch start index=%d primary=%s po=%s candidates=%zu budget=%d visited=%d\n",
+			batch_index, primary_id.c_str(), stuck_at_active_unknown_po->name.c_str(),
+			ranked.size(), stuck_at_active_select_fault_try,
+			stuck_at_active_visited_wire_count);
+		fflush(stderr);
+	}
 	const size_t attempted_before = stuck_at_active_step.dtc_attempted_fault_ids.size();
 	const size_t embedded_before = stuck_at_active_step.dtc_embedded_fault_ids.size();
 	for (fptr secondary : ranked)
@@ -254,13 +260,16 @@ ATPG::StuckAtPhaseResult ATPG::rank_stuck_at_dtc_candidates(
 		if (stuck_at_active_unknown_po->value != U)
 			break;
 	}
-	fprintf(stderr,
-		"[ATPG][DTC] batch done primary=%s po=%s attempted=%zu embedded=%zu elapsed_s=%.3f\n",
-		primary_id.c_str(), stuck_at_active_unknown_po->name.c_str(),
-		stuck_at_active_step.dtc_attempted_fault_ids.size() - attempted_before,
-		stuck_at_active_step.dtc_embedded_fault_ids.size() - embedded_before,
-		std::chrono::duration<double>(Clock::now() - batch_started).count());
-	fflush(stderr);
+	if (log_batch)
+	{
+		fprintf(stderr,
+			"[ATPG][DTC] batch done index=%d primary=%s po=%s attempted=%zu embedded=%zu elapsed_s=%.3f\n",
+			batch_index, primary_id.c_str(), stuck_at_active_unknown_po->name.c_str(),
+			stuck_at_active_step.dtc_attempted_fault_ids.size() - attempted_before,
+			stuck_at_active_step.dtc_embedded_fault_ids.size() - embedded_before,
+			std::chrono::duration<double>(Clock::now() - batch_started).count());
+		fflush(stderr);
+	}
 	vector<string> last_attempted(
 		stuck_at_active_step.dtc_attempted_fault_ids.begin() + attempted_before,
 		stuck_at_active_step.dtc_attempted_fault_ids.end());

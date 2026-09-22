@@ -141,6 +141,7 @@ class _NativePrefixSession:
     def __init__(self, attempted=("f2",)):
         self.attempted = attempted
         self.seen = None
+        self.begin_calls = 0
 
     def config(self):
         return dict(PROTOCOL_CONFIG)
@@ -156,6 +157,7 @@ class _NativePrefixSession:
         return ("f0", "f1", "f2")
 
     def begin_step(self, primary):
+        self.begin_calls += 1
         self.primary = primary
         return {
             "phase": "dtc", "selected_fault_id": primary,
@@ -192,6 +194,20 @@ def test_python_session_ranks_only_bfs_batch_and_accepts_only_prefix():
     with pytest.raises(ValueError, match="exactly the current BFS"):
         PodemSession(_NativePrefixSession()).step(
             "f0", lambda candidates, _: candidates[:-1])
+
+
+def test_python_session_retries_ranker_exception_without_repeating_primary():
+    native = _NativePrefixSession()
+    session = PodemSession(native)
+
+    def fail_once(_candidates, _metadata):
+        raise RuntimeError("ranker failed")
+
+    with pytest.raises(RuntimeError, match="ranker failed"):
+        session.step("f0", fail_once)
+    result = session.step("f0", lambda candidates, _: candidates)
+    assert native.begin_calls == 1
+    assert result["dtc_attempted_fault_ids"] == ("f2",)
 
 
 def _metrics(fault_count, raw_patterns, final_patterns=1):

@@ -203,6 +203,12 @@ class PodemSession:
                 "select_fault_try": select_fault_try,
                 "visited_wire_count": visited_wire_count,
             }
+            # Preserve the exact native phase before invoking user/policy code so
+            # any ranking exception can be retried without re-running Primary.
+            self._pending = {
+                "fault_id": fault_id, "state": state, "batches": batches,
+                "attempted": attempted_so_far,
+            }
             requested_value = (candidates if rank_dtc_candidates is None
                                else rank_dtc_candidates(candidates, dict(metadata)))
             try:
