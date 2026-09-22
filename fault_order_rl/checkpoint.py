@@ -60,7 +60,11 @@ def load_checkpoint(path):
         raise ValueError(
             "checkpoint schema 3 uses REINFORCE and catalog-ordered DTC; retraining is required"
         )
-    if not isinstance(state, dict) or state.get("version") != 4:
+    if isinstance(state, dict) and state.get("version") == 4:
+        raise ValueError(
+            "checkpoint schema 4 uses full-remaining Ranked-DTC actions; retraining is required"
+        )
+    if not isinstance(state, dict) or state.get("version") != 5:
         raise ValueError("unsupported fault-order checkpoint")
     return state
 

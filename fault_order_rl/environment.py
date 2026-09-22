@@ -11,6 +11,10 @@ PROTOCOL_CONFIG = {
     "dtc_secondary_backtrack_limit": 50, "stc_enabled": True,
     "stc_reverse_order_enabled": True, "stc_shuffle_seed": 7,
     "stc_no_improvement_limit": 5, "scoap_enabled": False,
+    "dtc_bfs_small_input_threshold": 32,
+    "dtc_bfs_small_select_fault_try": 15,
+    "dtc_bfs_default_select_fault_try": 100,
+    "dtc_rollback_algorithm": "accepted_pi_cube_resim_v1",
 }
 RESULT_FIELDS = (
     "pattern_count", "current_pattern_count", "patterns_before_stc",
@@ -154,24 +158,108 @@ class PodemSession:
         self._coverage["uncollapsed_faults"] = _number(self.catalog, "uncollapsed_total")
         self._detected_ids = set()
         self._final = None
+        self._pending = None
 
-    def step(self, fault_id, ranked_secondary_fault_ids):
+    def step(self, fault_id, rank_dtc_candidates=None):
         if self._final is not None or fault_id not in self.remaining_fault_ids:
             raise ValueError("selected fault ID is not remaining")
-        ranked = _ids(
-            {"ranked_secondary_fault_ids": ranked_secondary_fault_ids},
-            "ranked_secondary_fault_ids", self._catalog_set)
-        expected_secondaries = set(self.remaining_fault_ids) - {fault_id}
-        if set(ranked) != expected_secondaries or len(ranked) != len(expected_secondaries):
-            raise ValueError(
-                "ranked secondary IDs must contain every non-primary remaining fault"
-            )
-        raw = dict(self._native.step(fault_id, list(ranked)))
+        if rank_dtc_candidates is not None and not callable(rank_dtc_candidates):
+            raise TypeError("rank_dtc_candidates must be callable or None")
+        before = set(self.remaining_fault_ids)
+        if self._pending is None:
+            state = dict(self._native.begin_step(fault_id))
+            batches = []
+            attempted_so_far = []
+        else:
+            if self._pending["fault_id"] != fault_id:
+                raise RuntimeError("PODEM session is awaiting a DTC ranking for another Primary")
+            state = self._pending["state"]
+            batches = self._pending["batches"]
+            attempted_so_far = self._pending["attempted"]
+
+        while state.get("phase") == "dtc":
+            if state.get("selected_fault_id") != fault_id:
+                raise RuntimeError("PODEM DTC phase changed the selected fault ID")
+            candidates = _ids(
+                state, "dtc_candidate_fault_ids", self._catalog_set)
+            if fault_id in candidates or not set(candidates) <= before - {fault_id}:
+                raise RuntimeError("PODEM returned invalid BFS DTC candidates")
+            batch_index = _number(state, "dtc_batch_index")
+            if batch_index != len(batches):
+                raise RuntimeError("PODEM returned a non-sequential DTC batch index")
+            select_fault_try = _number(state, "select_fault_try")
+            visited_wire_count = _number(state, "visited_wire_count")
+            if select_fault_try not in (
+                    self.config["dtc_bfs_small_select_fault_try"],
+                    self.config["dtc_bfs_default_select_fault_try"]
+            ) or visited_wire_count > select_fault_try:
+                raise RuntimeError("PODEM returned invalid DTC BFS visit accounting")
+            unknown_po_id = state.get("unknown_po_id")
+            if not isinstance(unknown_po_id, str) or not unknown_po_id:
+                raise RuntimeError("PODEM returned invalid unknown PO ID")
+            metadata = {
+                "unknown_po_id": unknown_po_id,
+                "dtc_batch_index": batch_index,
+                "select_fault_try": select_fault_try,
+                "visited_wire_count": visited_wire_count,
+            }
+            requested_value = (candidates if rank_dtc_candidates is None
+                               else rank_dtc_candidates(candidates, dict(metadata)))
+            try:
+                requested = tuple(requested_value)
+            except TypeError as exc:
+                self._pending = {
+                    "fault_id": fault_id, "state": state, "batches": batches,
+                    "attempted": attempted_so_far,
+                }
+                raise ValueError("DTC ranker must return an iterable permutation") from exc
+            if (len(requested) != len(candidates)
+                    or any(not isinstance(identifier, str) for identifier in requested)
+                    or len(set(requested)) != len(requested)
+                    or set(requested) != set(candidates)):
+                self._pending = {
+                    "fault_id": fault_id, "state": state, "batches": batches,
+                    "attempted": attempted_so_far,
+                }
+                raise ValueError("DTC ranker must return exactly the current BFS candidate permutation")
+            response = dict(self._native.rank_dtc_candidates(list(requested)))
+            executed = _ids(
+                response, "last_dtc_attempted_fault_ids", self._catalog_set)
+            embedded_batch = _ids(
+                response, "last_dtc_embedded_fault_ids", self._catalog_set)
+            if executed != requested[:len(executed)]:
+                raise RuntimeError("PODEM DTC attempted IDs are not the requested batch prefix")
+            if set(executed) & set(attempted_so_far):
+                raise RuntimeError("PODEM repeated a DTC secondary across batches")
+            if not set(embedded_batch) <= set(executed):
+                raise RuntimeError("PODEM embedded a DTC fault that was not attempted")
+            embedded_positions = [executed.index(identifier)
+                                  for identifier in embedded_batch]
+            if any(left >= right for left, right in zip(
+                    embedded_positions, embedded_positions[1:])):
+                raise RuntimeError("PODEM DTC embedded IDs are not in attempted order")
+            batches.append({
+                **metadata,
+                "bfs_candidate_fault_ids": candidates,
+                "requested_fault_ids": requested,
+                "executed_prefix_fault_ids": executed,
+                "embedded_fault_ids": embedded_batch,
+            })
+            attempted_so_far.extend(executed)
+            state = response
+            self._pending = {
+                "fault_id": fault_id, "state": state, "batches": batches,
+                "attempted": attempted_so_far,
+            }
+
+        if state.get("phase") != "complete":
+            raise RuntimeError("PODEM returned an invalid stuck-at session phase")
+        self._pending = None
+        raw = state
         missing = [field for field in STEP_FIELDS if field not in raw]
         if missing:
             raise RuntimeError("PODEM step is missing fields: {}".format(missing))
         result = _validate_result(raw, len(self.initial_fault_ids), False)
-        before = set(self.remaining_fault_ids)
         remaining = _ids(raw, "remaining_fault_ids", self._catalog_set)
         newly = _ids(raw, "newly_detected_fault_ids", self._catalog_set)
         attempted = _ids(raw, "dtc_attempted_fault_ids", self._catalog_set)
@@ -193,8 +281,8 @@ class PodemSession:
                 raise RuntimeError("PODEM coverage count changed incorrectly: {}".format(field))
         if not set(attempted) <= before - {fault_id}:
             raise RuntimeError("PODEM dtc_attempted IDs were not secondary candidates")
-        if attempted != ranked[:len(attempted)]:
-            raise RuntimeError("PODEM dtc_attempted IDs are not a ranked prefix")
+        if attempted != tuple(attempted_so_far):
+            raise RuntimeError("PODEM aggregate DTC attempts disagree with batch prefixes")
         if not set(embedded) <= set(attempted):
             raise RuntimeError("PODEM dtc_embedded IDs were not attempted")
         embedded_positions = [attempted.index(identifier) for identifier in embedded]
@@ -245,7 +333,8 @@ class PodemSession:
         self._detected_ids.update(newly)
         return {**result, **{field: raw[field] for field in STEP_FIELDS},
                 "remaining_fault_ids": remaining, "newly_detected_fault_ids": newly,
-                "dtc_attempted_fault_ids": attempted, "dtc_embedded_fault_ids": embedded}
+                "dtc_attempted_fault_ids": attempted, "dtc_embedded_fault_ids": embedded,
+                "dtc_batches": tuple(batches)}
 
     def finish(self):
         if self._final is not None:

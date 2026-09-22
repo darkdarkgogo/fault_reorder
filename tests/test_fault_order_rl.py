@@ -12,7 +12,8 @@ from fault_order_rl.checkpoint import load_checkpoint, save_checkpoint
 from fault_order_rl.data import CircuitData, CircuitSpec
 from fault_order_rl.environment import PROTOCOL_CONFIG, PodemEnvironment, PodemSession
 from fault_order_rl.model import FaultActorCritic, build_dynamic_features
-from fault_order_rl.policy import executed_prefix_stats, sample_ranking
+from fault_order_rl.policy import (centered_logits, joint_action_stats,
+                                   sample_candidate_ranking, sample_primary)
 from fault_order_rl.reward import (compute_gae, normalize_advantages,
                                    ppo_objective, step_reward,
                                    target_return, terminal_correction)
@@ -33,19 +34,31 @@ def test_actor_critic_shapes_and_dynamic_features():
     assert value.shape == ()
 
 
-def test_full_ranking_and_executed_prefix_have_gradients():
+def test_primary_and_bfs_batch_joint_probability_have_gradients():
     model = FaultActorCritic()
     embeddings = torch.randn(4, 257)
     rows = (3, 0, 2)
     scores, _ = model(build_dynamic_features(embeddings, rows))
-    scores = torch.zeros_like(scores)
-    assert sample_ranking(scores, rows, 1.0, False).tolist() == [0, 2, 3]
-    sampled = sample_ranking(
-        scores, rows, 1.0, True,
+    equal_scores = torch.zeros_like(scores)
+    assert int(sample_primary(equal_scores, rows, 1.0, False)) == 0
+    assert sample_candidate_ranking(
+        equal_scores, rows, (3, 2), 1.0, False).tolist() == [2, 3]
+    sampled = sample_candidate_ranking(
+        equal_scores, rows, (3, 2), 1.0, True,
         generator=torch.Generator().manual_seed(7))
-    assert sorted(sampled.tolist()) == sorted(rows)
-    log_prob, entropy, value = executed_prefix_stats(
-        model, embeddings, rows, (0, 3), 1.0)
+    assert sorted(sampled.tolist()) == [2, 3]
+    batches = ({
+        "bfs_candidate_rows": (3, 2),
+        "requested_rows": (2, 3),
+        "executed_prefix_rows": (2,),
+    },)
+    log_prob, entropy, value = joint_action_stats(
+        model, embeddings, rows, 0, batches, 1.0)
+    replay_scores, _ = model(build_dynamic_features(embeddings, rows))
+    logits = centered_logits(replay_scores, 1.0)
+    manual = (torch.log_softmax(logits, 0)[1]
+              + torch.log_softmax(logits[[0, 2]], 0)[1])
+    assert torch.allclose(log_prob, manual)
     loss = -(log_prob + 0.01 * entropy) + value.square()
     loss.backward()
     assert torch.isfinite(loss)
@@ -142,26 +155,43 @@ class _NativePrefixSession:
     def remaining_fault_ids(self):
         return ("f0", "f1", "f2")
 
-    def step(self, primary, secondaries):
-        self.seen = (primary, tuple(secondaries))
-        return _step_summary(
+    def begin_step(self, primary):
+        self.primary = primary
+        return {
+            "phase": "dtc", "selected_fault_id": primary,
+            "unknown_po_id": "po0", "dtc_candidate_fault_ids": ("f2", "f1"),
+            "dtc_batch_index": 0, "select_fault_try": 15,
+            "visited_wire_count": 3,
+            "last_dtc_attempted_fault_ids": (),
+            "last_dtc_embedded_fault_ids": (),
+        }
+
+    def rank_dtc_candidates(self, candidates):
+        self.seen = (self.primary, tuple(candidates))
+        return {**_step_summary(
             dtc_attempted_fault_ids=self.attempted,
             dtc_embedded_fault_ids=self.attempted,
             dtc_secondary_calls=len(self.attempted),
-            current_dtc_secondary_calls=len(self.attempted))
+            current_dtc_secondary_calls=len(self.attempted)),
+            "phase": "complete",
+            "last_dtc_attempted_fault_ids": self.attempted,
+            "last_dtc_embedded_fault_ids": self.attempted,
+        }
 
 
-def test_python_session_passes_full_ranking_and_accepts_only_prefix():
+def test_python_session_ranks_only_bfs_batch_and_accepts_only_prefix():
     native = _NativePrefixSession()
     session = PodemSession(native)
-    result = session.step("f0", ("f2", "f1"))
+    result = session.step("f0", lambda candidates, _: tuple(candidates))
     assert native.seen == ("f0", ("f2", "f1"))
     assert result["dtc_attempted_fault_ids"] == ("f2",)
+    assert result["dtc_batches"][0]["bfs_candidate_fault_ids"] == ("f2", "f1")
     bad = PodemSession(_NativePrefixSession(("f1",)))
-    with pytest.raises(RuntimeError, match="ranked prefix"):
-        bad.step("f0", ("f2", "f1"))
-    with pytest.raises(ValueError, match="every non-primary"):
-        PodemSession(_NativePrefixSession()).step("f0", ("f1",))
+    with pytest.raises(RuntimeError, match="requested batch prefix"):
+        bad.step("f0")
+    with pytest.raises(ValueError, match="exactly the current BFS"):
+        PodemSession(_NativePrefixSession()).step(
+            "f0", lambda candidates, _: candidates[:-1])
 
 
 def _metrics(fault_count, raw_patterns, final_patterns=1):
@@ -200,12 +230,17 @@ class _FakeSession:
         self.calls = 0
         self.dtc_calls = 0
 
-    def step(self, primary, secondaries):
+    def step(self, primary, rank_dtc_candidates=None):
         assert primary in self.remaining_fault_ids
-        assert set(secondaries) == set(self.remaining_fault_ids) - {primary}
-        assert len(secondaries) == len(self.remaining_fault_ids) - 1
-        self.ranking_log.append((primary, tuple(secondaries)))
-        attempted = tuple(secondaries)
+        candidates = tuple(identifier for identifier in self.remaining_fault_ids
+                           if identifier != primary)
+        metadata = {"unknown_po_id": "po0", "dtc_batch_index": 0,
+                    "select_fault_try": 15, "visited_wire_count": 1}
+        requested = (candidates if rank_dtc_candidates is None or not candidates
+                     else tuple(rank_dtc_candidates(candidates, metadata)))
+        assert set(requested) == set(candidates)
+        self.ranking_log.append((primary, requested))
+        attempted = requested
         self.patterns += 1
         self.calls += 1
         self.dtc_calls += len(attempted)
@@ -222,6 +257,13 @@ class _FakeSession:
             "generated_test_vector": "0" * len(self.initial),
             "dtc_attempted_fault_ids": attempted,
             "dtc_embedded_fault_ids": (),
+            "dtc_batches": ({
+                **metadata,
+                "bfs_candidate_fault_ids": candidates,
+                "requested_fault_ids": requested,
+                "executed_prefix_fault_ids": attempted,
+                "embedded_fault_ids": (),
+            },) if candidates else (),
             "newly_detected_fault_ids": (primary,),
             "remaining_fault_ids": self.remaining_fault_ids,
             "current_podem_calls": self.calls,
@@ -306,8 +348,61 @@ def test_best_key_is_coverage_first():
     assert evaluation_key(second) < evaluation_key(first)
 
 
-def test_schema_1_to_3_require_retraining(tmp_path):
-    for version in (1, 2, 3):
+def test_policy_rollout_uses_one_forward_per_primary(tmp_path):
+    circuit = _circuit(tmp_path, "counted", "counted-digest", count=3)
+    environment = _FakeEnvironment([circuit])
+
+    class CountingModel(FaultActorCritic):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, features):
+            self.calls += 1
+            return super().forward(features)
+
+    model = CountingModel()
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = TrainConfig()
+    trainer.environment = environment
+    trainer._check_result = lambda actual_circuit, result: None
+    _, _, decisions, _ = trainer._run_policy(
+        circuit, model, 1.0, False, environment)
+    assert model.calls == len(decisions) == 3
+    assert all("primary_row" in decision and "dtc_batches" in decision
+               for decision in decisions)
+
+
+def test_nested_dtc_trajectory_npz_uses_offsets_without_pickle(tmp_path):
+    trainer = Trainer.__new__(Trainer)
+    trainer.output = tmp_path
+    decisions = [{
+        "remaining_rows": (0, 1, 2), "primary_row": 0,
+        "dtc_batches": ({
+            "bfs_candidate_rows": (2, 1), "requested_rows": (1, 2),
+            "executed_prefix_rows": (1,), "embedded_rows": (),
+            "select_fault_try": 15, "visited_wire_count": 3,
+        },),
+        "old_log_prob": -1.0, "old_value": 0.0, "reward": 0.1,
+        "return": 0.2, "advantage": 0.3,
+    }, {
+        "remaining_rows": (1, 2), "primary_row": 2, "dtc_batches": (),
+        "old_log_prob": -0.5, "old_value": 0.1, "reward": 0.0,
+        "return": 0.0, "advantage": -0.1,
+    }]
+    trainer._write_circuit(1, 0, {"kind": "episode"}, decisions)
+    path = tmp_path / "rounds" / "round-000001" / "circuit-000000.npz"
+    with np.load(path, allow_pickle=False) as arrays:
+        assert arrays["primary_rows"].tolist() == [0, 2]
+        assert arrays["dtc_batch_step_offsets"].tolist() == [0, 1, 1]
+        assert arrays["dtc_candidate_rows"].tolist() == [2, 1]
+        assert arrays["dtc_candidate_rows_offsets"].tolist() == [0, 2]
+        assert arrays["dtc_executed_rows"].tolist() == [1]
+        assert arrays["dtc_executed_rows_offsets"].tolist() == [0, 1]
+
+
+def test_schema_1_to_4_require_retraining(tmp_path):
+    for version in (1, 2, 3, 4):
         path = tmp_path / (str(version) + ".pt")
         save_checkpoint(path, {"version": version})
         with pytest.raises(ValueError, match="retrain|retraining"):
@@ -338,7 +433,7 @@ def test_per_circuit_checkpoint_resume_validation_best_and_final(
     trainer = Trainer.create(
         train_manifest, TrainConfig(), output, train_env,
         validation_manifest, validation_env)
-    assert load_checkpoint(output / "latest.pt")["version"] == 4
+    assert load_checkpoint(output / "latest.pt")["version"] == 5
     train_env.fail_once.add("train_b")
     with pytest.raises(RuntimeError, match="injected"):
         trainer.step()

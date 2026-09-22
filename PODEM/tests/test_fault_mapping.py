@@ -85,14 +85,22 @@ class FaultMappingTests(unittest.TestCase):
         primary = "x:GO:sa0"
         state = session.begin_step(primary)
         requested = []
+        batches = []
         while state["phase"] == "dtc":
             candidates = list(state["dtc_candidate_fault_ids"])
+            self.assertEqual(state["select_fault_try"], 15)
+            self.assertLessEqual(state["visited_wire_count"], 15)
             ranking = list(reversed(candidates))
             requested.extend(ranking)
             state = session.rank_dtc_candidates(ranking)
+            batches.append((ranking, list(state["last_dtc_attempted_fault_ids"])))
         attempted = state["dtc_attempted_fault_ids"]
         self.assertEqual(attempted, requested[:len(attempted)])
         self.assertNotIn(primary, attempted)
+        self.assertTrue(all(executed == ranking[:len(executed)]
+                            for ranking, executed in batches))
+        self.assertTrue(any(len(executed) < len(ranking)
+                            for ranking, executed in batches))
 
         invalid = cpp_podem.StuckAtSession(str(binary), str(fault_map))
         state = invalid.begin_step(primary)
@@ -105,6 +113,23 @@ class FaultMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Cannot finalize"):
             invalid.result()
         invalid.rank_dtc_candidates(candidates)
+
+    def test_large_input_dtc_uses_100_wire_budget(self):
+        inputs = [f"INPUT(a{i})" for i in range(33)]
+        _, binary, fault_map, _, _ = self.convert("\n".join([
+            *inputs, "OUTPUT(x)", "OUTPUT(z)",
+            "x = BUF(a0)",
+            "z = AND({})".format(",".join(f"a{i}" for i in range(1, 33))),
+            "",
+        ]))
+        self.keep_dtc_faults(
+            fault_map, ["x:GO:sa0", "z:GO:sa0", "z:GO:sa1"])
+        session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
+        state = session.begin_step("x:GO:sa0")
+        self.assertEqual(state["phase"], "dtc")
+        self.assertEqual(state["unknown_po_id"], "z")
+        self.assertEqual(state["select_fault_try"], 100)
+        self.assertLessEqual(state["visited_wire_count"], 100)
 
     def complete_stc_session(self, binary, fault_map, **options):
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map), **options)

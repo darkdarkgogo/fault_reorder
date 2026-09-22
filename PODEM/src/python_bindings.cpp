@@ -104,6 +104,10 @@ py::dict phase_to_dict(const ATPG::StuckAtPhaseResult &phase) {
   if (phase.phase == "complete") {
     py::dict result = step_to_dict(phase.step_result);
     result["phase"] = "complete";
+    result["last_dtc_attempted_fault_ids"] =
+        phase.last_dtc_attempted_fault_ids;
+    result["last_dtc_embedded_fault_ids"] =
+        phase.last_dtc_embedded_fault_ids;
     return result;
   }
   if (phase.phase != "dtc")
@@ -116,6 +120,10 @@ py::dict phase_to_dict(const ATPG::StuckAtPhaseResult &phase) {
   result["dtc_batch_index"] = phase.dtc_batch_index;
   result["select_fault_try"] = phase.select_fault_try;
   result["visited_wire_count"] = phase.visited_wire_count;
+  result["last_dtc_attempted_fault_ids"] =
+      phase.last_dtc_attempted_fault_ids;
+  result["last_dtc_embedded_fault_ids"] =
+      phase.last_dtc_embedded_fault_ids;
   return result;
 }
 

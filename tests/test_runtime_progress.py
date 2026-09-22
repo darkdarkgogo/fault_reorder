@@ -99,7 +99,7 @@ def test_native_session_logs_sampled_steps_and_finalize(capsys):
         def __init__(self):
             self.remaining_fault_ids = tuple("f{}".format(i) for i in range(101))
 
-        def step(self, primary, secondaries):
+        def step(self, primary, rank_dtc_candidates=None):
             assert primary == self.remaining_fault_ids[0]
             self.remaining_fault_ids = self.remaining_fault_ids[1:]
             return {}

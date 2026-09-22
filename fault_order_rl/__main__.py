@@ -44,8 +44,8 @@ def _print_evaluation_by_circuit(report):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Dynamic full-ranking actor-critic PPO: fixed 5 rounds, "
-            "Primary backtrack=100, DTC secondary backtrack=50, schema=4"
+            "Dynamic BFS-filtered ranked-DTC actor-critic PPO: fixed 5 rounds, "
+            "Primary backtrack=100, DTC secondary backtrack=50, schema=5"
         ))
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate", help="Validate all artifacts without ATPG episodes")

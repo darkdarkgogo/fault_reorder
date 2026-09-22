@@ -261,6 +261,12 @@ ATPG::StuckAtPhaseResult ATPG::rank_stuck_at_dtc_candidates(
 		stuck_at_active_step.dtc_embedded_fault_ids.size() - embedded_before,
 		std::chrono::duration<double>(Clock::now() - batch_started).count());
 	fflush(stderr);
+	vector<string> last_attempted(
+		stuck_at_active_step.dtc_attempted_fault_ids.begin() + attempted_before,
+		stuck_at_active_step.dtc_attempted_fault_ids.end());
+	vector<string> last_embedded(
+		stuck_at_active_step.dtc_embedded_fault_ids.begin() + embedded_before,
+		stuck_at_active_step.dtc_embedded_fault_ids.end());
 
 	++stuck_at_next_po_index;
 	DtcBatchState next;
@@ -270,11 +276,16 @@ ATPG::StuckAtPhaseResult ATPG::rank_stuck_at_dtc_candidates(
 		stuck_at_active_candidates = next.candidates;
 		stuck_at_active_select_fault_try = next.select_fault_try;
 		stuck_at_active_visited_wire_count = next.visited_wire_count;
-		return make_stuck_at_dtc_phase();
+		StuckAtPhaseResult result = make_stuck_at_dtc_phase();
+		result.last_dtc_attempted_fault_ids = last_attempted;
+		result.last_dtc_embedded_fault_ids = last_embedded;
+		return result;
 	}
 	StuckAtPhaseResult result;
 	result.phase = "complete";
 	result.step_result = complete_stuck_at_step();
+	result.last_dtc_attempted_fault_ids = last_attempted;
+	result.last_dtc_embedded_fault_ids = last_embedded;
 	return result;
 }
 

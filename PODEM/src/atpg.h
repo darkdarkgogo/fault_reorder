@@ -147,6 +147,8 @@ public:
 		int dtc_batch_index{};
 		int select_fault_try{};
 		int visited_wire_count{};
+		vector<string> last_dtc_attempted_fault_ids;
+		vector<string> last_dtc_embedded_fault_ids;
 		AtpgStepResult step_result;
 	};
 

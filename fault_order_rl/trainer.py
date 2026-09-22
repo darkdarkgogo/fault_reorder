@@ -1,4 +1,4 @@
-"""Dynamic full-ranking actor-critic PPO training for fault reordering."""
+"""Dynamic BFS-filtered ranked-DTC actor-critic PPO training."""
 
 import copy
 import csv
@@ -19,16 +19,17 @@ from .checkpoint import (atomic_write, capture_rng, load_checkpoint, restore_rng
 from .data import _sha256, load_all_circuits, load_manifest
 from .environment import PROTOCOL_CONFIG, PodemEnvironment
 from .model import FaultActorCritic, build_dynamic_features
-from .policy import executed_prefix_stats, sample_ranking
+from .policy import (joint_action_stats, joint_action_stats_from_scores,
+                     sample_candidate_ranking, sample_primary)
 from .progress import progress, sample_progress
 from .reward import (compute_gae, normalize_advantages, ppo_objective,
                      step_reward, target_return, terminal_correction)
 
 
-POLICY_IDENTITY = "dynamic_ranked_dtc_actor_critic_ppo_v1"
+POLICY_IDENTITY = "dynamic_bfs_ranked_dtc_actor_critic_ppo_v2"
 SOLVER_PROTOCOL = {
     **PROTOCOL_CONFIG,
-    "compression_algorithm_version": "stuck_at_podemx_ranked_dtc_v2",
+    "compression_algorithm_version": "stuck_at_podemx_bfs_ranked_dtc_v3",
 }
 DEFAULT_VALIDATION_MANIFEST = (
     Path(__file__).resolve().parents[1] / "configs" / "anchor_validation_6.json"
@@ -129,7 +130,7 @@ def _evaluation_export(circuit, scores, order, decisions, trace, metrics):
     exit_steps = np.full(count, -1, dtype=np.int64)
     exit_reasons = np.full(count, "", dtype="<U32")
     for step_index, (decision, event) in enumerate(zip(decisions, trace)):
-        selected = decision["requested_rows"][0]
+        selected = decision["primary_row"]
         selected_steps[selected] = step_index
         selected_scores[selected] = event["selected_score"]
         before = set(decision["remaining_rows"])
@@ -145,7 +146,7 @@ def _evaluation_export(circuit, scores, order, decisions, trace, metrics):
         "ranks": ranks,
         "permutation": order,
         "selected_rows": np.asarray(
-            [decision["requested_rows"][0] for decision in decisions],
+            [decision["primary_row"] for decision in decisions],
             dtype=np.int64),
         "selected_scores": selected_scores,
         "selected_steps": selected_steps,
@@ -367,7 +368,7 @@ class Trainer:
                     step=step_number, selectable=len(ranking), primary=ranking[0],
                 )
             step_started = time.perf_counter()
-            session.step(ranking[0], ranking[1:])
+            session.step(ranking[0])
             if sampled:
                 progress(
                     "ATPG", "step done", circuit=circuit.name, mode=mode,
@@ -417,34 +418,59 @@ class Trainer:
                     "PODEM remaining fault is absent from embeddings") from exc
             features = build_dynamic_features(circuit.embeddings, rows)
             scores, value = model(features)
-            ranking_tensor = sample_ranking(
-                scores, rows, temperature, stochastic)
-            requested_rows = tuple(int(row) for row in ranking_tensor.tolist())
-            requested_ids = tuple(circuit.fault_ids[row] for row in requested_rows)
+            primary_row = int(sample_primary(
+                scores, rows, temperature, stochastic))
+            primary_id = circuit.fault_ids[primary_row]
+            def rank_batch(candidate_ids, _metadata):
+                try:
+                    candidate_rows = tuple(row_by_id[identifier]
+                                           for identifier in candidate_ids)
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "PODEM DTC candidate is absent from embeddings") from exc
+                if (primary_row in candidate_rows
+                        or not set(candidate_rows) <= set(rows) - {primary_row}):
+                    raise RuntimeError(
+                        "PODEM DTC candidate is outside the step-start remaining set")
+                ranking = sample_candidate_ranking(
+                    scores, rows, candidate_rows, temperature, stochastic)
+                return tuple(circuit.fault_ids[int(row)]
+                             for row in ranking.tolist())
             sampled = sample_progress(step_number, 5, 100)
             if sampled:
                 progress(
                     "ATPG", "step start", circuit=circuit.name, mode="policy",
-                    step=step_number, selectable=len(requested_ids),
-                    primary=requested_ids[0],
+                    step=step_number, selectable=len(rows),
+                    primary=primary_id,
                 )
             step_started = time.perf_counter()
-            step = session.step(requested_ids[0], requested_ids[1:])
+            step = session.step(primary_id, rank_batch)
             if sampled:
                 progress(
                     "ATPG", "step done", circuit=circuit.name, mode="policy",
                     step=step_number, remaining=len(session.remaining_fault_ids),
                     elapsed_s="{:.3f}".format(time.perf_counter() - step_started),
                 )
-            executed_ids = (requested_ids[0],) + tuple(
-                step["dtc_attempted_fault_ids"])
-            executed_rows = tuple(row_by_id[identifier]
-                                  for identifier in executed_ids)
+            dtc_batches = tuple({
+                "unknown_po_id": batch["unknown_po_id"],
+                "bfs_candidate_rows": tuple(
+                    row_by_id[identifier]
+                    for identifier in batch["bfs_candidate_fault_ids"]),
+                "requested_rows": tuple(
+                    row_by_id[identifier]
+                    for identifier in batch["requested_fault_ids"]),
+                "executed_prefix_rows": tuple(
+                    row_by_id[identifier]
+                    for identifier in batch["executed_prefix_fault_ids"]),
+                "embedded_rows": tuple(
+                    row_by_id[identifier]
+                    for identifier in batch["embedded_fault_ids"]),
+                "select_fault_try": batch["select_fault_try"],
+                "visited_wire_count": batch["visited_wire_count"],
+            } for batch in step["dtc_batches"])
             with torch.no_grad():
-                old_log_prob, entropy, replayed_value = executed_prefix_stats(
-                    model, circuit.embeddings, rows, executed_rows, temperature)
-            if not torch.allclose(value.detach(), replayed_value.detach()):
-                raise RuntimeError("actor-critic value changed within one decision")
+                old_log_prob, entropy, cached_value = joint_action_stats_from_scores(
+                    scores, value, rows, primary_row, dtc_batches, temperature)
             pattern_increment = step["current_pattern_count"] - previous_patterns
             newly_detected_eqv = sum(
                 eqv_by_id[identifier]
@@ -452,24 +478,23 @@ class Trainer:
             reward = step_reward(
                 pattern_increment, newly_detected_eqv, initial_eqv,
                 self.config.alpha)
-            selected_local = rows.index(requested_rows[0])
+            selected_local = rows.index(primary_row)
             decisions.append({
                 "remaining_rows": rows,
-                "requested_rows": requested_rows,
-                "executed_rows": executed_rows,
+                "primary_row": primary_row,
+                "dtc_batches": dtc_batches,
                 "old_log_prob": float(old_log_prob),
-                "old_value": float(replayed_value),
+                "old_value": float(cached_value),
                 "entropy": float(entropy),
                 "reward": reward,
                 "pattern_increment": pattern_increment,
                 "newly_detected_eqv": newly_detected_eqv,
             })
             trace.append({
-                "selected_fault_id": requested_ids[0],
-                "selected_row": requested_rows[0],
+                "selected_fault_id": primary_id,
+                "selected_row": primary_row,
                 "selected_score": float(scores[selected_local].detach()),
-                "requested_fault_ids": requested_ids,
-                "executed_fault_ids": executed_ids,
+                "dtc_batches": step["dtc_batches"],
                 "remaining_count": len(rows),
                 "remaining_ratio": len(rows) / circuit.fault_count,
                 "target_status": step["target_status"],
@@ -538,9 +563,10 @@ class Trainer:
         for epoch in range(self.config.ppo_epochs):
             new_log_probs, entropies, values = [], [], []
             for decision in decisions:
-                log_prob, entropy, value = executed_prefix_stats(
+                log_prob, entropy, value = joint_action_stats(
                     model, circuit.embeddings, decision["remaining_rows"],
-                    decision["executed_rows"], self.config.temperature)
+                    decision["primary_row"], decision["dtc_batches"],
+                    self.config.temperature)
                 new_log_probs.append(log_prob)
                 entropies.append(entropy)
                 values.append(value)
@@ -586,8 +612,8 @@ class Trainer:
                 first_rows = tuple(range(circuit.fault_count))
                 scores, _ = model(build_dynamic_features(
                     circuit.embeddings, first_rows))
-                order = sample_ranking(
-                    scores, first_rows, self.config.temperature,
+                order = sample_candidate_ranking(
+                    scores, first_rows, first_rows, self.config.temperature,
                     False).detach().cpu().numpy()
                 exports[circuit.name] = _evaluation_export(
                     circuit, scores, order, decisions, trace, metrics)
@@ -689,7 +715,7 @@ class Trainer:
         model = self.model if model is None else model
         optimizer = self.optimizer if optimizer is None else optimizer
         return {
-            "version": 4,
+            "version": 5,
             "kind": "latest",
             "run_id": self.run_id,
             "policy": POLICY_IDENTITY,
@@ -732,13 +758,39 @@ class Trainer:
         directory = self.output / "rounds" / "round-{:06d}".format(number)
         stem = directory / "circuit-{:06d}".format(index)
         arrays = {}
-        for key in ("remaining_rows", "requested_rows", "executed_rows"):
+        remaining_values, remaining_offsets = [], [0]
+        for decision in decisions:
+            remaining_values.extend(decision["remaining_rows"])
+            remaining_offsets.append(len(remaining_values))
+        arrays["remaining_rows"] = np.asarray(remaining_values, dtype=np.int64)
+        arrays["remaining_rows_offsets"] = np.asarray(
+            remaining_offsets, dtype=np.int64)
+        arrays["primary_rows"] = np.asarray(
+            [decision["primary_row"] for decision in decisions], dtype=np.int64)
+
+        batches = []
+        batch_step_offsets = [0]
+        for decision in decisions:
+            batches.extend(decision["dtc_batches"])
+            batch_step_offsets.append(len(batches))
+        arrays["dtc_batch_step_offsets"] = np.asarray(
+            batch_step_offsets, dtype=np.int64)
+        for output_name, batch_key in (
+                ("dtc_candidate_rows", "bfs_candidate_rows"),
+                ("dtc_requested_rows", "requested_rows"),
+                ("dtc_executed_rows", "executed_prefix_rows"),
+                ("dtc_embedded_rows", "embedded_rows")):
             values, offsets = [], [0]
-            for decision in decisions:
-                values.extend(decision[key])
+            for batch in batches:
+                values.extend(batch[batch_key])
                 offsets.append(len(values))
-            arrays[key] = np.asarray(values, dtype=np.int64)
-            arrays[key + "_offsets"] = np.asarray(offsets, dtype=np.int64)
+            arrays[output_name] = np.asarray(values, dtype=np.int64)
+            arrays[output_name + "_offsets"] = np.asarray(
+                offsets, dtype=np.int64)
+        arrays["dtc_select_fault_try"] = np.asarray(
+            [batch["select_fault_try"] for batch in batches], dtype=np.int64)
+        arrays["dtc_visited_wire_count"] = np.asarray(
+            [batch["visited_wire_count"] for batch in batches], dtype=np.int64)
         arrays["old_log_probs"] = np.asarray(
             [decision["old_log_prob"] for decision in decisions], dtype=np.float32)
         arrays["old_values"] = np.asarray(
