@@ -15,6 +15,10 @@
 Primary PODEM、PODEMX 回溯上限、fault simulation、STC、coverage guard、reward、PPO
 超参数和 checkpoint 提交边界等未在本文中明确修改的协议继续保持不变。
 
+本规范同时把原 TDF DTC 的 `select_fault_try` 搜索预算引入 stuck-at DTC，并把当前
+per-candidate 全 wire snapshot 回滚替换为基于已接受 PI cube 的确定性恢复。两项行为都
+属于新 solver protocol identity，不能与旧 checkpoint 混用。
+
 ## 目标
 
 恢复原始 DTC 的结构性候选筛选：只从当前值为 `U`（即 X）的 primary output 向前
@@ -76,6 +80,19 @@ Primary PODEM 返回 TRUE 后，不随机填充仍为 `U` 的 PI。C++ 按 `ckto
 4. 对 reconvergent 路径使用 visited-wire 集合，避免重复遍历；
 5. 对 fault ID 去重，第一次出现的位置决定 BFS 顺序。
 
+每个 unknown PO 使用独立的 `select_fault_try` wire-visit 预算。该预算统计从 FIFO
+`q_wire` 中实际出队并展开的 wire 数；达到预算后不再向更深层扩展，只保留预算内已经
+发现的 fault。第一版固定复用原 TDF 规则：
+
+```text
+ncktin <= 32  -> select_fault_try = 15
+ncktin > 32   -> select_fault_try = 100
+```
+
+预算在切换到下一个 unknown PO 时重置。`select_fault_try` 限制 BFS 展开，不限制已经
+形成的 candidate batch 中允许实际尝试的 fault 数。阈值 32、预算 15/100 和计数语义
+必须进入 solver protocol identity；任何变化都要求新的实验协议和 checkpoint。
+
 一个 fault 只有同时满足下列条件时才进入当前 batch：
 
 - 属于当前会话的 undetected/selectable fault catalog；
@@ -98,7 +115,12 @@ C++ 按返回顺序尝试 secondary fault：
 - 成功时保留新增 PI 约束，并继续保证 Primary 和先前已接受 secondary 可检测；
 - 失败或达到回溯上限时完整回滚本次尝试；
 - 无论成功或失败，已执行的 fault 都加入本 Primary 的 attempted set；
-- 当前 unknown PO 变为已知后，立即停止当前 ranking，未执行尾部不计入动作；
+- 每完成一个 secondary fault，无论 PODEMX 返回 TRUE、FALSE 或 MAYBE，都先把 solver
+  恢复到当前已接受 PI cube 的无故障 good-circuit 状态，再检查目标 PO；
+- 如果目标 PO 不再为 `U`，立即停止当前 ranking，未执行尾部不计入动作；
+- PODEMX 成功但目标 PO 仍为 `U` 时，保留该 secondary 新增的合法约束，并继续尝试
+  当前 ranking 的下一个 fault；
+- PODEMX 失败时先完成状态等价回滚，再确认目标 PO 仍为 `U`，然后继续；
 - ranking 耗尽而 PO 仍未知时，跳过该 PO 并继续查找下一个 unknown PO；
 - test cube 改变后，下一批候选必须重新执行 BFS，不得复用旧候选集合。
 
@@ -119,6 +141,7 @@ cktout order
 -> gate fan-in order
 -> wire udflist order
 -> first occurrence after de-duplication
+-> stop expansion at select_fault_try
 ```
 
 Native baseline 和 RL 必须共享候选发现、PODEMX、回滚、preserved-fault 检查、随机填充
@@ -226,7 +249,8 @@ dtc_batch_index
 - 只允许在等待当前 DTC batch 排名时调用；
 - 输入必须恰好是当前暴露候选列表的 permutation；
 - 验证失败不得改变 test cube、attempted set、metrics 或 phase，调用方可以修正后重试；
-- 按输入顺序执行，直到当前 PO 已知或 ranking 耗尽；
+- 按输入顺序执行；每完成一个 fault 都在 canonical good-circuit cube 上检查当前 PO，
+  直到 PO 已知或 ranking 耗尽；
 - 自动寻找下一个可用 BFS batch；有新 batch 时返回 `phase="dtc"`；
 - 没有后续 batch 时填充未知 PI、执行一次 fault simulation 并返回
   `phase="complete"` 的完整 step result。
@@ -299,6 +323,39 @@ attempted 去重使用独立 session-step 集合；step 完成后销毁。失败
 value、assigned、changed 和 scheduled 状态。成功尝试保留 cube 约束，但不能直接从
 remaining set 删除 fault。
 
+### 固定采用的优化回滚
+
+实现不得继续使用当前 `saf_compaction.cpp` 中每个 candidate 开始前复制全部
+`sort_wlist` value/assigned/changed/scheduled 的 `vector<Snapshot>`。本次修改必须同时
+删除这条 per-candidate full-wire snapshot 路径。
+
+回滚采用与 TDF `tdf_podemx_secondary()` 同类的“已接受 PI cube + 重新 implication”方案：
+
+1. Primary 成功后保存 canonical good-value PI cube，作为第一个 accepted cube；
+2. 每个 secondary 搜索只在该 cube 中仍为 `U` 的 PI 上建立本地 decision stack；
+3. 搜索期间的 decision PI、backtrack flag 和 propagate-tree mark 都由 candidate-local
+   容器跟踪；
+4. candidate 失败或达到回溯上限时，清除本地 decision/backtrack/mark 状态，恢复
+   accepted PI cube；
+5. 把内部逻辑恢复到确定的无故障状态，标记恢复后发生变化的 PI，并执行一次正常逻辑
+   implication，使所有 wire value、changed 和 scheduled 标志达到 canonical good-circuit
+   状态；
+6. candidate 成功时，先验证 Primary 和此前 accepted secondary 仍可检测，再把当前 PI
+   赋值规范化为 good values，并提交为新的 accepted PI cube；
+7. 每次 preserved-fault 检查使用临时 fault injection，检查结束后必须回到 accepted
+   good-circuit cube，不能把最后一个被注入 fault 的 D/D-bar 状态留给 PO 检查或下一次 BFS。
+
+允许恢复过程线性扫描内部 wires 以清除 fault-injection 残留并重新 implication，但禁止为
+每个 candidate 同时保存和恢复全部 wire 状态。持久 checkpoint 的大小为 O(number_of_PIs)，
+candidate-local decision/mark 日志大小为 O(actual_search_changes)。这比当前“尝试前复制全
+电路、失败后再复制回去”的两次全状态搬运少，并与 TDF 通过 PI 恢复后重新 `sim()` 的方向
+一致。
+
+“完整回滚”在本文中只表示 observable solver state 等价，不表示保留 full-wire snapshot。
+状态等价至少包括：accepted PI cube、无故障内部 wire values、所有 transient changed/
+scheduled/backtrack flags、propagate-tree marks、preserved faults 和累计 metrics。失败尝试
+除 backtrack/call 统计外不能留下其他可观察副作用。
+
 ## Checkpoint 与协议版本
 
 新 action mask、joint probability 和 trajectory schema 与现有“完整 remaining ranking”
@@ -306,6 +363,8 @@ checkpoint 不兼容。实现必须：
 
 - 提升 checkpoint schema；
 - 把 solver protocol identity 改为新的 BFS-filtered ranked-DTC 版本；
+- 在 protocol identity 中固定 `select_fault_try` 的阈值、预算和计数语义，以及 PI-cube
+  rollback algorithm version；
 - 拒绝恢复旧 schema 或旧 solver protocol 的 optimizer、baseline、EMA 与 RNG 状态；
 - 要求从头训练，不能静默迁移旧 PPO 轨迹或 checkpoint。
 
@@ -320,6 +379,7 @@ checkpoint 不兼容。实现必须：
 Primary ID
 unknown PO ID
 BFS candidate count
+select_fault_try budget / visited wire count
 attempted prefix count
 embedded count
 DTC backtracks
@@ -358,12 +418,19 @@ total_backtracks = primary_backtracks + dtc_backtracks
 ### C++ 与 binding
 
 - unknown PO 反向 BFS 只遍历 `U` fan-in cone；cone 外 fault 不返回、不尝试；
+- 小输入电路每个 PO 最多展开 15 个 wires，大输入电路最多展开 100 个 wires，切换 PO
+  后预算正确重置；
 - BFS 顺序对固定网表稳定，并正确处理 reconvergence 与重复 `udflist` fault；
 - heuristic 按 BFS 顺序执行；反向 RL ranking 只改变候选内部顺序；
-- 当前 PO 被填充后停止当前 ranking，attempted IDs 是连续前缀；
+- 每完成一个 candidate 都在恢复后的 good-circuit cube 上检查目标 PO；PO 不再为 `U`
+  时立即停止当前 ranking，attempted IDs 是连续前缀；
 - 下一 unknown PO 使用修改后的 cube 重新 BFS；
 - 同一 fault 在一个 Primary 内不重复尝试；
-- candidate 失败完整回滚，成功继续保持 Primary 与已接受 secondary；
+- candidate 失败通过 accepted PI cube + implication 完成状态等价回滚，成功继续保持
+  Primary 与已接受 secondary；
+- 测试证明回滚前后的 canonical solver state 相同，并确认实现不再构造 per-candidate
+  full-wire `Snapshot`；
+- preserved-fault 注入检查结束后重新建立 good-circuit 状态，PO/BFS 不读取残留 D/D-bar；
 - 无候选、DTC disabled、Primary FALSE 和 Primary MAYBE 均正确完成 step；
 - 非法 permutation 和错误 phase 在任何状态修改前失败；
 - legacy heuristic convenience path 与显式 BFS-order state machine 结果一致。
@@ -394,11 +461,16 @@ total_backtracks = primary_backtracks + dtc_backtracks
 
 1. DTC 不再遍历全部 non-primary remaining faults。
 2. 每个 attempted secondary 都来自当时 unknown PO 的反向 `U`-cone BFS 候选集合。
-3. Heuristic 严格使用稳定 BFS 顺序。
-4. RL 每个 primary step 只执行一次模型 forward。
-5. RL 的每个 DTC batch 只复用该次 Primary scores 进行候选内排序。
-6. test cube 改变或进入下一 unknown PO 后重新 BFS，但不重新打分。
-7. PPO joint probability 只包含 Primary 和真实执行的各 batch 前缀。
-8. 旧 full-remaining-ranking checkpoint 不能恢复。
-9. coverage、pattern、fault status、calls 和 backtracks 指标保持可审计且一致。
-10. 单元测试、Python 测试和至少一个真实 binding 集成测试全部通过。
+3. 每个 unknown PO 的 BFS 严格执行 TDF 同源的 `select_fault_try` 15/100 预算。
+4. Heuristic 严格使用预算内的稳定 BFS 顺序。
+5. RL 每个 primary step 只执行一次模型 forward。
+6. RL 的每个 DTC batch 只复用该次 Primary scores 进行候选内排序。
+7. 每完成一个 secondary 都恢复 canonical good-circuit 状态并立即检查目标 PO；PO 已知
+   时停止当前 ranking。
+8. test cube 改变或进入下一 unknown PO 后重新 BFS，但不重新打分。
+9. PPO joint probability 只包含 Primary 和真实执行的各 batch 前缀。
+10. per-candidate full-wire snapshot 已删除，失败通过 accepted PI cube + implication 完成
+    状态等价回滚。
+11. 旧 full-remaining-ranking checkpoint 不能恢复。
+12. coverage、pattern、fault status、calls 和 backtracks 指标保持可审计且一致。
+13. 单元测试、Python 测试和至少一个真实 binding 集成测试全部通过。
