@@ -96,6 +96,8 @@ ncktin > 32   -> select_fault_try = 100
 一个 fault 只有同时满足下列条件时才进入当前 batch：
 
 - 属于当前会话的 undetected/selectable fault catalog；
+- `wire->udflist` 只是会话开始时建立的稳定结构索引；fault simulation 已经设置
+  `detect == TRUE` 并从 `flist_undetect` drop 的 stale entry 必须在候选发现时排除；
 - 不是本步 Primary；
 - 尚未被标记为 `test_tried`；
 - 当前状态不是 `REDUNDANT`；
@@ -104,6 +106,11 @@ ncktin > 32   -> select_fault_try = 100
 
 这里的“候选”表示结构上允许尝试，不表示 PODEMX 一定成功。可检测性仍由真实
 `stuck_at_podemx_secondary()` 搜索决定。
+
+候选资格必须在每个 Primary 上相对于当时的 remaining set 重新成立。前一个 pattern
+已经检测的 fault 不得在后续 Primary 的任何 BFS batch 中再次出现；Python 的
+`candidate_ids subseteq F_t - {primary}` 校验是这一 native 不变量的边界保护，不能替代
+C++ 过滤。
 
 ### Batch 生命周期
 

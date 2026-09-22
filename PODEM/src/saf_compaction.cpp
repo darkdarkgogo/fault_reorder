@@ -149,7 +149,7 @@ bool ATPG::find_next_stuck_at_dtc_batch(DtcBatchState &batch)
 			{
 				const string identifier = fault_identifier(fault);
 				if (fault == stuck_at_active_primary || fault->test_tried ||
-					fault->detect == REDUNDANT ||
+					fault->detect == TRUE || fault->detect == REDUNDANT ||
 					stuck_at_attempted_ids.find(identifier) != stuck_at_attempted_ids.end())
 					continue;
 				if (candidate_ids.insert(identifier).second)

@@ -335,6 +335,29 @@ class FaultMappingTests(unittest.TestCase):
         self.assertEqual(next_step["total_backtracks"],
                          next_step["primary_backtracks"] + next_step["dtc_backtracks"])
 
+    def test_stale_detected_faults_do_not_reenter_later_dtc_batches(self):
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\n"
+            "OUTPUT(x)\nOUTPUT(q1)\nOUTPUT(q2)\nOUTPUT(r)\n"
+            "x = BUF(a)\nq1 = BUF(b)\nq2 = BUF(b)\nr = BUF(c)\n"
+        )
+        self.keep_dtc_faults(fault_map, [
+            "x:GO:sa0", "q1:GO:sa0", "q2:GO:sa0",
+            "r:GO:sa0", "r:GO:sa1",
+        ])
+        session = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), stc_enabled=False)
+        first = session.step("x:GO:sa0")
+        detected = set(first["newly_detected_fault_ids"])
+        self.assertIn("q2:GO:sa0", detected)
+        self.assertNotIn("q2:GO:sa0", first["dtc_attempted_fault_ids"])
+
+        state = session.begin_step("r:GO:sa1")
+        while state["phase"] == "dtc":
+            candidates = list(state["dtc_candidate_fault_ids"])
+            self.assertFalse(detected.intersection(candidates))
+            state = session.rank_dtc_candidates(candidates)
+
     def test_failed_stuck_at_dtc_attempt_restores_primary_cube(self):
         binary, fault_map = self.make_dtc_fixture(failure_only=True)
         for seed in (0, 1, 14, 99):
