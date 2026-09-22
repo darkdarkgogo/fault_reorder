@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstdio>
 #include <mutex>
 
 #include <pybind11/pybind11.h>
@@ -88,8 +90,13 @@ StuckAtProtocolConfig make_protocol_config(
 py::dict catalog_stuck_at(const std::string &circuit_path,
                           const std::string &fault_map_path) {
   ATPG atpg;
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point catalog_started = Clock::now();
   atpg.detected_num = 1;
   atpg.set_fault_map_path(fault_map_path);
+
+  std::vector<ATPG::FaultCatalogEntry> catalog;
+  int uncollapsed_total = 0;
 
   {
     py::gil_scoped_release release;
@@ -98,10 +105,40 @@ py::dict catalog_stuck_at(const std::string &circuit_path,
     atpg.rearrange_gate_inputs();
     atpg.create_dummy_gate();
     atpg.generate_fault_list();
+    std::fflush(stdout);
+    std::fprintf(
+        stderr,
+        "[LOAD][CATALOG] fault_list done circuit=%s elapsed_s=%.3f\n",
+        circuit_path.c_str(),
+        std::chrono::duration<double>(Clock::now() - catalog_started).count());
+    std::fflush(stderr);
+
+    const Clock::time_point copy_started = Clock::now();
+    std::fprintf(stderr, "[LOAD][CATALOG] get_fault_catalog start circuit=%s\n",
+                 circuit_path.c_str());
+    std::fflush(stderr);
+    catalog = atpg.get_fault_catalog();
+    uncollapsed_total = atpg.get_uncollapsed_fault_count();
+    std::fprintf(
+        stderr,
+        "[LOAD][CATALOG] get_fault_catalog done circuit=%s faults=%zu elapsed_s=%.3f\n",
+        circuit_path.c_str(), catalog.size(),
+        std::chrono::duration<double>(Clock::now() - copy_started).count());
+    std::fflush(stderr);
   }
 
-  return catalog_to_dict(
-      atpg.get_fault_catalog(), atpg.get_uncollapsed_fault_count());
+  const Clock::time_point dict_started = Clock::now();
+  std::fprintf(stderr, "[LOAD][CATALOG] catalog_to_dict start circuit=%s faults=%zu\n",
+               circuit_path.c_str(), catalog.size());
+  std::fflush(stderr);
+  py::dict result = catalog_to_dict(catalog, uncollapsed_total);
+  std::fprintf(
+      stderr,
+      "[LOAD][CATALOG] catalog_to_dict done circuit=%s faults=%zu elapsed_s=%.3f\n",
+      circuit_path.c_str(), catalog.size(),
+      std::chrono::duration<double>(Clock::now() - dict_started).count());
+  std::fflush(stderr);
+  return result;
 }
 
 py::dict run_stuck_at_ordered(const std::string &circuit_path,
@@ -123,6 +160,7 @@ py::dict run_stuck_at_ordered(const std::string &circuit_path,
     atpg.rearrange_gate_inputs();
     atpg.create_dummy_gate();
     atpg.generate_fault_list();
+    std::fflush(stdout);
     atpg.reorder_stuck_at_faults(ordered_fault_ids);
     summary = atpg.run_stuck_at(false);
   }
@@ -147,6 +185,7 @@ public:
     atpg_.rearrange_gate_inputs();
     atpg_.create_dummy_gate();
     atpg_.generate_fault_list();
+    std::fflush(stdout);
     catalog_ = atpg_.get_fault_catalog();
     uncollapsed_total_ = atpg_.get_uncollapsed_fault_count();
   }

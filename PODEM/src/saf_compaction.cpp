@@ -1,5 +1,7 @@
 #include "atpg.h"
 
+#include <chrono>
+#include <cstdio>
 #include <unordered_map>
 
 namespace {
@@ -118,9 +120,29 @@ ATPG::DtcResult ATPG::run_stuck_at_dtc(
 	}
 	if (candidates.size() != selectable_by_id.size())
 		throw runtime_error("Ranked DTC candidates do not cover the selectable secondaries");
+	using Clock = std::chrono::steady_clock;
+	const Clock::time_point dtc_started = Clock::now();
+	fprintf(
+		stderr,
+		"[ATPG][DTC] start primary=%s candidates=%zu backtrack_limit=%d\n",
+		fault_identifier(primary).c_str(), candidates.size(), podemx_backtrack_limit);
+	fflush(stderr);
 	vector<fptr> preserved{primary};
-	for (fptr secondary : candidates)
+	for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
 	{
+		fptr secondary = candidates[candidate_index];
+		const size_t candidate_number = candidate_index + 1;
+		const bool log_candidate = candidate_number <= 5 || candidate_number % 1000 == 0;
+		const Clock::time_point candidate_started = Clock::now();
+		if (log_candidate)
+		{
+			fprintf(
+				stderr,
+				"[ATPG][DTC] candidate begin primary=%s candidate=%s index=%zu total=%zu\n",
+				fault_identifier(primary).c_str(), fault_identifier(secondary).c_str(),
+				candidate_number, candidates.size());
+			fflush(stderr);
+		}
 		struct Snapshot { int value; bool assigned; bool assigned_v2; bool changed; bool scheduled; };
 		vector<Snapshot> snapshot;
 		for (wptr wire : sort_wlist)
@@ -166,7 +188,25 @@ ATPG::DtcResult ATPG::run_stuck_at_dtc(
 				if (saved.scheduled) wire->set_scheduled();
 			}
 		}
+		if (log_candidate)
+		{
+			fprintf(
+				stderr,
+				"[ATPG][DTC] candidate done primary=%s candidate=%s index=%zu total=%zu embedded=%s backtracks=%d elapsed_s=%.3f\n",
+				fault_identifier(primary).c_str(), fault_identifier(secondary).c_str(),
+				candidate_number, candidates.size(), embedded ? "true" : "false",
+				backtracks,
+				std::chrono::duration<double>(Clock::now() - candidate_started).count());
+			fflush(stderr);
+		}
 	}
+	fprintf(
+		stderr,
+		"[ATPG][DTC] done primary=%s attempted=%d embedded=%zu backtracks=%d elapsed_s=%.3f\n",
+		fault_identifier(primary).c_str(), result.secondary_calls,
+		result.embedded_fault_ids.size(), result.backtracks,
+		std::chrono::duration<double>(Clock::now() - dtc_started).count());
+	fflush(stderr);
 	return result;
 }
 

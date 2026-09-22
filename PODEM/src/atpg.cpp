@@ -7,6 +7,8 @@
 
 #include "atpg.h"
 
+#include <chrono>
+#include <cstdio>
 #include <unordered_set>
 
 void ATPG::configure_ordered_stuck_at(const StuckAtProtocolConfig &config)
@@ -173,7 +175,24 @@ ATPG::AtpgStepResult ATPG::step_stuck_at(
 	AtpgStepResult step;
 	step.selected_fault_id = fault_id;
 	int current_backtracks = 0;
+	using Clock = std::chrono::steady_clock;
+	const Clock::time_point primary_started = Clock::now();
+	fprintf(
+		stderr,
+		"[ATPG][PRIMARY] start fault=%s selectable=%zu backtrack_limit=%d\n",
+		fault_id.c_str(), selectable_ids.size(), backtrack_limit);
+	fflush(stderr);
 	const int podem_result = podem(fault_under_test, current_backtracks);
+	const char *primary_status =
+		podem_result == TRUE ? "detected" :
+		podem_result == FALSE ? "redundant" :
+		podem_result == MAYBE ? "aborted" : "unsupported";
+	fprintf(
+		stderr,
+		"[ATPG][PRIMARY] done fault=%s status=%s backtracks=%d elapsed_s=%.3f\n",
+		fault_id.c_str(), primary_status, current_backtracks,
+		std::chrono::duration<double>(Clock::now() - primary_started).count());
+	fflush(stderr);
 	switch (podem_result)
 	{
 		case TRUE:

@@ -5,12 +5,15 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import time
 
 import numpy as np
 import torch
 
 from fault_embedding.circuit import build_graph, read_bench
 from fault_embedding.inference import OFFICIAL_CHECKPOINT_SHA256, OFFICIAL_SOURCE_SHA256
+
+from .progress import progress
 
 
 def _sha256(path):
@@ -213,6 +216,36 @@ def load_all_circuits(manifest, environment):
                 raise ValueError("missing circuit artifact: {}".format(path))
     circuits = []
     for spec in manifest.circuits:
-        catalog = environment.catalog(spec.bench_path, spec.faultmap_path)
-        circuits.append(load_circuit_data(spec, catalog))
+        started = time.perf_counter()
+        progress("LOAD", "catalog start", circuit=spec.name)
+        try:
+            catalog = environment.catalog(spec.bench_path, spec.faultmap_path)
+        except Exception as exc:
+            progress(
+                "LOAD", "catalog error", circuit=spec.name,
+                error_type=type(exc).__name__, error=str(exc),
+                elapsed_s="{:.3f}".format(time.perf_counter() - started),
+            )
+            raise
+        progress(
+            "LOAD", "catalog done", circuit=spec.name,
+            elapsed_s="{:.3f}".format(time.perf_counter() - started),
+        )
+
+        started = time.perf_counter()
+        progress("LOAD", "validation start", circuit=spec.name)
+        try:
+            circuit = load_circuit_data(spec, catalog)
+        except Exception as exc:
+            progress(
+                "LOAD", "validation error", circuit=spec.name,
+                error_type=type(exc).__name__, error=str(exc),
+                elapsed_s="{:.3f}".format(time.perf_counter() - started),
+            )
+            raise
+        progress(
+            "LOAD", "validation done", circuit=spec.name,
+            elapsed_s="{:.3f}".format(time.perf_counter() - started),
+        )
+        circuits.append(circuit)
     return circuits

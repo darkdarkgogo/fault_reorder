@@ -20,6 +20,7 @@ from .data import _sha256, load_all_circuits, load_manifest
 from .environment import PROTOCOL_CONFIG, PodemEnvironment
 from .model import FaultActorCritic, build_dynamic_features
 from .policy import executed_prefix_stats, sample_ranking
+from .progress import progress, sample_progress
 from .reward import (compute_gae, normalize_advantages, ppo_objective,
                      step_reward, target_return, terminal_correction)
 
@@ -248,14 +249,26 @@ class Trainer:
         self = cls(manifest, config, output, environment, validation_manifest,
                    validation_environment)
         for circuit in self.circuits:
-            metrics, _ = self._run_native(circuit, self.environment)
+            progress("BASELINE", "start", split="train", circuit=circuit.name)
+            metrics, elapsed = self._run_native(
+                circuit, self.environment, "baseline-train")
+            progress(
+                "BASELINE", "done", split="train", circuit=circuit.name,
+                elapsed_s="{:.3f}".format(elapsed),
+            )
             self.native_metrics[circuit.name] = metrics
             self.states[circuit.name] = {
                 "native_covered_equivalent_faults": metrics[
                     "covered_equivalent_faults"]
             }
         for circuit in self.validation_circuits:
-            metrics, _ = self._run_native(circuit, self.validation_environment)
+            progress("BASELINE", "start", split="validation", circuit=circuit.name)
+            metrics, elapsed = self._run_native(
+                circuit, self.validation_environment, "baseline-validation")
+            progress(
+                "BASELINE", "done", split="validation", circuit=circuit.name,
+                elapsed_s="{:.3f}".format(elapsed),
+            )
             self.validation_native_metrics[circuit.name] = metrics
             self.validation_states[circuit.name] = {
                 "native_covered_equivalent_faults": metrics[
@@ -332,14 +345,43 @@ class Trainer:
         if result["patterns_after_stc"] > result["uncollapsed_faults"]:
             raise RuntimeError("PODEM pattern count exceeds initial equivalent faults")
 
-    def _run_native(self, circuit, environment):
+    def _run_native(self, circuit, environment, mode="baseline"):
         start = time.perf_counter()
+        session_started = time.perf_counter()
+        progress("NATIVE", "session start", circuit=circuit.name, mode=mode)
         session = environment.start_session(
             circuit.spec.bench_path, circuit.spec.faultmap_path)
+        progress(
+            "NATIVE", "session ready", circuit=circuit.name, mode=mode,
+            selectable=len(session.remaining_fault_ids),
+            elapsed_s="{:.3f}".format(time.perf_counter() - session_started),
+        )
+        step_number = 0
         while session.remaining_fault_ids:
+            step_number += 1
             ranking = tuple(session.remaining_fault_ids)
+            sampled = sample_progress(step_number, 5, 100)
+            if sampled:
+                progress(
+                    "ATPG", "step start", circuit=circuit.name, mode=mode,
+                    step=step_number, selectable=len(ranking), primary=ranking[0],
+                )
+            step_started = time.perf_counter()
             session.step(ranking[0], ranking[1:])
+            if sampled:
+                progress(
+                    "ATPG", "step done", circuit=circuit.name, mode=mode,
+                    step=step_number, remaining=len(session.remaining_fault_ids),
+                    elapsed_s="{:.3f}".format(time.perf_counter() - step_started),
+                )
+        finalize_started = time.perf_counter()
+        progress("STC", "finalize start", circuit=circuit.name, mode=mode)
         result = session.finish()
+        progress(
+            "STC", "finalize done", circuit=circuit.name, mode=mode,
+            patterns=result.get("patterns_after_stc", result.get("pattern_count", "unknown")),
+            elapsed_s="{:.3f}".format(time.perf_counter() - finalize_started),
+        )
         self._check_result(circuit, result)
         return result, time.perf_counter() - start
 
@@ -347,8 +389,15 @@ class Trainer:
                     environment=None):
         environment = environment or self.environment
         start = time.perf_counter()
+        session_started = time.perf_counter()
+        progress("NATIVE", "session start", circuit=circuit.name, mode="policy")
         session = environment.start_session(
             circuit.spec.bench_path, circuit.spec.faultmap_path)
+        progress(
+            "NATIVE", "session ready", circuit=circuit.name, mode="policy",
+            selectable=len(session.remaining_fault_ids),
+            elapsed_s="{:.3f}".format(time.perf_counter() - session_started),
+        )
         row_by_id = {
             identifier: row for row, identifier in enumerate(circuit.fault_ids)}
         eqv_by_id = {
@@ -357,7 +406,9 @@ class Trainer:
         initial_eqv = int(circuit.eqv_fault_nums.sum())
         previous_patterns = 0
         decisions, trace = [], []
+        step_number = 0
         while session.remaining_fault_ids:
+            step_number += 1
             try:
                 rows = tuple(row_by_id[identifier]
                              for identifier in session.remaining_fault_ids)
@@ -370,7 +421,21 @@ class Trainer:
                 scores, rows, temperature, stochastic)
             requested_rows = tuple(int(row) for row in ranking_tensor.tolist())
             requested_ids = tuple(circuit.fault_ids[row] for row in requested_rows)
+            sampled = sample_progress(step_number, 5, 100)
+            if sampled:
+                progress(
+                    "ATPG", "step start", circuit=circuit.name, mode="policy",
+                    step=step_number, selectable=len(requested_ids),
+                    primary=requested_ids[0],
+                )
+            step_started = time.perf_counter()
             step = session.step(requested_ids[0], requested_ids[1:])
+            if sampled:
+                progress(
+                    "ATPG", "step done", circuit=circuit.name, mode="policy",
+                    step=step_number, remaining=len(session.remaining_fault_ids),
+                    elapsed_s="{:.3f}".format(time.perf_counter() - step_started),
+                )
             executed_ids = (requested_ids[0],) + tuple(
                 step["dtc_attempted_fault_ids"])
             executed_rows = tuple(row_by_id[identifier]
@@ -423,7 +488,14 @@ class Trainer:
                 "current_pattern_count": step["current_pattern_count"],
             })
             previous_patterns = step["current_pattern_count"]
+        finalize_started = time.perf_counter()
+        progress("STC", "finalize start", circuit=circuit.name, mode="policy")
         result = session.finish()
+        progress(
+            "STC", "finalize done", circuit=circuit.name, mode="policy",
+            patterns=result.get("patterns_after_stc", result.get("pattern_count", "unknown")),
+            elapsed_s="{:.3f}".format(time.perf_counter() - finalize_started),
+        )
         self._check_result(circuit, result)
         return result, time.perf_counter() - start, decisions, trace
 
