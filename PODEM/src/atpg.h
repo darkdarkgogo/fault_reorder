@@ -271,6 +271,8 @@ private:
 	void fill_stuck_at_primary_cube();
 	AtpgStepResult complete_stuck_at_step();
 	void reset_stuck_at_active_step();
+	StuckAtPhaseResult begin_stuck_at_step_impl(
+		const string &fault_id, bool expose_ranked_dtc);
 
 	/* used in input.cpp to parse circuit*/
 	int debug;				 /* != 0 if debugging;  this is a switch of debug mode */
@@ -389,6 +391,9 @@ private:
 		int visited_wire_count{};
 	};
 	bool find_next_stuck_at_dtc_batch(DtcBatchState &batch);
+	bool eligible_stuck_at_dtc_secondary(fptr fault) const;
+	bool attempt_stuck_at_dtc_secondary(fptr secondary, wptr unknown_po);
+	void run_stuck_at_lazy_dtc();
 	void restore_stuck_at_good_cube(const vector<int> &accepted_pi_cube);
 	int stuck_at_podemx_secondary(fptr fault, int &backtracks);
 	bool stuck_at_cube_detects(fptr fault);

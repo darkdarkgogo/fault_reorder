@@ -63,8 +63,11 @@ remaining set F_t
   -> fault simulation
 ```
 
-Heuristic baseline 将每个 batch 的 BFS 顺序原样提交。RL 训练时只在当前 batch 内按
-Plackett-Luce 分布采样；确定性评估按缓存 score 降序，同分按 catalog row 升序。
+Heuristic/native baseline 不提交完整 batch，而是复用原 TDF 的 lazy `q_wire`/`q_fault`
+流程：`q_fault` 为空时才展开下一个 `U` wire，发现 eligible faults 后立即逐个尝试。
+`StuckAtSession.step()` 与 `run_stuck_at_ordered()` 都使用这条 baseline 路径。RL 训练
+仍先取得预算内完整 batch，再在该 batch 内按 Plackett-Luce 分布采样；确定性评估按
+缓存 score 降序，同分按 catalog row 升序。
 
 每次 secondary 尝试完成后，无论 TRUE、FALSE 或 MAYBE，都恢复 accepted PI cube，
 重新建立 canonical good-circuit implication，再检查目标 PO。PO 不再为 `U` 时立即停止

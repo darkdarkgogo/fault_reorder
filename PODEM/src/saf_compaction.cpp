@@ -119,6 +119,50 @@ int ATPG::stuck_at_podemx_secondary(fptr fault, int &backtracks)
 	return status;
 }
 
+bool ATPG::eligible_stuck_at_dtc_secondary(fptr fault) const
+{
+	if (fault == stuck_at_active_primary || fault->test_tried ||
+		fault->detect == TRUE || fault->detect == REDUNDANT)
+		return false;
+	return stuck_at_attempted_ids.find(fault_identifier(fault)) ==
+		stuck_at_attempted_ids.end();
+}
+
+bool ATPG::attempt_stuck_at_dtc_secondary(fptr secondary, wptr unknown_po)
+{
+	const string identifier = fault_identifier(secondary);
+	if (!stuck_at_attempted_ids.insert(identifier).second)
+		throw runtime_error("A stuck-at DTC secondary was attempted more than once");
+	stuck_at_active_step.dtc_attempted_fault_ids.push_back(identifier);
+	++stuck_at_active_dtc_calls;
+	int backtracks = 0;
+	bool embedded = stuck_at_podemx_secondary(secondary, backtracks) == TRUE;
+	stuck_at_active_dtc_backtracks += backtracks;
+	vector<int> proposed_cube;
+	for (wptr wire : cktin)
+		proposed_cube.push_back(good_value(wire->value));
+	if (embedded)
+	{
+		for (fptr preserved : stuck_at_preserved_faults)
+		{
+			restore_stuck_at_good_cube(proposed_cube);
+			if (!stuck_at_cube_detects(preserved))
+			{
+				embedded = false;
+				break;
+			}
+		}
+	}
+	if (embedded)
+	{
+		stuck_at_accepted_pi_cube = proposed_cube;
+		stuck_at_preserved_faults.push_back(secondary);
+		stuck_at_active_step.dtc_embedded_fault_ids.push_back(identifier);
+	}
+	restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);
+	return unknown_po->value != U;
+}
+
 bool ATPG::find_next_stuck_at_dtc_batch(DtcBatchState &batch)
 {
 	if (stuck_at_step_phase != StuckAtStepPhase::awaiting_dtc_order)
@@ -148,9 +192,7 @@ bool ATPG::find_next_stuck_at_dtc_batch(DtcBatchState &batch)
 			for (fptr fault : wire->udflist)
 			{
 				const string identifier = fault_identifier(fault);
-				if (fault == stuck_at_active_primary || fault->test_tried ||
-					fault->detect == TRUE || fault->detect == REDUNDANT ||
-					stuck_at_attempted_ids.find(identifier) != stuck_at_attempted_ids.end())
+				if (!eligible_stuck_at_dtc_secondary(fault))
 					continue;
 				if (candidate_ids.insert(identifier).second)
 					candidates.push_back(fault);
@@ -171,6 +213,66 @@ bool ATPG::find_next_stuck_at_dtc_batch(DtcBatchState &batch)
 		}
 	}
 	return false;
+}
+
+void ATPG::run_stuck_at_lazy_dtc()
+{
+	const int budget = static_cast<int>(cktin.size()) <=
+		stuck_at_protocol_config.dtc_bfs_small_input_threshold
+		? stuck_at_protocol_config.dtc_bfs_small_select_fault_try
+		: stuck_at_protocol_config.dtc_bfs_default_select_fault_try;
+	for (wptr unknown_po : cktout)
+	{
+		if (unknown_po->value != U)
+			continue;
+		queue<wptr> q_wire;
+		queue<fptr> q_fault;
+		unordered_set<wptr> visited_wires;
+		unordered_set<string> queued_fault_ids;
+		q_wire.push(unknown_po);
+		int expanded_wires = 0;
+		stuck_at_active_unknown_po = unknown_po;
+		stuck_at_active_select_fault_try = budget;
+		while (unknown_po->value == U)
+		{
+			// This is the original TDF lazy boundary: BFS advances only when
+			// every fault found at the already-expanded wires has been tried.
+			while (q_fault.empty() && expanded_wires < budget)
+			{
+				if (q_wire.empty())
+					break;
+				wptr wire = q_wire.front();
+				q_wire.pop();
+				if (!visited_wires.insert(wire).second || wire->value != U)
+					continue;
+				++expanded_wires;
+				if (!wire->inode.empty())
+				{
+					for (wptr input : wire->inode.front()->iwire)
+					{
+						if (input->value == U &&
+							visited_wires.find(input) == visited_wires.end())
+							q_wire.push(input);
+					}
+				}
+				for (fptr fault : wire->udflist)
+				{
+					const string identifier = fault_identifier(fault);
+					if (eligible_stuck_at_dtc_secondary(fault) &&
+						queued_fault_ids.insert(identifier).second)
+						q_fault.push(fault);
+				}
+			}
+			if (q_fault.empty())
+				break;
+			fptr secondary = q_fault.front();
+			q_fault.pop();
+			if (attempt_stuck_at_dtc_secondary(secondary, unknown_po))
+				break;
+		}
+		stuck_at_active_visited_wire_count = expanded_wires;
+	}
+	stuck_at_active_unknown_po = nullptr;
 }
 
 ATPG::StuckAtPhaseResult ATPG::make_stuck_at_dtc_phase() const
@@ -227,37 +329,8 @@ ATPG::StuckAtPhaseResult ATPG::rank_stuck_at_dtc_candidates(
 	const size_t embedded_before = stuck_at_active_step.dtc_embedded_fault_ids.size();
 	for (fptr secondary : ranked)
 	{
-		const string identifier = fault_identifier(secondary);
-		if (!stuck_at_attempted_ids.insert(identifier).second)
-			throw runtime_error("A stuck-at DTC secondary was attempted more than once");
-		stuck_at_active_step.dtc_attempted_fault_ids.push_back(identifier);
-		++stuck_at_active_dtc_calls;
-		int backtracks = 0;
-		bool embedded = stuck_at_podemx_secondary(secondary, backtracks) == TRUE;
-		stuck_at_active_dtc_backtracks += backtracks;
-		vector<int> proposed_cube;
-		for (wptr wire : cktin)
-			proposed_cube.push_back(good_value(wire->value));
-		if (embedded)
-		{
-			for (fptr preserved : stuck_at_preserved_faults)
-			{
-				restore_stuck_at_good_cube(proposed_cube);
-				if (!stuck_at_cube_detects(preserved))
-				{
-					embedded = false;
-					break;
-				}
-			}
-		}
-		if (embedded)
-		{
-			stuck_at_accepted_pi_cube = proposed_cube;
-			stuck_at_preserved_faults.push_back(secondary);
-			stuck_at_active_step.dtc_embedded_fault_ids.push_back(identifier);
-		}
-		restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);
-		if (stuck_at_active_unknown_po->value != U)
+		if (attempt_stuck_at_dtc_secondary(
+			secondary, stuck_at_active_unknown_po))
 			break;
 	}
 	if (log_batch)

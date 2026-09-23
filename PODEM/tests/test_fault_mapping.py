@@ -78,6 +78,20 @@ class FaultMappingTests(unittest.TestCase):
         self.keep_dtc_faults(fault_map, ids)
         return binary, fault_map
 
+    def make_lazy_dtc_fixture(self):
+        # Detecting w:sa0 fixes b=d=1 but leaves y unknown because c is U.
+        # TDF lazy DTC therefore skips the now-known b/d wires when it resumes
+        # BFS, while ranked DTC has already collected dummy_gate2:sa1 from the
+        # original all-U cone.
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nINPUT(b)\nINPUT(c)\nINPUT(d)\n"
+            "OUTPUT(x)\nOUTPUT(y)\nOUTPUT(z)\n"
+            "x = BUF(a)\nw = AND(b,d)\ny = AND(w,c)\nz = BUF(w)\n"
+        )
+        ids = ["x:GO:sa0", "w:GO:sa0", "dummy_gate2:GO:sa1"]
+        self.keep_dtc_faults(fault_map, ids)
+        return binary, fault_map, ids
+
     def test_ranked_dtc_follows_supplied_secondary_prefix(self):
         binary, fault_map = self.make_dtc_fixture()
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map))
@@ -113,6 +127,33 @@ class FaultMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Cannot finalize"):
             invalid.result()
         invalid.rank_dtc_candidates(candidates)
+
+    def test_native_dtc_is_tdf_lazy_while_ranked_dtc_collects_full_batch(self):
+        binary, fault_map, ids = self.make_lazy_dtc_fixture()
+        primary, near_fault, deep_fault = ids
+
+        native = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), stc_enabled=False)
+        first = native.step(primary)
+        self.assertEqual(first["dtc_attempted_fault_ids"], [near_fault])
+        self.assertNotIn(deep_fault, first["dtc_attempted_fault_ids"])
+
+        ranked = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), stc_enabled=False)
+        state = ranked.begin_step(primary)
+        self.assertEqual(state["phase"], "dtc")
+        self.assertEqual(
+            state["dtc_candidate_fault_ids"], [near_fault, deep_fault])
+        state = ranked.rank_dtc_candidates(
+            state["dtc_candidate_fault_ids"])
+        self.assertEqual(
+            state["last_dtc_attempted_fault_ids"], [near_fault, deep_fault])
+
+        while native.remaining_fault_ids():
+            native.step(native.remaining_fault_ids()[0])
+        ordered = cpp_podem.run_stuck_at_ordered(
+            str(binary), str(fault_map), ids, stc_enabled=False)
+        self.assertEqual(native.result(), ordered)
 
     def test_large_input_dtc_uses_100_wire_budget(self):
         inputs = [f"INPUT(a{i})" for i in range(33)]

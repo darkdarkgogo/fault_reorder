@@ -160,6 +160,12 @@ void ATPG::reset_stuck_at_active_step()
 
 ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step(const string &fault_id)
 {
+	return begin_stuck_at_step_impl(fault_id, true);
+}
+
+ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step_impl(
+	const string &fault_id, bool expose_ranked_dtc)
+{
 	prepare_stuck_at_session();
 	if (stuck_at_step_phase != StuckAtStepPhase::idle)
 		throw runtime_error("A stuck-at step is already awaiting a DTC ranking");
@@ -231,15 +237,20 @@ ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step(const string &fault_id)
 			stuck_at_preserved_faults.push_back(fault_under_test);
 			if (dynamic_test_compression)
 			{
-				DtcBatchState batch;
-				if (find_next_stuck_at_dtc_batch(batch))
+				if (expose_ranked_dtc)
 				{
-					stuck_at_active_unknown_po = batch.unknown_po;
-					stuck_at_active_candidates = batch.candidates;
-					stuck_at_active_select_fault_try = batch.select_fault_try;
-					stuck_at_active_visited_wire_count = batch.visited_wire_count;
-					return make_stuck_at_dtc_phase();
+					DtcBatchState batch;
+					if (find_next_stuck_at_dtc_batch(batch))
+					{
+						stuck_at_active_unknown_po = batch.unknown_po;
+						stuck_at_active_candidates = batch.candidates;
+						stuck_at_active_select_fault_try = batch.select_fault_try;
+						stuck_at_active_visited_wire_count = batch.visited_wire_count;
+						return make_stuck_at_dtc_phase();
+					}
 				}
+				else
+					run_stuck_at_lazy_dtc();
 			}
 			break;
 		}
@@ -313,9 +324,7 @@ ATPG::AtpgStepResult ATPG::complete_stuck_at_step()
 
 ATPG::AtpgStepResult ATPG::step_stuck_at(const string &fault_id)
 {
-	StuckAtPhaseResult state = begin_stuck_at_step(fault_id);
-	while (state.phase == "dtc")
-		state = rank_stuck_at_dtc_candidates(state.dtc_candidate_fault_ids);
+	StuckAtPhaseResult state = begin_stuck_at_step_impl(fault_id, false);
 	if (state.phase != "complete")
 		throw runtime_error("Stuck-at step ended in an unsupported phase");
 	return state.step_result;

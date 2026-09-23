@@ -2,6 +2,8 @@
 
 当前实现是 coverage-first 的 Actor-Critic PPO。完整约束见
 [`2026-09-22-bfs-filtered-ranked-dtc-design.md`](superpowers/specs/2026-09-22-bfs-filtered-ranked-dtc-design.md)，
+其 heuristic lazy 修订见
+[`2026-09-23-tdf-lazy-baseline-design.md`](superpowers/specs/2026-09-23-tdf-lazy-baseline-design.md)，
 运行命令见 [`fault-order-rl.md`](fault-order-rl.md)。
 
 ## 1. 动态状态与 Primary 选择
@@ -17,10 +19,10 @@
 的 critic value。每个 Primary step 只执行一次模型 forward。训练时从完整 `F_t` 的
 categorical 分布选择 Primary；确定性评估按 score 降序选择，同分按 catalog row 升序。
 
-## 2. BFS-filtered Ranked-DTC
+## 2. RL Ranked-DTC 与 heuristic lazy DTC
 
-Primary 成功后，C++ 在 canonical good-circuit cube 上按稳定 `cktout` 顺序查找 unknown
-PO，并从该 PO 沿值为 `U` 的 fan-in 执行 FIFO 反向 BFS：
+Primary 成功后，RL 路径由 C++ 在 canonical good-circuit cube 上按稳定 `cktout` 顺序
+查找 unknown PO，并从该 PO 沿值为 `U` 的 fan-in 执行 FIFO 反向 BFS：
 
 ```text
 cktout order
@@ -38,14 +40,21 @@ ncktin <= 32 : select_fault_try = 15
 ncktin > 32  : select_fault_try = 100
 ```
 
-Heuristic baseline 原样使用 BFS 顺序。RL 从 Primary 的缓存 score tensor 中索引当前
-candidate rows，只对该 batch 排序；不能增加、遗漏或重复 ID，也不能重新调用模型。
+RL 在预算内先收集完整 batch，再从 Primary 的缓存 score tensor 中索引当前 candidate
+rows 并排序；不能增加、遗漏或重复 ID，也不能重新调用模型。
+
+Heuristic/native baseline 不建立完整 batch，而是严格使用原 TDF lazy 调度：维护
+`q_wire` 和 `q_fault`，仅当 `q_fault` 为空时才从 `q_wire` 展开下一个 `U` wire；一旦
+该 wire 的 `udflist` 产生 eligible faults，就立即逐个 DTC。只有这些 faults 全部耗尽且
+目标 PO 仍为 `U` 时，才继续反向 BFS。`StuckAtSession.step()` 与
+`run_stuck_at_ordered()` 共用这条 lazy 路径。
 
 ## 3. 执行前缀、PO 检查与回滚
 
-C++ 按提交顺序尝试 batch。每完成一个 secondary fault，无论 PODEMX 返回 TRUE、FALSE
-或 MAYBE，都恢复 accepted fault-free PI cube、重新 implication，再检查目标 PO。如果
-PO 已知，当前 ranking 立即结束；因此实际动作只包含 requested order 的连续前缀。
+C++ 的两条路径共用单个 secondary 的执行操作。每完成一个 secondary fault，无论
+PODEMX 返回 TRUE、FALSE 或 MAYBE，都恢复 accepted fault-free PI cube、重新
+implication，再检查目标 PO。如果 PO 已知，baseline 立即丢弃 lazy 队列尾部，RL 则
+立即丢弃 ranking 尾部；因此 RL 实际动作只包含 requested order 的连续前缀。
 
 成功 secondary 只有在 Primary 和此前 accepted secondary 仍可检测时才提交新 PI cube。
 失败、达到回溯上限或 preserved-fault 检查失败时恢复旧 accepted cube。实现不保存逐
