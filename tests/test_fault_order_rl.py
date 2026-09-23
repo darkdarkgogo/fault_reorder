@@ -181,6 +181,29 @@ class _NativePrefixSession:
         }
 
 
+class _NativeLazySession(_NativePrefixSession):
+    def __init__(self):
+        super().__init__()
+        self.step_calls = []
+
+    def begin_step(self, primary):
+        raise AssertionError("baseline must not enter ranked DTC phases")
+
+    def step(self, primary):
+        self.step_calls.append(primary)
+        return _step_summary()
+
+
+def test_python_session_without_ranker_calls_native_lazy_step():
+    native = _NativeLazySession()
+    session = PodemSession(native)
+    result = session.step("f0")
+    assert native.step_calls == ["f0"]
+    assert native.begin_calls == 0
+    assert result["dtc_attempted_fault_ids"] == ("f2",)
+    assert result["dtc_batches"] == ()
+
+
 def test_python_session_ranks_only_bfs_batch_and_accepts_only_prefix():
     native = _NativePrefixSession()
     session = PodemSession(native)
@@ -190,7 +213,7 @@ def test_python_session_ranks_only_bfs_batch_and_accepts_only_prefix():
     assert result["dtc_batches"][0]["bfs_candidate_fault_ids"] == ("f2", "f1")
     bad = PodemSession(_NativePrefixSession(("f1",)))
     with pytest.raises(RuntimeError, match="requested batch prefix"):
-        bad.step("f0")
+        bad.step("f0", lambda candidates, _: candidates)
     with pytest.raises(ValueError, match="exactly the current BFS"):
         PodemSession(_NativePrefixSession()).step(
             "f0", lambda candidates, _: candidates[:-1])

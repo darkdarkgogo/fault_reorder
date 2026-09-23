@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import cpp_podem
+from fault_order_rl.environment import PodemSession
 from convert_binary_bench import catalog_cpp_podem, convert_binary_bench
 
 
@@ -137,6 +138,12 @@ class FaultMappingTests(unittest.TestCase):
         first = native.step(primary)
         self.assertEqual(first["dtc_attempted_fault_ids"], [near_fault])
         self.assertNotIn(deep_fault, first["dtc_attempted_fault_ids"])
+
+        wrapped = PodemSession(cpp_podem.StuckAtSession(
+            str(binary), str(fault_map)))
+        wrapped_first = wrapped.step(primary)
+        self.assertEqual(wrapped_first["dtc_attempted_fault_ids"], (near_fault,))
+        self.assertEqual(wrapped_first["dtc_batches"], ())
 
         ranked = cpp_podem.StuckAtSession(
             str(binary), str(fault_map), stc_enabled=False)

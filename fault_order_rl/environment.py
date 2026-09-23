@@ -166,7 +166,17 @@ class PodemSession:
         if rank_dtc_candidates is not None and not callable(rank_dtc_candidates):
             raise TypeError("rank_dtc_candidates must be callable or None")
         before = set(self.remaining_fault_ids)
-        if self._pending is None:
+        if rank_dtc_candidates is None and self._pending is None:
+            # Native/baseline execution must enter the C++ TDF-lazy path.
+            # The phased begin/rank API is reserved for an explicit RL ranker,
+            # because even an identity ranking has already collected a full
+            # BFS batch and is therefore not lazy.
+            state = dict(self._native.step(fault_id))
+            state["phase"] = "complete"
+            batches = []
+            attempted_so_far = list(_ids(
+                state, "dtc_attempted_fault_ids", self._catalog_set))
+        elif self._pending is None:
             state = dict(self._native.begin_step(fault_id))
             batches = []
             attempted_so_far = []
