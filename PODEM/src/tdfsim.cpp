@@ -734,12 +734,16 @@ void ATPG::random_order_fault_sim()
 	std::shuffle(vectors.begin(), vectors.end(),
 		std::mt19937{static_cast<std::mt19937::result_type>(stcseed)});
 	stcseed = (stcmul * stcseed) % 20001019;
-	for (int i = 0; i < vectors.size(); i++)
+	for (size_t i = 0; i < vectors.size();)
 	{
 		bool redundant = tdfault_sim_a_vector(vectors[i], current_detect_num);
 		if (redundant)
 		{
 			vectors.erase(vectors.begin() + i);
+		}
+		else
+		{
+			++i;
 		}
 	}
 }
