@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate the undefined read of `temp` when a SCOAP fanout branch connects directly to an output.
 
-**Architecture:** Keep the existing fanout minimum-reduction intact. Set the branch-local candidate `temp` to zero for `OUTPUT`, so the common `if (temp < co[i])` reduction handles direct-output observability without reading stale or uninitialized state.
+**Architecture:** Keep the existing fanout minimum-reduction intact. Initialize each branch-local candidate to the current `co[i]` as a neutral value, then set it to zero for `OUTPUT`, so the common `if (temp < co[i])` reduction never reads stale or uninitialized state.
 
 **Tech Stack:** C++11/14, MinGW warning diagnostics, setuptools/pybind11, pytest.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Modify only the `OUTPUT` case in the fanout-branch loop of `ATPG::calculate_scoap()`.
+- Modify only branch-local `temp` initialization and the `OUTPUT` case in the fanout-branch loop of `ATPG::calculate_scoap()`.
 - Do not change signed/unsigned loop types in this task.
 - Do not change PODEM, DTC/STC, RL policy, or protocol configuration.
 - Preserve `CO = 0` for a branch connected directly to a primary output.
@@ -40,9 +40,14 @@ Expected: `tdfsim.cpp:680: warning: 'temp' may be used uninitialized`.
 - [ ] **Step 2: Apply the minimal correction**
 
 ```cpp
+n = w->onode[j];
+temp = co[i];
+switch (n->type)
+{
 case OUTPUT:
     temp = 0;
     break;
+}
 ```
 
 - [ ] **Step 3: Re-run the focused compiler diagnostic**

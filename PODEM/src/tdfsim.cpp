@@ -646,10 +646,11 @@ void ATPG::calculate_scoap()
 		for (j = 1; j < w->onode.size(); ++j)
 		{
 			n = w->onode[j];
+			temp = co[i];
 			switch (n->type)
 			{
 				case OUTPUT:
-					co[i] = 0;
+					temp = 0;
 					break;
 				case NOT:
 				case BUF:
