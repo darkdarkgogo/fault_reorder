@@ -395,6 +395,9 @@ private:
 	bool attempt_stuck_at_dtc_secondary(fptr secondary, wptr unknown_po);
 	void run_stuck_at_lazy_dtc();
 	void restore_stuck_at_good_cube(const vector<int> &accepted_pi_cube);
+	void validate_stuck_at_monotonic_cube(
+		const vector<int> &accepted_cube,
+		const vector<int> &proposed_cube) const;
 	int stuck_at_podemx_secondary(fptr fault, int &backtracks);
 	bool stuck_at_cube_detects(fptr fault);
 	StuckAtPhaseResult make_stuck_at_dtc_phase() const;
@@ -404,7 +407,6 @@ private:
 	fptr stuck_at_active_primary{};
 	wptr stuck_at_active_unknown_po{};
 	vector<fptr> stuck_at_active_candidates;
-	vector<fptr> stuck_at_preserved_faults;
 	vector<int> stuck_at_accepted_pi_cube;
 	vector<string> stuck_at_step_before_ids;
 	unordered_set<string> stuck_at_attempted_ids;

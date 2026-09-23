@@ -144,7 +144,6 @@ void ATPG::reset_stuck_at_active_step()
 	stuck_at_active_primary = nullptr;
 	stuck_at_active_unknown_po = nullptr;
 	stuck_at_active_candidates.clear();
-	stuck_at_preserved_faults.clear();
 	stuck_at_accepted_pi_cube.clear();
 	stuck_at_step_before_ids.clear();
 	stuck_at_attempted_ids.clear();
@@ -234,7 +233,6 @@ ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step_impl(
 				stuck_at_accepted_pi_cube.push_back(
 					wire->value == D ? 1 : wire->value == D_bar ? 0 : wire->value);
 			restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);
-			stuck_at_preserved_faults.push_back(fault_under_test);
 			if (dynamic_test_compression)
 			{
 				if (expose_ranked_dtc)

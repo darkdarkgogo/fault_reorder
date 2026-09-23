@@ -29,7 +29,7 @@ from .reward import (compute_gae, normalize_advantages, ppo_objective,
 POLICY_IDENTITY = "dynamic_bfs_ranked_dtc_actor_critic_ppo_v2"
 SOLVER_PROTOCOL = {
     **PROTOCOL_CONFIG,
-    "compression_algorithm_version": "stuck_at_podemx_bfs_ranked_dtc_v3",
+    "compression_algorithm_version": "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4",
 }
 DEFAULT_VALIDATION_MANIFEST = (
     Path(__file__).resolve().parents[1] / "configs" / "anchor_validation_6.json"

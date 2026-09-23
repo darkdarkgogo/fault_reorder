@@ -40,6 +40,35 @@ void ATPG::restore_stuck_at_good_cube(const vector<int> &accepted_pi_cube)
 	}
 }
 
+void ATPG::validate_stuck_at_monotonic_cube(
+	const vector<int> &accepted_cube,
+	const vector<int> &proposed_cube) const
+{
+	if (accepted_cube.size() != cktin.size() ||
+		proposed_cube.size() != cktin.size())
+		throw runtime_error("Stuck-at DTC PI cube size mismatch");
+
+	for (size_t i = 0; i < accepted_cube.size(); ++i)
+	{
+		const int old_value = good_value(accepted_cube[i]);
+		const int new_value = good_value(proposed_cube[i]);
+		const bool old_value_is_valid =
+			old_value == 0 || old_value == 1 || old_value == U;
+		const bool new_value_is_valid =
+			new_value == 0 || new_value == 1 || new_value == U;
+		if (!old_value_is_valid || !new_value_is_valid)
+			throw runtime_error(
+				"Stuck-at DTC PI cube has an invalid value at index " +
+				to_string(i) + ": old=" + to_string(old_value) +
+				", new=" + to_string(new_value));
+		if (old_value != U && new_value != old_value)
+			throw runtime_error(
+				"Stuck-at PODEMX changed fixed PI at index " +
+				to_string(i) + ": old=" + to_string(old_value) +
+				", new=" + to_string(new_value));
+	}
+}
+
 // Rebuild the fault-free implication before injecting each fault. A D or
 // D-bar left by the preceding injection must never contaminate this check.
 bool ATPG::stuck_at_cube_detects(fptr fault)
@@ -143,20 +172,9 @@ bool ATPG::attempt_stuck_at_dtc_secondary(fptr secondary, wptr unknown_po)
 		proposed_cube.push_back(good_value(wire->value));
 	if (embedded)
 	{
-		for (fptr preserved : stuck_at_preserved_faults)
-		{
-			restore_stuck_at_good_cube(proposed_cube);
-			if (!stuck_at_cube_detects(preserved))
-			{
-				embedded = false;
-				break;
-			}
-		}
-	}
-	if (embedded)
-	{
+		validate_stuck_at_monotonic_cube(
+			stuck_at_accepted_pi_cube, proposed_cube);
 		stuck_at_accepted_pi_cube = proposed_cube;
-		stuck_at_preserved_faults.push_back(secondary);
 		stuck_at_active_step.dtc_embedded_fault_ids.push_back(identifier);
 	}
 	restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);

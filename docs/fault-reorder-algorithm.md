@@ -56,10 +56,12 @@ PODEMX 返回 TRUE、FALSE 或 MAYBE，都恢复 accepted fault-free PI cube、�
 implication，再检查目标 PO。如果 PO 已知，baseline 立即丢弃 lazy 队列尾部，RL 则
 立即丢弃 ranking 尾部；因此 RL 实际动作只包含 requested order 的连续前缀。
 
-成功 secondary 只有在 Primary 和此前 accepted secondary 仍可检测时才提交新 PI cube。
-失败、达到回溯上限或 preserved-fault 检查失败时恢复旧 accepted cube。实现不保存逐
-candidate 的全 wire snapshot；临时 fault injection 后也必须恢复 good-circuit 状态，避免
-残留 `D`/`D_bar` 影响 PO 判断或下一次 BFS。
+成功 secondary 只有在 proposed PI cube 通过单调性 invariant 后才提交：旧 cube 中已经
+确定的 `0/1` PI 必须保持不变，仅允许原来的 `U` 保持 `U` 或细化为 `0/1`。在五值仿真中，
+已经到达 PO 的确定 `D`/`D_bar` 不会被这种细化破坏，因此生产路径不再重放 Primary 和历史
+accepted secondary。失败或达到回溯上限时不提交 proposed cube，并恢复旧 accepted
+good-circuit cube、重新 implication；invariant 违反则立即报错，因为它表示 PODEMX 实现
+破坏了固定 PI。这样也能避免临时 `D`/`D_bar` 影响 PO 判断或下一次 BFS。
 
 测试 cube 改变后重新执行 BFS，但仍复用同一个 Primary score tensor。同一 Primary 内
 一个 secondary 最多实际尝试一次。

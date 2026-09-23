@@ -87,6 +87,9 @@ def test_fixed_protocol_and_training_defaults():
     assert PROTOCOL_CONFIG["primary_backtrack_limit"] == 100
     assert PROTOCOL_CONFIG["dtc_secondary_backtrack_limit"] == 50
     assert SOLVER_PROTOCOL["primary_backtrack_limit"] == 100
+    assert SOLVER_PROTOCOL["compression_algorithm_version"] == (
+        "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4"
+    )
     config = TrainConfig()
     config.validate()
     assert config.rounds == 5
