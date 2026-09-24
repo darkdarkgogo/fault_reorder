@@ -202,7 +202,7 @@ class FaultMappingTests(unittest.TestCase):
             str(binary), str(fault_map), ids, stc_enabled=False)
         self.assertEqual(native.result(), ordered)
 
-    def test_large_input_dtc_uses_100_wire_budget(self):
+    def test_large_input_dtc_uses_15_wire_budget(self):
         inputs = [f"INPUT(a{i})" for i in range(33)]
         _, binary, fault_map, _, _ = self.convert("\n".join([
             *inputs, "OUTPUT(x)", "OUTPUT(z)",
@@ -216,8 +216,8 @@ class FaultMappingTests(unittest.TestCase):
         state = session.begin_step("x:GO:sa0")
         self.assertEqual(state["phase"], "dtc")
         self.assertEqual(state["unknown_po_id"], "z")
-        self.assertEqual(state["select_fault_try"], 100)
-        self.assertLessEqual(state["visited_wire_count"], 100)
+        self.assertEqual(state["select_fault_try"], 15)
+        self.assertLessEqual(state["visited_wire_count"], 15)
 
     def complete_stc_session(self, binary, fault_map, **options):
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map), **options)
@@ -819,7 +819,7 @@ class FaultMappingTests(unittest.TestCase):
             "scoap_enabled": False,
             "dtc_bfs_small_input_threshold": 32,
             "dtc_bfs_small_select_fault_try": 15,
-            "dtc_bfs_default_select_fault_try": 100,
+            "dtc_bfs_default_select_fault_try": 15,
             "dtc_rollback_algorithm": "accepted_pi_cube_resim_v1",
         })
         snapshot = session.config()

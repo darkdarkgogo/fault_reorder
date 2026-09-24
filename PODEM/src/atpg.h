@@ -74,7 +74,7 @@ struct StuckAtProtocolConfig
 	bool scoap_enabled{false};
 	int dtc_bfs_small_input_threshold{32};
 	int dtc_bfs_small_select_fault_try{15};
-	int dtc_bfs_default_select_fault_try{100};
+	int dtc_bfs_default_select_fault_try{15};
 	string dtc_rollback_algorithm{"accepted_pi_cube_resim_v1"};
 };
 
