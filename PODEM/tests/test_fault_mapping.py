@@ -47,6 +47,46 @@ def fault_signature(catalog: dict) -> set[tuple[str, int]]:
     }
 
 
+def test_dtc_diagnostics_are_opt_in_and_result_neutral(
+        tmp_path, monkeypatch, capfd):
+    source = tmp_path / "source.bench"
+    binary = tmp_path / "binary.bench"
+    fault_map = tmp_path / "binary.faultmap"
+    source.write_text(
+        "INPUT(a)\nINPUT(b)\nINPUT(c)\n"
+        "OUTPUT(x)\nOUTPUT(y)\nOUTPUT(z)\n"
+        "x = BUF(a)\nn = NOT(b)\ny = AND(b,n)\nz = BUF(c)\n",
+        encoding="ascii",
+    )
+    convert_binary_bench(source, binary, fault_map)
+    lines = fault_map.read_text(encoding="ascii").splitlines()
+    records = {line.split()[1]: line for line in lines if line.startswith("fault ")}
+    selected = [records[fault_id] for fault_id in (
+        "x:GO:sa0", "z:GO:sa0", "y:GO:sa0", "z:GO:sa1",
+    )]
+    fault_map.write_text("\n".join([
+        *lines[:3], f"count {len(selected)}",
+        f"uncollapsed_total {sum(int(line.split()[7]) for line in selected)}",
+        *selected, "end", "",
+    ]), encoding="ascii")
+
+    monkeypatch.delenv("PODEM_DTC_DIAGNOSTICS", raising=False)
+    quiet = cpp_podem.StuckAtSession(
+        str(binary), str(fault_map), stc_enabled=False).step("x:GO:sa0")
+    quiet_stderr = capfd.readouterr().err
+
+    monkeypatch.setenv("PODEM_DTC_DIAGNOSTICS", "1")
+    diagnostic = cpp_podem.StuckAtSession(
+        str(binary), str(fault_map), stc_enabled=False).step("x:GO:sa0")
+    diagnostic_stderr = capfd.readouterr().err
+
+    assert "[ATPG][DTC-LAZY]" not in quiet_stderr
+    assert "[ATPG][PODEMX]" not in quiet_stderr
+    assert "[ATPG][DTC-LAZY] start primary=x:GO:sa0" in diagnostic_stderr
+    assert "[ATPG][DTC-LAZY] done primary=x:GO:sa0" in diagnostic_stderr
+    assert quiet == diagnostic
+
+
 class FaultMappingTests(unittest.TestCase):
     def convert(self, text: str):
         directory = tempfile.TemporaryDirectory()

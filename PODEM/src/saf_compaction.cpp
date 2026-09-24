@@ -2,11 +2,29 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace {
+constexpr double kDtcProgressIntervalSeconds = 10.0;
+constexpr double kPodemxSlowSeconds = 2.0;
+
+bool dtc_diagnostics_enabled()
+{
+#ifdef _MSC_VER
+	char value[2]{};
+	size_t required = 0;
+	getenv_s(&required, value, sizeof(value), "PODEM_DTC_DIAGNOSTICS");
+	return required == 2 && value[0] == '1';
+#else
+	const char *value = std::getenv("PODEM_DTC_DIAGNOSTICS");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+#endif
+}
+
 int good_value(int value)
 {
 	return value == D ? 1 : (value == D_bar ? 0 : value);
@@ -87,6 +105,15 @@ bool ATPG::stuck_at_cube_detects(fptr fault)
 // and earlier secondary assignments never become backtrack decisions.
 int ATPG::stuck_at_podemx_secondary(fptr fault, int &backtracks)
 {
+	using Clock = std::chrono::steady_clock;
+	const bool diagnostics = dtc_diagnostics_enabled();
+	const Clock::time_point started = Clock::now();
+	double last_progress_s = 0.0;
+	size_t iterations = 0;
+	size_t forward_decisions = 0;
+	const string primary_id = diagnostics
+		? stuck_at_active_step.selected_fault_id : string();
+	const string secondary_id = diagnostics ? fault_identifier(fault) : string();
 	struct Decision { wptr wire; int first_value; bool flipped; };
 	vector<Decision> decisions;
 	vector<int> fixed_values;
@@ -97,6 +124,21 @@ int ATPG::stuck_at_podemx_secondary(fptr fault, int &backtracks)
 	int status = FALSE;
 	while (true)
 	{
+		++iterations;
+		if (diagnostics)
+		{
+			const double elapsed_s = std::chrono::duration<double>(
+				Clock::now() - started).count();
+			if (elapsed_s - last_progress_s >= kDtcProgressIntervalSeconds)
+			{
+				fprintf(stderr,
+					"[ATPG][PODEMX] progress primary=%s secondary=%s iterations=%zu decisions=%zu depth=%zu backtracks=%d elapsed_s=%.3f\n",
+					primary_id.c_str(), secondary_id.c_str(), iterations,
+					forward_decisions, decisions.size(), backtracks, elapsed_s);
+				fflush(stderr);
+				last_progress_s = elapsed_s;
+			}
+		}
 		if (stuck_at_cube_detects(fault))
 		{
 			status = TRUE;
@@ -119,6 +161,7 @@ int ATPG::stuck_at_podemx_secondary(fptr fault, int &backtracks)
 		if (valid_decision)
 		{
 			decisions.push_back({decision, decision->value, false});
+			++forward_decisions;
 			continue;
 		}
 		for (size_t i = 0; i < cktin.size(); ++i)
@@ -145,6 +188,21 @@ int ATPG::stuck_at_podemx_secondary(fptr fault, int &backtracks)
 		decision.wire->remove_all_assigned();
 	for (wptr wire : cktin)
 		wire->value = good_value(wire->value);
+	if (diagnostics)
+	{
+		const double elapsed_s = std::chrono::duration<double>(
+			Clock::now() - started).count();
+		if (elapsed_s >= kPodemxSlowSeconds)
+		{
+			const char *status_name = status == TRUE ? "detected" :
+				status == MAYBE ? "aborted" : "failed";
+			fprintf(stderr,
+				"[ATPG][PODEMX] slow-done primary=%s secondary=%s status=%s iterations=%zu decisions=%zu backtracks=%d elapsed_s=%.3f\n",
+				primary_id.c_str(), secondary_id.c_str(), status_name,
+				iterations, forward_decisions, backtracks, elapsed_s);
+			fflush(stderr);
+		}
+	}
 	return status;
 }
 
@@ -235,14 +293,35 @@ bool ATPG::find_next_stuck_at_dtc_batch(DtcBatchState &batch)
 
 void ATPG::run_stuck_at_lazy_dtc()
 {
+	using Clock = std::chrono::steady_clock;
+	const bool diagnostics = dtc_diagnostics_enabled();
+	const Clock::time_point started = Clock::now();
+	Clock::time_point last_progress = started;
+	const string primary_id = stuck_at_active_step.selected_fault_id;
+	const size_t attempted_before =
+		stuck_at_active_step.dtc_attempted_fault_ids.size();
+	const size_t embedded_before =
+		stuck_at_active_step.dtc_embedded_fault_ids.size();
+	size_t last_progress_po = 0;
+	size_t last_progress_attempted = 0;
+	size_t po_processed = 0;
+	size_t total_expanded_wires = 0;
 	const int budget = static_cast<int>(cktin.size()) <=
 		stuck_at_protocol_config.dtc_bfs_small_input_threshold
 		? stuck_at_protocol_config.dtc_bfs_small_select_fault_try
 		: stuck_at_protocol_config.dtc_bfs_default_select_fault_try;
+	if (diagnostics)
+	{
+		fprintf(stderr,
+			"[ATPG][DTC-LAZY] start primary=%s outputs=%zu wire_budget=%d secondary_backtrack_limit=%d\n",
+			primary_id.c_str(), cktout.size(), budget, podemx_backtrack_limit);
+		fflush(stderr);
+	}
 	for (wptr unknown_po : cktout)
 	{
 		if (unknown_po->value != U)
 			continue;
+		++po_processed;
 		queue<wptr> q_wire;
 		queue<fptr> q_fault;
 		unordered_set<wptr> visited_wires;
@@ -251,6 +330,32 @@ void ATPG::run_stuck_at_lazy_dtc()
 		int expanded_wires = 0;
 		stuck_at_active_unknown_po = unknown_po;
 		stuck_at_active_select_fault_try = budget;
+		auto maybe_log_progress = [&]() {
+			if (!diagnostics)
+				return;
+			const Clock::time_point now = Clock::now();
+			const size_t attempted =
+				stuck_at_active_step.dtc_attempted_fault_ids.size() - attempted_before;
+			const bool po_due = po_processed - last_progress_po >= 100;
+			const bool attempted_due = attempted - last_progress_attempted >= 500;
+			const bool time_due = std::chrono::duration<double>(
+				now - last_progress).count() >= kDtcProgressIntervalSeconds;
+			if (!po_due && !attempted_due && !time_due)
+				return;
+			const size_t embedded =
+				stuck_at_active_step.dtc_embedded_fault_ids.size() - embedded_before;
+			fprintf(stderr,
+				"[ATPG][DTC-LAZY] progress primary=%s po_processed=%zu current_po=%s expanded_wires=%zu current_po_wires=%d attempted=%zu embedded=%zu backtracks=%d elapsed_s=%.3f\n",
+				primary_id.c_str(), po_processed, unknown_po->name.c_str(),
+				total_expanded_wires, expanded_wires, attempted, embedded,
+				stuck_at_active_dtc_backtracks,
+				std::chrono::duration<double>(now - started).count());
+			fflush(stderr);
+			last_progress_po = po_processed;
+			last_progress_attempted = attempted;
+			last_progress = now;
+		};
+		maybe_log_progress();
 		while (unknown_po->value == U)
 		{
 			// This is the original TDF lazy boundary: BFS advances only when
@@ -264,6 +369,8 @@ void ATPG::run_stuck_at_lazy_dtc()
 				if (!visited_wires.insert(wire).second || wire->value != U)
 					continue;
 				++expanded_wires;
+				++total_expanded_wires;
+				maybe_log_progress();
 				if (!wire->inode.empty())
 				{
 					for (wptr input : wire->inode.front()->iwire)
@@ -285,12 +392,27 @@ void ATPG::run_stuck_at_lazy_dtc()
 				break;
 			fptr secondary = q_fault.front();
 			q_fault.pop();
-			if (attempt_stuck_at_dtc_secondary(secondary, unknown_po))
+			const bool po_resolved =
+				attempt_stuck_at_dtc_secondary(secondary, unknown_po);
+			maybe_log_progress();
+			if (po_resolved)
 				break;
 		}
 		stuck_at_active_visited_wire_count = expanded_wires;
+		maybe_log_progress();
 	}
 	stuck_at_active_unknown_po = nullptr;
+	if (diagnostics)
+	{
+		fprintf(stderr,
+			"[ATPG][DTC-LAZY] done primary=%s po_processed=%zu expanded_wires=%zu attempted=%zu embedded=%zu backtracks=%d elapsed_s=%.3f\n",
+			primary_id.c_str(), po_processed, total_expanded_wires,
+			stuck_at_active_step.dtc_attempted_fault_ids.size() - attempted_before,
+			stuck_at_active_step.dtc_embedded_fault_ids.size() - embedded_before,
+			stuck_at_active_dtc_backtracks,
+			std::chrono::duration<double>(Clock::now() - started).count());
+		fflush(stderr);
+	}
 }
 
 ATPG::StuckAtPhaseResult ATPG::make_stuck_at_dtc_phase() const
