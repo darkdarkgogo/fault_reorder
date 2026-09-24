@@ -542,27 +542,25 @@ ATPG::nptr ATPG::find_propagate_gate(const int &level)
  * returns NULL if no X path exists*/
 bool ATPG::trace_unknown_path(const wptr w)
 {
-	int i, nout;
-	// TODO search X-path
-	// HINT if w is PO, return TRUE, if not, check all its fanout
-	//------------------------------------- hole ---------------------------------------
-	if (w->is_output()) // if w is PO
-		return true;			// a X path has been found
-	else								// check all its fanout
+	unordered_set<wptr> visited;
+	return trace_unknown_path(w, visited);
+}
+
+bool ATPG::trace_unknown_path(const wptr w, unordered_set<wptr> &visited)
+{
+	if (!visited.insert(w).second)
+		return false;
+
+	if (w->is_output())
+		return true;
+
+	for (int i = 0, nout = w->onode.size(); i < nout; i++)
 	{
-		for (i = 0, nout = w->onode.size(); i < nout; i++)
-		{
-			if (w->onode[i]->owire.front()->value == U) // if unknown value exists
-			{
-				// down trace. if X-path exists, return TRUE.
-				if (trace_unknown_path(w->onode[i]->owire.front()))
-					return true;
-			}
-		}							// end of search
-		return false; // if program runs out the for loop, there is no X-path
+		wptr output = w->onode[i]->owire.front();
+		if (output->value == U && trace_unknown_path(output, visited))
+			return true;
 	}
-	//----------------------------------------------------------------------------------
-	// TODO END
+	return false;
 } /* end of trace_unknown_path */
 
 /* Check if any D or D_bar reaches PO. Fig 7.4 */

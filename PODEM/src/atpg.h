@@ -375,6 +375,7 @@ private:
 	wptr find_easiest_control(nptr);
 	nptr find_propagate_gate(const int &);
 	bool trace_unknown_path(wptr);
+	bool trace_unknown_path(wptr, unordered_set<wptr> &);
 	bool check_test();
 	void mark_propagate_tree(nptr);
 	void unmark_propagate_tree(nptr);
