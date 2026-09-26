@@ -9,8 +9,28 @@
 
 #include <chrono>
 #include <cstdio>
-#include <unordered_set>
 
+namespace
+{
+	double steady_seconds()
+	{
+		return std::chrono::duration<double>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	bool atpg_timing_enabled()
+	{
+#ifdef _MSC_VER
+		char value[2]{};
+		size_t required = 0;
+		getenv_s(&required, value, sizeof(value), "PODEM_ATPG_TIMING");
+		return required == 2 && value[0] == '1';
+#else
+		const char *value = std::getenv("PODEM_ATPG_TIMING");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+#endif
+	}
+}
 void ATPG::configure_ordered_stuck_at(const StuckAtProtocolConfig &config)
 {
 	stuck_at_protocol_config = config;
@@ -32,6 +52,7 @@ void ATPG::configure_ordered_stuck_at(const StuckAtProtocolConfig &config)
 	stuck_at_session_prepared = false;
 	stuck_at_final_result = AtpgRunResult{};
 	stuck_at_total_detect_num = 0;
+	stuck_at_detected_collapsed_faults = 0;
 	stuck_at_total_backtracks = 0;
 	stuck_at_aborted_faults = 0;
 	stuck_at_redundant_faults = 0;
@@ -49,6 +70,14 @@ void ATPG::prepare_stuck_at_session()
 		throw runtime_error("Ordered ATPG requires one-attempt stuck-at generation mode");
 	if (stuck_at_session_prepared)
 		return;
+	stuck_at_faults_by_id.clear();
+	for (const auto &owned_fault : flist)
+	{
+		fptr fault = owned_fault.get();
+		const string identifier = fault_identifier(fault);
+		if (!stuck_at_faults_by_id.emplace(identifier, fault).second)
+			throw runtime_error("Duplicate fault ID in catalog: " + identifier);
+	}
 
 	// Backtrace supports AND/OR/NAND/NOR/NOT/BUF, not physical XOR/EQV.
 	// Reject these before a sampled order can reach an undefined backtrace path.
@@ -130,11 +159,7 @@ ATPG::AtpgRunResult ATPG::get_stuck_at_result() const
 	result.dtc_secondary_calls = stuck_at_dtc_secondary_calls;
 	result.primary_backtracks = stuck_at_primary_backtracks;
 	result.dtc_backtracks = stuck_at_dtc_backtracks;
-	for (const auto &owned_fault : flist)
-	{
-		if (owned_fault->detect == TRUE)
-			result.detected_collapsed_faults++;
-	}
+	result.detected_collapsed_faults = stuck_at_detected_collapsed_faults;
 	return result;
 }
 
@@ -154,6 +179,7 @@ void ATPG::reset_stuck_at_active_step()
 	stuck_at_active_select_fault_try = 0;
 	stuck_at_active_visited_wire_count = 0;
 	stuck_at_next_po_index = 0;
+	stuck_at_active_step_started_seconds = 0.0;
 }
 
 ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step(const string &fault_id)
@@ -167,32 +193,20 @@ ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step_impl(
 	prepare_stuck_at_session();
 	if (stuck_at_step_phase != StuckAtStepPhase::idle)
 		throw runtime_error("A stuck-at step is already awaiting a DTC ranking");
-	fptr known_fault = nullptr;
-	for (const auto &owned_fault : flist)
-	{
-		if (fault_identifier(owned_fault.get()) == fault_id)
-		{
-			known_fault = owned_fault.get();
-			break;
-		}
-	}
-	if (known_fault == nullptr)
+	const auto known = stuck_at_faults_by_id.find(fault_id);
+	if (known == stuck_at_faults_by_id.end())
 		throw runtime_error("Unknown fault ID: " + fault_id);
-	const vector<string> selectable_ids = get_selectable_fault_ids();
-	const unordered_set<string> selectable_set(selectable_ids.begin(), selectable_ids.end());
-	if (selectable_set.find(fault_id) == selectable_set.end())
+	fptr fault_under_test = known->second;
+	if (fault_under_test->detect != FALSE || fault_under_test->test_tried)
 		throw runtime_error("Fault ID is not selectable: " + fault_id);
 
-	fptr fault_under_test = nullptr;
+	size_t selectable_count = 0;
 	for (fptr fault : flist_undetect)
-	{
-		if (fault == known_fault && !fault->test_tried && fault->detect != REDUNDANT)
-			fault_under_test = fault;
-	}
-	if (fault_under_test == nullptr)
-		throw runtime_error("Fault ID is not selectable: " + fault_id);
+		if (!fault->test_tried && fault->detect != REDUNDANT)
+			++selectable_count;
 
 	reset_stuck_at_active_step();
+	stuck_at_active_step_started_seconds = steady_seconds();
 	stuck_at_step_phase = StuckAtStepPhase::awaiting_dtc_order;
 	stuck_at_active_primary = fault_under_test;
 	stuck_at_active_step.selected_fault_id = fault_id;
@@ -202,7 +216,7 @@ ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step_impl(
 	fprintf(
 		stderr,
 		"[ATPG][PRIMARY] start fault=%s selectable=%zu backtrack_limit=%d\n",
-		fault_id.c_str(), selectable_ids.size(), backtrack_limit);
+		fault_id.c_str(), selectable_count, backtrack_limit);
 	fflush(stderr);
 	const int podem_result = podem(fault_under_test, current_backtracks);
 	const char *primary_status =
@@ -273,6 +287,9 @@ ATPG::AtpgStepResult ATPG::complete_stuck_at_step()
 	if (stuck_at_step_phase != StuckAtStepPhase::awaiting_dtc_order ||
 		stuck_at_active_primary == nullptr)
 		throw runtime_error("No active stuck-at step can be completed");
+	double fsim_elapsed_seconds = 0.0;
+	double book_elapsed_seconds = 0.0;
+	int current_detect_num = 0;
 	if (stuck_at_active_step.generated_pattern)
 	{
 		restore_stuck_at_good_cube(stuck_at_accepted_pi_cube);
@@ -283,16 +300,23 @@ ATPG::AtpgStepResult ATPG::complete_stuck_at_step()
 		stuck_at_active_step.generated_test_vector = vec;
 		if (print_test_vectors)
 			display_io();
-		int current_detect_num = 0;
 		vector<fptr> newly_detected_faults;
+		const double fsim_started_seconds = steady_seconds();
 		fault_sim_a_vector(vec, current_detect_num, &newly_detected_faults);
+		fsim_elapsed_seconds = steady_seconds() - fsim_started_seconds;
+		const double detection_book_started_seconds = steady_seconds();
 		for (fptr fault : newly_detected_faults)
 			stuck_at_active_step.newly_detected_fault_ids.push_back(
 				fault_identifier(fault));
+		stuck_at_detected_collapsed_faults +=
+			static_cast<int>(newly_detected_faults.size());
+		book_elapsed_seconds +=
+			steady_seconds() - detection_book_started_seconds;
 		vectors.push_back(vec);
 		stuck_at_total_detect_num += current_detect_num;
 		in_vector_no++;
 	}
+	const double result_book_started_seconds = steady_seconds();
 	stuck_at_active_primary->test_tried = true;
 	stuck_at_dtc_secondary_calls += stuck_at_active_dtc_calls;
 	stuck_at_dtc_backtracks += stuck_at_active_dtc_backtracks;
@@ -304,6 +328,27 @@ ATPG::AtpgStepResult ATPG::complete_stuck_at_step()
 	stuck_at_active_step.remaining_fault_ids = get_selectable_fault_ids();
 	stuck_at_active_step.cumulative_result = get_stuck_at_result();
 	AtpgStepResult result = stuck_at_active_step;
+	book_elapsed_seconds += steady_seconds() - result_book_started_seconds;
+	const double step_elapsed_seconds =
+		steady_seconds() - stuck_at_active_step_started_seconds;
+	if (atpg_timing_enabled())
+	{
+		fprintf(
+			stderr,
+			"[ATPG][FSIM] detected_equivalent=%d elapsed_s=%.6f\n",
+			current_detect_num, fsim_elapsed_seconds);
+		fprintf(
+			stderr,
+			"[ATPG][BOOK] remaining=%zu newly_detected=%zu elapsed_s=%.6f\n",
+			result.remaining_fault_ids.size(),
+			result.newly_detected_fault_ids.size(), book_elapsed_seconds);
+		fprintf(
+			stderr,
+			"[ATPG][STEP] fault=%s status=%s elapsed_s=%.6f\n",
+			result.selected_fault_id.c_str(), result.target_status.c_str(),
+			step_elapsed_seconds);
+		fflush(stderr);
+	}
 	reset_stuck_at_active_step();
 	return result;
 }
@@ -321,10 +366,7 @@ ATPG::AtpgRunResult ATPG::run_stuck_at(bool print_report)
 	prepare_stuck_at_session();
 	vector<string> selectable = get_selectable_fault_ids();
 	while (!selectable.empty())
-	{
-		step_stuck_at(selectable.front());
-		selectable = get_selectable_fault_ids();
-	}
+		selectable = step_stuck_at(selectable.front()).remaining_fault_ids;
 
 	const AtpgRunResult result = finalize_stuck_at_session();
 	if (print_report)

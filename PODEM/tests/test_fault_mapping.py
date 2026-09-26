@@ -1,3 +1,4 @@
+import re
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,36 @@ def test_dtc_diagnostics_are_opt_in_and_result_neutral(
     assert "[ATPG][DTC-LAZY] start primary=x:GO:sa0" in diagnostic_stderr
     assert "[ATPG][DTC-LAZY] done primary=x:GO:sa0" in diagnostic_stderr
     assert quiet == diagnostic
+
+
+def test_atpg_timing_is_opt_in_and_result_neutral(tmp_path, monkeypatch, capfd):
+    source = tmp_path / "source.bench"
+    binary = tmp_path / "binary.bench"
+    fault_map = tmp_path / "binary.faultmap"
+    source.write_text("INPUT(a)\nOUTPUT(y)\ny = BUF(a)\n", encoding="ascii")
+    convert_binary_bench(source, binary, fault_map)
+
+    monkeypatch.delenv("PODEM_ATPG_TIMING", raising=False)
+    quiet_session = cpp_podem.StuckAtSession(
+        str(binary), str(fault_map), dtc_enabled=False, stc_enabled=False)
+    quiet = quiet_session.step(quiet_session.remaining_fault_ids()[0])
+    quiet_stderr = capfd.readouterr().err
+
+    monkeypatch.setenv("PODEM_ATPG_TIMING", "1")
+    timed_session = cpp_podem.StuckAtSession(
+        str(binary), str(fault_map), dtc_enabled=False, stc_enabled=False)
+    timed = timed_session.step(timed_session.remaining_fault_ids()[0])
+    timed_stderr = capfd.readouterr().err
+
+    for tag in ("FSIM", "BOOK", "STEP"):
+        assert f"[ATPG][{tag}]" not in quiet_stderr
+        match = re.search(
+            rf"\[ATPG\]\[{tag}\].*elapsed_s=([0-9]+(?:\.[0-9]+)?)",
+            timed_stderr,
+        )
+        assert match is not None
+        assert float(match.group(1)) >= 0.0
+    assert quiet == timed
 
 
 class FaultMappingTests(unittest.TestCase):

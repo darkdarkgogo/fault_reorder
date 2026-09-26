@@ -16,6 +16,7 @@
 #include <random>
 #include <iostream>
 #include <fstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <cstring>
 #include <cstdio>
@@ -256,6 +257,7 @@ private:
 	bool stuck_at_session_prepared{};
 	AtpgRunResult stuck_at_final_result{};
 	int stuck_at_total_detect_num{};
+	int stuck_at_detected_collapsed_faults{};
 	int stuck_at_total_backtracks{};
 	int stuck_at_aborted_faults{};
 	int stuck_at_redundant_faults{};
@@ -405,6 +407,7 @@ private:
 
 	enum class StuckAtStepPhase { idle, awaiting_dtc_order };
 	StuckAtStepPhase stuck_at_step_phase{StuckAtStepPhase::idle};
+	unordered_map<string, fptr> stuck_at_faults_by_id;
 	fptr stuck_at_active_primary{};
 	wptr stuck_at_active_unknown_po{};
 	vector<fptr> stuck_at_active_candidates;
@@ -418,6 +421,7 @@ private:
 	int stuck_at_active_select_fault_try{};
 	int stuck_at_active_visited_wire_count{};
 	size_t stuck_at_next_po_index{};
+	double stuck_at_active_step_started_seconds{};
 
 	/* New flags */
 	bool dynamic_test_compression = false;
