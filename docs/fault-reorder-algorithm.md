@@ -118,7 +118,8 @@ shortfall > 0 : -10 * shortfall / InitialEqv
 
 ## 7. Training、validation 与恢复
 
-训练 manifest 由调用方指定；validation 默认 `configs/anchor_validation_6.json`。两个 split
+训练 manifest 由调用方指定；validation 默认 `configs/anchor_validation_5.json`，不包含
+`b17_C`。两个 split
 分别建立 native baseline，artifact provenance 不得重叠。Validation 不更新参数。每轮按
 以下字典序 key 选择 best：
 

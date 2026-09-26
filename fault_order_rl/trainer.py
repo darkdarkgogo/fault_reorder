@@ -32,7 +32,7 @@ SOLVER_PROTOCOL = {
     "compression_algorithm_version": "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4",
 }
 DEFAULT_VALIDATION_MANIFEST = (
-    Path(__file__).resolve().parents[1] / "configs" / "anchor_validation_6.json"
+    Path(__file__).resolve().parents[1] / "configs" / "anchor_validation_5.json"
 )
 
 

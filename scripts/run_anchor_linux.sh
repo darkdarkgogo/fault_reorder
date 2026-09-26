@@ -14,5 +14,5 @@ fi
 
 exec python3 -m fault_order_rl train \
   --manifest configs/anchor_train_1024.json \
-  --validation-manifest configs/anchor_validation_6.json \
+  --validation-manifest configs/anchor_validation_5.json \
   --output "$output"

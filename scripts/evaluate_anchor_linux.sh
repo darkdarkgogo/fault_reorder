@@ -5,7 +5,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 run_dir="${1:-runs/anchor_train_1024}"
-manifest="${2:-configs/anchor_validation_6.json}"
+manifest="${2:-configs/anchor_validation_5.json}"
 manifest_name="$(basename -- "$manifest" .json)"
 output_base="${3:-$run_dir/evaluation-$manifest_name}"
 best_checkpoint="$run_dir/best.pt"

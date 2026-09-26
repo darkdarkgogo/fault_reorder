@@ -86,6 +86,8 @@ def test_reward_terminal_target_gae_and_ppo_are_finite():
 def test_fixed_protocol_and_training_defaults():
     assert PROTOCOL_CONFIG["primary_backtrack_limit"] == 100
     assert PROTOCOL_CONFIG["dtc_secondary_backtrack_limit"] == 50
+    assert PROTOCOL_CONFIG["dtc_bfs_small_select_fault_try"] == 15
+    assert PROTOCOL_CONFIG["dtc_bfs_default_select_fault_try"] == 15
     assert SOLVER_PROTOCOL["primary_backtrack_limit"] == 100
     assert SOLVER_PROTOCOL["compression_algorithm_version"] == (
         "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4"

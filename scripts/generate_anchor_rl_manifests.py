@@ -5,9 +5,18 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+VALIDATION_EXCLUDED_STEMS = frozenset({"b17_C"})
 SPLITS = {
-    "train": (1024, ROOT / "configs" / "anchor_train_1024.json"),
-    "validation": (6, ROOT / "configs" / "anchor_validation_6.json"),
+    "train": (
+        1024,
+        ROOT / "configs" / "anchor_train_1024.json",
+        frozenset(),
+    ),
+    "validation": (
+        5,
+        ROOT / "configs" / "anchor_validation_5.json",
+        VALIDATION_EXCLUDED_STEMS,
+    ),
 }
 
 
@@ -25,9 +34,16 @@ def circuit_entry(split, source):
     }
 
 
-def generate_manifest(split, expected_count, output):
+def generate_manifest(split, expected_count, output, excluded_stems=()):
     source_dir = ROOT / "datasets" / split
-    sources = sorted(source_dir.glob("*.bench"), key=lambda path: path.name)
+    sources = sorted(
+        (
+            source
+            for source in source_dir.glob("*.bench")
+            if source.stem not in excluded_stems
+        ),
+        key=lambda path: path.name,
+    )
     if len(sources) != expected_count:
         raise ValueError(
             "Expected {} {} circuits, found {}".format(
@@ -51,16 +67,14 @@ def generate_manifest(split, expected_count, output):
     return {"split": split, "circuits": len(entries), "output": str(output)}
 
 
-def main():
-    results = [
-        generate_manifest(split, count, output)
-        for split, (count, output) in SPLITS.items()
-    ]
-    validation = json.loads(
-        (ROOT / "configs" / "anchor_validation_6.json").read_text(encoding="utf-8")
-    )
-    single_dir = ROOT / "configs" / "anchor_validation_single"
+def write_single_manifests(validation, single_dir):
     single_dir.mkdir(parents=True, exist_ok=True)
+    expected_names = {
+        entry["name"] + ".json" for entry in validation["circuits"]
+    }
+    for existing in single_dir.glob("*.json"):
+        if existing.name not in expected_names:
+            existing.unlink()
     for entry in validation["circuits"]:
         output = single_dir / (entry["name"] + ".json")
         # Paths in the combined manifest are relative to configs/. Single
@@ -77,6 +91,19 @@ def main():
             }, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+def main():
+    results = [
+        generate_manifest(split, count, output, excluded_stems)
+        for split, (count, output, excluded_stems) in SPLITS.items()
+    ]
+    validation_manifest = SPLITS["validation"][1]
+    validation = json.loads(
+        validation_manifest.read_text(encoding="utf-8")
+    )
+    single_dir = ROOT / "configs" / "anchor_validation_single"
+    write_single_manifests(validation, single_dir)
     results.append({
         "split": "validation-single",
         "circuits": len(validation["circuits"]),

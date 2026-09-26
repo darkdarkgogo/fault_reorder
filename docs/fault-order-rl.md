@@ -13,7 +13,7 @@ Primary 从完整 remaining set 中选择；DTC secondary 候选由 C++ 从 unkn
 - Primary backtrack limit 固定为 `100`；DTC secondary limit 固定为 `50`。
 - 每个 unknown PO 的 `select_fault_try` 统一为 `15`。
 - PODEM seed 固定为 `14`，DTC 与 STC 均启用。
-- 默认独立验证集为 `configs/anchor_validation_6.json`。
+- 默认独立验证集为 `configs/anchor_validation_5.json`，不包含运行过慢的 `b17_C`。
 
 训练集和验证集的 manifest 必须不同，且 artifact provenance 不能重叠。验证集不参与
 梯度更新，只用于根据 `(覆盖短缺总量, STC 后向量总数)` 选择 `best.pt`。
@@ -26,7 +26,7 @@ Windows：
 C:\Users\acer\.conda\envs\d2l\python.exe PODEM\setup.py build_ext --inplace
 C:\Users\acer\.conda\envs\d2l\python.exe -m fault_order_rl train `
   --manifest configs\anchor_train_1024.json `
-  --validation-manifest configs\anchor_validation_6.json `
+  --validation-manifest configs\anchor_validation_5.json `
   --output runs\anchor_train_1024
 ```
 
@@ -114,12 +114,12 @@ optimizer 与 Python/NumPy/Torch RNG。
 ```bash
 python3 -m fault_order_rl evaluate \
   --checkpoint runs/anchor_train_1024/best.pt \
-  --manifest configs/anchor_validation_6.json \
+  --manifest configs/anchor_validation_5.json \
   --output runs/anchor_train_1024/evaluation-best
 
 python3 -m fault_order_rl evaluate \
   --checkpoint runs/anchor_train_1024/final.pt \
-  --manifest configs/anchor_validation_6.json \
+  --manifest configs/anchor_validation_5.json \
   --output runs/anchor_train_1024/evaluation-final
 ```
 
