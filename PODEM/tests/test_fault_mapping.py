@@ -408,6 +408,24 @@ class FaultMappingTests(unittest.TestCase):
                 self.assertEqual(result, session.result())
                 self.assertEqual(session.remaining_fault_ids(), [])
 
+    def test_newly_detected_order_mixes_direct_and_packet_faults(self):
+        _, binary, fault_map, _, _ = self.convert(
+            "INPUT(a)\nOUTPUT(x)\nOUTPUT(y)\nOUTPUT(z)\n"
+            "x = BUF(a)\nn = BUF(a)\ny = BUF(n)\nz = NOT(n)\n"
+        )
+        # x is observed directly at a primary output. n must pass through the
+        # packet simulator before the same vector can drop it.
+        self.keep_dtc_faults(fault_map, ["x:GO:sa0", "n:GO:sa0"])
+        session = cpp_podem.StuckAtSession(
+            str(binary), str(fault_map), dtc_enabled=False, stc_enabled=False)
+
+        step = session.step("x:GO:sa0")
+
+        self.assertEqual(step["generated_test_vector"], "1")
+        self.assertEqual(
+            step["newly_detected_fault_ids"], ["x:GO:sa0", "n:GO:sa0"])
+        self.assertEqual(step["remaining_fault_ids"], [])
+
     def keep_dtc_faults(self, fault_map, ids):
         lines = fault_map.read_text(encoding="ascii").splitlines()
         records = {line.split()[1]: line for line in lines if line.startswith("fault ")}

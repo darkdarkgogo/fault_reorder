@@ -421,7 +421,9 @@ private:
 	int stuck_at_active_select_fault_try{};
 	int stuck_at_active_visited_wire_count{};
 	size_t stuck_at_next_po_index{};
+	bool stuck_at_active_timing_enabled{};
 	double stuck_at_active_step_started_seconds{};
+	double stuck_at_active_book_elapsed_seconds{};
 
 	/* New flags */
 	bool dynamic_test_compression = false;
