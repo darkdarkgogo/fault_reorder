@@ -152,9 +152,8 @@ class FaultMappingTests(unittest.TestCase):
 
     def make_lazy_dtc_fixture(self):
         # Detecting w:sa0 fixes b=d=1 but leaves y unknown because c is U.
-        # TDF lazy DTC therefore skips the now-known b/d wires when it resumes
-        # BFS, while ranked DTC has already collected dummy_gate2:sa1 from the
-        # original all-U cone.
+        # The retained secondary faults lie deeper than the first BFS wire, so
+        # a one-wire DTC budget must stop before either can be attempted.
         _, binary, fault_map, _, _ = self.convert(
             "INPUT(a)\nINPUT(b)\nINPUT(c)\nINPUT(d)\n"
             "OUTPUT(x)\nOUTPUT(y)\nOUTPUT(z)\n"
@@ -174,8 +173,8 @@ class FaultMappingTests(unittest.TestCase):
         batches = []
         while state["phase"] == "dtc":
             candidates = list(state["dtc_candidate_fault_ids"])
-            self.assertEqual(state["select_fault_try"], 15)
-            self.assertLessEqual(state["visited_wire_count"], 15)
+            self.assertEqual(state["select_fault_try"], 1)
+            self.assertLessEqual(state["visited_wire_count"], 1)
             ranking = list(reversed(candidates))
             requested.extend(ranking)
             state = session.rank_dtc_candidates(ranking)
@@ -200,32 +199,27 @@ class FaultMappingTests(unittest.TestCase):
             invalid.result()
         invalid.rank_dtc_candidates(candidates)
 
-    def test_native_dtc_is_tdf_lazy_while_ranked_dtc_collects_full_batch(self):
+    def test_one_wire_budget_stops_before_deeper_dtc_candidates(self):
         binary, fault_map, ids = self.make_lazy_dtc_fixture()
-        primary, near_fault, deep_fault = ids
+        primary, _, deep_fault = ids
 
         native = cpp_podem.StuckAtSession(
             str(binary), str(fault_map), stc_enabled=False)
         first = native.step(primary)
-        self.assertEqual(first["dtc_attempted_fault_ids"], [near_fault])
+        self.assertEqual(first["dtc_attempted_fault_ids"], [])
         self.assertNotIn(deep_fault, first["dtc_attempted_fault_ids"])
 
         wrapped = PodemSession(cpp_podem.StuckAtSession(
             str(binary), str(fault_map)))
         wrapped_first = wrapped.step(primary)
-        self.assertEqual(wrapped_first["dtc_attempted_fault_ids"], (near_fault,))
+        self.assertEqual(wrapped_first["dtc_attempted_fault_ids"], ())
         self.assertEqual(wrapped_first["dtc_batches"], ())
 
         ranked = cpp_podem.StuckAtSession(
             str(binary), str(fault_map), stc_enabled=False)
         state = ranked.begin_step(primary)
-        self.assertEqual(state["phase"], "dtc")
-        self.assertEqual(
-            state["dtc_candidate_fault_ids"], [near_fault, deep_fault])
-        state = ranked.rank_dtc_candidates(
-            state["dtc_candidate_fault_ids"])
-        self.assertEqual(
-            state["last_dtc_attempted_fault_ids"], [near_fault, deep_fault])
+        self.assertEqual(state["phase"], "complete")
+        self.assertNotIn(deep_fault, state["dtc_attempted_fault_ids"])
 
         while native.remaining_fault_ids():
             native.step(native.remaining_fault_ids()[0])
@@ -233,7 +227,7 @@ class FaultMappingTests(unittest.TestCase):
             str(binary), str(fault_map), ids, stc_enabled=False)
         self.assertEqual(native.result(), ordered)
 
-    def test_large_input_dtc_uses_15_wire_budget(self):
+    def test_large_input_dtc_uses_one_wire_budget(self):
         inputs = [f"INPUT(a{i})" for i in range(33)]
         _, binary, fault_map, _, _ = self.convert("\n".join([
             *inputs, "OUTPUT(x)", "OUTPUT(z)",
@@ -247,8 +241,8 @@ class FaultMappingTests(unittest.TestCase):
         state = session.begin_step("x:GO:sa0")
         self.assertEqual(state["phase"], "dtc")
         self.assertEqual(state["unknown_po_id"], "z")
-        self.assertEqual(state["select_fault_try"], 15)
-        self.assertLessEqual(state["visited_wire_count"], 15)
+        self.assertEqual(state["select_fault_try"], 1)
+        self.assertLessEqual(state["visited_wire_count"], 1)
 
     def complete_stc_session(self, binary, fault_map, **options):
         session = cpp_podem.StuckAtSession(str(binary), str(fault_map), **options)
@@ -867,8 +861,8 @@ class FaultMappingTests(unittest.TestCase):
             "stc_no_improvement_limit": 5,
             "scoap_enabled": False,
             "dtc_bfs_small_input_threshold": 32,
-            "dtc_bfs_small_select_fault_try": 15,
-            "dtc_bfs_default_select_fault_try": 15,
+            "dtc_bfs_small_select_fault_try": 1,
+            "dtc_bfs_default_select_fault_try": 1,
             "dtc_rollback_algorithm": "accepted_pi_cube_resim_v1",
         })
         snapshot = session.config()

@@ -11,7 +11,7 @@ Primary 从完整 remaining set 中选择；DTC secondary 候选由 C++ 从 unkn
 - value loss 系数 `0.5`，entropy 系数 `0.01`，Adam 学习率 `1e-4`。
 - step shaping `alpha=0.1`，覆盖短缺惩罚 `beta=10.0`。
 - Primary backtrack limit 固定为 `100`；DTC secondary limit 固定为 `50`。
-- 每个 unknown PO 的 `select_fault_try` 统一为 `15`。
+- 每个 unknown PO 的 `select_fault_try` 统一为 `1`。
 - PODEM seed 固定为 `14`，DTC 与 STC 均启用。
 - 默认独立验证集为 `configs/anchor_validation_5.json`，不包含运行过慢的 `b17_C`。
 

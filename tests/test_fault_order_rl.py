@@ -86,8 +86,8 @@ def test_reward_terminal_target_gae_and_ppo_are_finite():
 def test_fixed_protocol_and_training_defaults():
     assert PROTOCOL_CONFIG["primary_backtrack_limit"] == 100
     assert PROTOCOL_CONFIG["dtc_secondary_backtrack_limit"] == 50
-    assert PROTOCOL_CONFIG["dtc_bfs_small_select_fault_try"] == 15
-    assert PROTOCOL_CONFIG["dtc_bfs_default_select_fault_try"] == 15
+    assert PROTOCOL_CONFIG["dtc_bfs_small_select_fault_try"] == 1
+    assert PROTOCOL_CONFIG["dtc_bfs_default_select_fault_try"] == 1
     assert SOLVER_PROTOCOL["primary_backtrack_limit"] == 100
     assert SOLVER_PROTOCOL["compression_algorithm_version"] == (
         "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4"
@@ -167,8 +167,8 @@ class _NativePrefixSession:
         return {
             "phase": "dtc", "selected_fault_id": primary,
             "unknown_po_id": "po0", "dtc_candidate_fault_ids": ("f2", "f1"),
-            "dtc_batch_index": 0, "select_fault_try": 15,
-            "visited_wire_count": 3,
+            "dtc_batch_index": 0, "select_fault_try": 1,
+            "visited_wire_count": 1,
             "last_dtc_attempted_fault_ids": (),
             "last_dtc_embedded_fault_ids": (),
         }
@@ -279,7 +279,7 @@ class _FakeSession:
         candidates = tuple(identifier for identifier in self.remaining_fault_ids
                            if identifier != primary)
         metadata = {"unknown_po_id": "po0", "dtc_batch_index": 0,
-                    "select_fault_try": 15, "visited_wire_count": 1}
+                    "select_fault_try": 1, "visited_wire_count": 1}
         requested = (candidates if rank_dtc_candidates is None or not candidates
                      else tuple(rank_dtc_candidates(candidates, metadata)))
         assert set(requested) == set(candidates)
@@ -425,7 +425,7 @@ def test_nested_dtc_trajectory_npz_uses_offsets_without_pickle(tmp_path):
         "dtc_batches": ({
             "bfs_candidate_rows": (2, 1), "requested_rows": (1, 2),
             "executed_prefix_rows": (1,), "embedded_rows": (),
-            "select_fault_try": 15, "visited_wire_count": 3,
+            "select_fault_try": 1, "visited_wire_count": 1,
         },),
         "old_log_prob": -1.0, "old_value": 0.0, "reward": 0.1,
         "return": 0.2, "advantage": 0.3,

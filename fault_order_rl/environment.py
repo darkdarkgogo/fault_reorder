@@ -12,8 +12,8 @@ PROTOCOL_CONFIG = {
     "stc_reverse_order_enabled": True, "stc_shuffle_seed": 7,
     "stc_no_improvement_limit": 5, "scoap_enabled": False,
     "dtc_bfs_small_input_threshold": 32,
-    "dtc_bfs_small_select_fault_try": 15,
-    "dtc_bfs_default_select_fault_try": 15,
+    "dtc_bfs_small_select_fault_try": 1,
+    "dtc_bfs_default_select_fault_try": 1,
     "dtc_rollback_algorithm": "accepted_pi_cube_resim_v1",
 }
 RESULT_FIELDS = (

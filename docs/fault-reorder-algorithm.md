@@ -36,7 +36,7 @@ cktout order
 `U` cone 的 fault 才能进入 batch。每个 PO 的 BFS wire 展开预算为：
 
 ```text
-all ncktin : select_fault_try = 15
+all ncktin : select_fault_try = 1
 ```
 
 RL 在预算内先收集完整 batch，再从 Primary 的缓存 score tensor 中索引当前 candidate
