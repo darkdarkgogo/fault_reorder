@@ -145,7 +145,6 @@ void ATPG::reset_stuck_at_active_step()
 	stuck_at_active_unknown_po = nullptr;
 	stuck_at_active_candidates.clear();
 	stuck_at_accepted_pi_cube.clear();
-	stuck_at_step_before_ids.clear();
 	stuck_at_attempted_ids.clear();
 	stuck_at_active_step = AtpgStepResult{};
 	stuck_at_active_dtc_calls = 0;
@@ -185,10 +184,8 @@ ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step_impl(
 		throw runtime_error("Fault ID is not selectable: " + fault_id);
 
 	fptr fault_under_test = nullptr;
-	vector<string> before_ids;
 	for (fptr fault : flist_undetect)
 	{
-		before_ids.push_back(fault_identifier(fault));
 		if (fault == known_fault && !fault->test_tried && fault->detect != REDUNDANT)
 			fault_under_test = fault;
 	}
@@ -198,7 +195,6 @@ ATPG::StuckAtPhaseResult ATPG::begin_stuck_at_step_impl(
 	reset_stuck_at_active_step();
 	stuck_at_step_phase = StuckAtStepPhase::awaiting_dtc_order;
 	stuck_at_active_primary = fault_under_test;
-	stuck_at_step_before_ids = before_ids;
 	stuck_at_active_step.selected_fault_id = fault_id;
 	int current_backtracks = 0;
 	using Clock = std::chrono::steady_clock;
@@ -288,7 +284,11 @@ ATPG::AtpgStepResult ATPG::complete_stuck_at_step()
 		if (print_test_vectors)
 			display_io();
 		int current_detect_num = 0;
-		fault_sim_a_vector(vec, current_detect_num);
+		vector<fptr> newly_detected_faults;
+		fault_sim_a_vector(vec, current_detect_num, &newly_detected_faults);
+		for (fptr fault : newly_detected_faults)
+			stuck_at_active_step.newly_detected_fault_ids.push_back(
+				fault_identifier(fault));
 		vectors.push_back(vec);
 		stuck_at_total_detect_num += current_detect_num;
 		in_vector_no++;
@@ -301,18 +301,6 @@ ATPG::AtpgStepResult ATPG::complete_stuck_at_step()
 	stuck_at_active_step.current_primary_backtracks = stuck_at_primary_backtracks;
 	stuck_at_active_step.current_dtc_backtracks = stuck_at_dtc_backtracks;
 
-	const vector<string> undetected_ids = [&]() {
-		vector<string> ids;
-		for (fptr fault : flist_undetect)
-			ids.push_back(fault_identifier(fault));
-		return ids;
-	}();
-	const unordered_set<string> after_set(undetected_ids.begin(), undetected_ids.end());
-	for (const string &identifier : stuck_at_step_before_ids)
-	{
-		if (after_set.find(identifier) == after_set.end())
-			stuck_at_active_step.newly_detected_fault_ids.push_back(identifier);
-	}
 	stuck_at_active_step.remaining_fault_ids = get_selectable_fault_ids();
 	stuck_at_active_step.cumulative_result = get_stuck_at_result();
 	AtpgStepResult result = stuck_at_active_step;

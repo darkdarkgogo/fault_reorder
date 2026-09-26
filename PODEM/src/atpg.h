@@ -352,7 +352,7 @@ private:
 	forward_list<wptr> wlist_faulty;
 
 	void fault_simulate_vectors(int &);
-	void fault_sim_a_vector(const string &, int &);
+	void fault_sim_a_vector(const string &, int &, vector<fptr> * = nullptr);
 	void fault_sim_evaluate(wptr);
 	wptr get_faulty_wire(fptr, int &);
 	void inject_fault_value(wptr, const int &, const int &);
@@ -409,7 +409,6 @@ private:
 	wptr stuck_at_active_unknown_po{};
 	vector<fptr> stuck_at_active_candidates;
 	vector<int> stuck_at_accepted_pi_cube;
-	vector<string> stuck_at_step_before_ids;
 	unordered_set<string> stuck_at_attempted_ids;
 	AtpgStepResult stuck_at_active_step{};
 	int stuck_at_active_dtc_calls{};

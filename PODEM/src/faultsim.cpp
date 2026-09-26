@@ -32,7 +32,10 @@ void ATPG::fault_simulate_vectors(int &total_detect_num)
 } // fault_simulate_vectors
 
 /* fault simulate a single test vector */
-void ATPG::fault_sim_a_vector(const string &vec, int &num_of_current_detect)
+void ATPG::fault_sim_a_vector(
+	const string &vec,
+	int &num_of_current_detect,
+	vector<fptr> *newly_detected_faults)
 {
 	wptr w, faulty_wire;
 	/* array of 16 fptrs, which points to the 16 faults in a simulation packet  */
@@ -294,20 +297,27 @@ void ATPG::fault_sim_a_vector(const string &vec, int &num_of_current_detect)
 		}																		 // end fault sim of a packet
 	}																			 // end loop. for f = flist
 
-	/* fault dropping  */
-	flist_undetect.remove_if(
-			[&](const fptr fptr_ele)
-			{
-				if (fptr_ele->detect == TRUE)
-				{
-					num_of_current_detect += fptr_ele->eqv_fault_num;
-					return true;
-				}
-				else
-				{
-					return false;
-				}
-			});
+	/* Drop detected faults in list order and optionally report this vector's
+	 * detections to the ordered step API. The owning flist keeps each FAULT
+	 * alive after its pointer is removed from flist_undetect. */
+	auto previous = flist_undetect.before_begin();
+	auto current = flist_undetect.begin();
+	while (current != flist_undetect.end())
+	{
+		fptr detected_fault = *current;
+		if (detected_fault->detect == TRUE)
+		{
+			if (newly_detected_faults != nullptr)
+				newly_detected_faults->push_back(detected_fault);
+			num_of_current_detect += detected_fault->eqv_fault_num;
+			current = flist_undetect.erase_after(previous);
+		}
+		else
+		{
+			previous = current;
+			++current;
+		}
+	}
 } /* end of fault_sim_a_vector */
 
 /* evaluate wire w

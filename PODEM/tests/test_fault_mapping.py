@@ -403,7 +403,7 @@ class FaultMappingTests(unittest.TestCase):
                          step["current_primary_backtracks"] + step["current_dtc_backtracks"])
         self.assertEqual(step["generated_test_vector"][0], "1")
         self.assertEqual(step["generated_test_vector"][2], "1")
-        self.assertEqual(set(step["newly_detected_fault_ids"]), {"x:GO:sa0", "z:GO:sa0"})
+        self.assertEqual(step["newly_detected_fault_ids"], ["x:GO:sa0", "z:GO:sa0"])
         self.assertEqual(step["remaining_fault_ids"], ["y:GO:sa0", "z:GO:sa1"])
         self.assertEqual(step["podem_calls"], 1)
         self.assertEqual(step["primary_podem_calls"], 1)
