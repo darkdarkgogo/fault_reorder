@@ -556,52 +556,79 @@ class Trainer:
             "reward_sum": sum(decision["reward"] for decision in decisions),
         }
 
-    def _ppo_update(self, model, optimizer, circuit, decisions):
+    def _ppo_update(self, model, optimizer, rollouts):
+        samples = [
+            (rollout["circuit"], decision)
+            for rollout in rollouts
+            for decision in rollout["decisions"]
+        ]
+        if not samples:
+            raise ValueError("rollout batch must contain at least one transition")
         old_log_probs = torch.tensor(
-            [decision["old_log_prob"] for decision in decisions],
+            [decision["old_log_prob"] for _, decision in samples],
             dtype=torch.float32)
         returns = torch.tensor(
-            [decision["return"] for decision in decisions], dtype=torch.float32)
+            [decision["return"] for _, decision in samples], dtype=torch.float32)
         advantages = normalize_advantages(torch.tensor(
-            [decision["advantage"] for decision in decisions],
+            [decision["advantage"] for _, decision in samples],
             dtype=torch.float32))
+        transition_count = len(samples)
+        minibatch_count = (
+            transition_count + self.config.ppo_minibatch_size - 1
+        ) // self.config.ppo_minibatch_size
         epochs = []
         model.train()
         for epoch in range(self.config.ppo_epochs):
-            new_log_probs, entropies, values = [], [], []
-            for decision in decisions:
-                log_prob, entropy, value = joint_action_stats(
-                    model, circuit.embeddings, decision["remaining_rows"],
-                    decision["primary_row"], decision["dtc_batches"],
-                    self.config.temperature)
-                new_log_probs.append(log_prob)
-                entropies.append(entropy)
-                values.append(value)
-            loss, details = ppo_objective(
-                torch.stack(new_log_probs), old_log_probs, advantages,
-                torch.stack(values), returns, torch.stack(entropies),
-                self.config.ppo_clip, self.config.value_coef,
-                self.config.entropy_coef)
-            if not torch.isfinite(loss):
-                raise RuntimeError("non-finite PPO loss")
-            optimizer.zero_grad()
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), self.config.gradient_clip)
-            if not torch.isfinite(grad_norm):
-                raise RuntimeError("non-finite PPO gradient")
-            optimizer.step()
-            if not all(torch.isfinite(parameter).all()
-                       for parameter in model.parameters()):
-                raise RuntimeError("non-finite model after PPO update")
-            epochs.append({
-                "epoch": epoch + 1,
-                "loss": float(loss.detach()),
-                "gradient_norm": float(grad_norm),
-                **{key: float(value.detach())
-                   for key, value in details.items()},
-            })
-        return epochs
+            permutation = torch.randperm(transition_count)
+            minibatches = []
+            for start in range(0, transition_count,
+                               self.config.ppo_minibatch_size):
+                indices = permutation[
+                    start:start + self.config.ppo_minibatch_size]
+                new_log_probs, entropies, values = [], [], []
+                for index in indices.tolist():
+                    circuit, decision = samples[index]
+                    log_prob, entropy, value = joint_action_stats(
+                        model, circuit.embeddings, decision["remaining_rows"],
+                        decision["primary_row"], decision["dtc_batches"],
+                        self.config.temperature)
+                    new_log_probs.append(log_prob)
+                    entropies.append(entropy)
+                    values.append(value)
+                loss, details = ppo_objective(
+                    torch.stack(new_log_probs), old_log_probs[indices],
+                    advantages[indices], torch.stack(values), returns[indices],
+                    torch.stack(entropies), self.config.ppo_clip,
+                    self.config.value_coef, self.config.entropy_coef)
+                if not torch.isfinite(loss):
+                    raise RuntimeError("non-finite PPO loss")
+                optimizer.zero_grad()
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), self.config.gradient_clip)
+                if not torch.isfinite(grad_norm):
+                    raise RuntimeError("non-finite PPO gradient")
+                optimizer.step()
+                if not all(torch.isfinite(parameter).all()
+                           for parameter in model.parameters()):
+                    raise RuntimeError("non-finite model after PPO update")
+                minibatches.append({
+                    "minibatch": len(minibatches) + 1,
+                    "sample_count": int(indices.numel()),
+                    "loss": float(loss.detach()),
+                    "gradient_norm": float(grad_norm),
+                    **{key: float(value.detach())
+                       for key, value in details.items()},
+                })
+            epochs.append({"epoch": epoch + 1, "minibatches": minibatches})
+        return {
+            "circuits": [rollout["circuit"].name for rollout in rollouts],
+            "circuit_count": len(rollouts),
+            "transition_count": transition_count,
+            "minibatch_count": minibatch_count,
+            "optimizer_steps": self.config.ppo_epochs * minibatch_count,
+            "epochs": epochs,
+        }
 
     def evaluate_model(self, model, round_number, circuits=None,
                        environment=None, states=None):

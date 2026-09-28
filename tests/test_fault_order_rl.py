@@ -425,6 +425,95 @@ def test_policy_rollout_uses_one_forward_per_primary(tmp_path):
                for decision in decisions)
 
 
+def test_rollout_batch_ppo_uses_transition_minibatches_and_circuit_data(
+        tmp_path, monkeypatch):
+    from fault_order_rl import trainer as trainer_module
+
+    counts = (90, 80, 100, 80)
+    circuits = [
+        _circuit(tmp_path, "ppo_" + str(index), "digest-" + str(index), count=1)
+        for index in range(len(counts))
+    ]
+    for index, circuit in enumerate(circuits):
+        circuit.embeddings[:, 0] = float(index + 1)
+    rollouts = []
+    raw_advantages = []
+    owners = []
+    for circuit, count in zip(circuits, counts):
+        decisions = []
+        for sample in range(count):
+            advantage = float(len(raw_advantages) - 175)
+            decisions.append({
+                "remaining_rows": (0,),
+                "primary_row": 0,
+                "dtc_batches": (),
+                "old_log_prob": 0.0,
+                "return": 1.0,
+                "advantage": advantage,
+            })
+            raw_advantages.append(advantage)
+            owners.append(float(len(rollouts) + 1))
+        rollouts.append({"circuit": circuit, "decisions": decisions})
+
+    class TinyActorCritic(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+            self.seen = []
+
+        def forward(self, features):
+            self.seen.append(float(features[0, 0]))
+            scores = features[:, 0] * self.weight
+            value = features[:, 0].mean() * self.weight
+            return scores, value
+
+    permutations = [
+        torch.roll(torch.arange(sum(counts)), shifts=epoch)
+        for epoch in range(4)
+    ]
+    permutation_calls = []
+
+    def fake_randperm(size):
+        assert size == sum(counts)
+        result = permutations[len(permutation_calls)]
+        permutation_calls.append(result.clone())
+        return result
+
+    captured_advantages = []
+    real_objective = ppo_objective
+
+    def capture_objective(new_log_probs, old_log_probs, advantages, values,
+                          returns, entropies, *args, **kwargs):
+        captured_advantages.append(advantages.detach().clone())
+        return real_objective(
+            new_log_probs, old_log_probs, advantages, values, returns,
+            entropies, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "randperm", fake_randperm)
+    monkeypatch.setattr(trainer_module, "ppo_objective", capture_objective)
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = TrainConfig()
+    model = TinyActorCritic()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    summary = trainer._ppo_update(model, optimizer, rollouts)
+
+    assert summary["circuits"] == [circuit.name for circuit in circuits]
+    assert summary["circuit_count"] == 4
+    assert summary["transition_count"] == 350
+    assert summary["minibatch_count"] == 3
+    assert summary["optimizer_steps"] == 12
+    assert len(permutation_calls) == 4
+    assert [
+        minibatch["sample_count"]
+        for minibatch in summary["epochs"][0]["minibatches"]
+    ] == [128, 128, 94]
+    expected_advantages = normalize_advantages(torch.tensor(raw_advantages))
+    assert torch.allclose(
+        torch.cat(captured_advantages[:3]), expected_advantages[permutations[0]])
+    assert model.seen[:350] == [owners[index] for index in permutations[0]]
+
+
 def test_nested_dtc_trajectory_npz_uses_offsets_without_pickle(tmp_path):
     trainer = Trainer.__new__(Trainer)
     trainer.output = tmp_path
