@@ -19,7 +19,8 @@ from fault_order_rl.reward import (compute_gae, normalize_advantages,
                                    target_return, terminal_correction)
 from fault_order_rl.trainer import (POLICY_IDENTITY, SOLVER_PROTOCOL,
                                     TRAINING_PROTOCOL, TrainConfig, Trainer,
-                                    evaluate_checkpoint, evaluation_key)
+                                    evaluate_checkpoint, evaluation_key,
+                                    state_dict_equal)
 
 
 def test_actor_critic_shapes_and_dynamic_features():
@@ -514,6 +515,52 @@ def test_rollout_batch_ppo_uses_transition_minibatches_and_circuit_data(
     assert model.seen[:350] == [owners[index] for index in permutations[0]]
 
 
+def test_rollout_batch_collects_four_circuits_before_optimizer_update(
+        tmp_path, monkeypatch):
+    train_circuits = [
+        _circuit(tmp_path, "batch_" + str(index), "batch-" + str(index))
+        for index in range(4)
+    ]
+    validation_circuits = [
+        _circuit(tmp_path, "validation", "validation-digest")]
+    train_env = _FakeEnvironment(train_circuits)
+    validation_env = _FakeEnvironment(validation_circuits)
+    train_manifest = _manifest(
+        tmp_path / "train.json", [circuit.name for circuit in train_circuits])
+    validation_manifest = _manifest(
+        tmp_path / "validation.json", ["validation"])
+    from fault_order_rl import trainer as trainer_module
+    monkeypatch.setattr(
+        trainer_module, "load_all_circuits",
+        lambda manifest, environment: environment.circuits)
+    trainer = Trainer.create(
+        train_manifest, TrainConfig(), tmp_path / "run", train_env,
+        validation_manifest, validation_env)
+    snapshots = []
+    update_entries = []
+    real_run_policy = trainer._run_policy
+    real_ppo_update = trainer._ppo_update
+
+    def capture_rollout(circuit, model, *args, **kwargs):
+        if circuit in train_circuits:
+            snapshots.append(copy.deepcopy(model.state_dict()))
+        return real_run_policy(circuit, model, *args, **kwargs)
+
+    def capture_update(model, optimizer, rollouts):
+        update_entries.append((len(snapshots), [
+            rollout["circuit"].name for rollout in rollouts]))
+        return real_ppo_update(model, optimizer, rollouts)
+
+    monkeypatch.setattr(trainer, "_run_policy", capture_rollout)
+    monkeypatch.setattr(trainer, "_ppo_update", capture_update)
+    trainer.step()
+
+    assert update_entries == [(4, [circuit.name for circuit in train_circuits])]
+    assert len(snapshots) == 4
+    assert all(state_dict_equal(snapshots[0], snapshot)
+               for snapshot in snapshots[1:])
+
+
 def test_nested_dtc_trajectory_npz_uses_offsets_without_pickle(tmp_path):
     trainer = Trainer.__new__(Trainer)
     trainer.output = tmp_path
@@ -550,17 +597,22 @@ def test_schema_1_to_4_require_retraining(tmp_path):
             load_checkpoint(path)
 
 
-def test_per_circuit_checkpoint_resume_validation_best_and_final(
+def test_rollout_batch_checkpoint_resume_validation_best_and_final(
         tmp_path, monkeypatch):
     train_circuits = [
         _circuit(tmp_path, "train_a", "train-a"),
         _circuit(tmp_path, "train_b", "train-b"),
+        _circuit(tmp_path, "train_c", "train-c"),
+        _circuit(tmp_path, "train_d", "train-d"),
+        _circuit(tmp_path, "train_e", "train-e"),
     ]
     validation_circuits = [
         _circuit(tmp_path, "validation_a", "validation-a")]
     train_env = _FakeEnvironment(train_circuits)
     validation_env = _FakeEnvironment(validation_circuits)
-    train_manifest = _manifest(tmp_path / "train.json", ["train_a", "train_b"])
+    train_manifest = _manifest(
+        tmp_path / "train.json",
+        ["train_a", "train_b", "train_c", "train_d", "train_e"])
     validation_manifest = _manifest(
         tmp_path / "validation.json", ["validation_a"])
 
@@ -589,19 +641,42 @@ def test_per_circuit_checkpoint_resume_validation_best_and_final(
         trainer.step()
     committed = load_checkpoint(output / "latest.pt")
     assert committed["round"] == 0
-    assert committed["next_circuit_index"] == 1
-    first_parameters = copy.deepcopy(committed["model"])
+    assert committed["next_circuit_index"] == 0
+    assert not (output / "rounds" / "round-000001").exists()
+    initial_parameters = copy.deepcopy(committed["model"])
 
     resumed = Trainer.resume(
         output / "latest.pt", environment=train_env,
         validation_environment=validation_env)
-    assert resumed.next_circuit_index == 1
-    assert all(torch.equal(first_parameters[key], resumed.model.state_dict()[key])
-               for key in first_parameters)
+    assert resumed.next_circuit_index == 0
+    assert all(torch.equal(initial_parameters[key], resumed.model.state_dict()[key])
+               for key in initial_parameters)
+    train_env.fail_once.add("train_e")
+    with pytest.raises(RuntimeError, match="injected"):
+        resumed.step()
+    first_batch = load_checkpoint(output / "latest.pt")
+    assert first_batch["round"] == 0
+    assert first_batch["next_circuit_index"] == 4
+    for index in range(4):
+        assert (output / "rounds" / "round-000001"
+                / "circuit-{:06d}.json".format(index)).is_file()
+    assert not (output / "rounds" / "round-000001"
+                / "circuit-000004.json").exists()
+
+    resumed = Trainer.resume(
+        output / "latest.pt", environment=train_env,
+        validation_environment=validation_env)
+    assert resumed.next_circuit_index == 4
     records = resumed.step()
     assert resumed.round == 1
     assert [record["circuit"] for record in records
-            if record["kind"] == "episode"] == ["train_b"]
+            if record["kind"] == "episode"] == ["train_e"]
+    episode = next(record for record in records if record["kind"] == "episode")
+    assert episode["rollout_batch_circuits"] == ["train_e"]
+    assert episode["rollout_batch_circuit_count"] == 1
+    assert episode["rollout_batch_transition_count"] == 3
+    assert episode["ppo_minibatch_count"] == 1
+    assert episode["optimizer_steps"] == 4
     assert (output / "best.pt").is_file()
     best = load_checkpoint(output / "best.pt")
     assert best["kind"] == "best"

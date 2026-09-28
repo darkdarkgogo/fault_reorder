@@ -669,7 +669,8 @@ class Trainer:
         return best
 
     def _record(self, circuit, circuit_index, round_number, metrics, elapsed,
-                trajectory, decisions, reward_summary, ppo_epochs):
+                trajectory, decisions, reward_summary, ppo_summary,
+                rollout_batch_index):
         advantages = np.asarray(
             [decision["advantage"] for decision in decisions],
             dtype=np.float64)
@@ -685,7 +686,13 @@ class Trainer:
             "checkpoint_identity": self.run_id + ":" + str(round_number),
             "seconds": elapsed,
             "trajectory": trajectory,
-            "ppo_epochs": ppo_epochs,
+            "rollout_batch_index": rollout_batch_index,
+            "rollout_batch_circuits": ppo_summary["circuits"],
+            "rollout_batch_circuit_count": ppo_summary["circuit_count"],
+            "rollout_batch_transition_count": ppo_summary["transition_count"],
+            "ppo_minibatch_count": ppo_summary["minibatch_count"],
+            "optimizer_steps": ppo_summary["optimizer_steps"],
+            "ppo_epochs": ppo_summary["epochs"],
             "coverage_valid": reward_summary["coverage_shortfall"] == 0,
             "episode_return": reward_summary["target_return"],
             "advantage_mean": float(advantages.mean()),
@@ -699,38 +706,70 @@ class Trainer:
             raise ValueError("training already reached the configured round target")
         number = self.round + 1
         records = []
-        for index in range(self.next_circuit_index, len(self.circuits)):
+        while self.next_circuit_index < len(self.circuits):
+            batch_start = self.next_circuit_index
+            batch_end = min(
+                batch_start + self.config.circuit_batch_size,
+                len(self.circuits))
             rng_before = capture_rng()
-            circuit = self.circuits[index]
             try:
                 candidate = copy.deepcopy(self.model)
                 optimizer = self._optimizer(candidate)
                 optimizer.load_state_dict(copy.deepcopy(
                     self.optimizer.state_dict()))
                 candidate.eval()
-                with torch.no_grad():
-                    metrics, elapsed, decisions, trace = self._run_policy(
-                        circuit, candidate, self.config.temperature, True,
-                        self.environment)
-                reward_summary = self._finish_trajectory(
-                    circuit, metrics, decisions, self.states[circuit.name])
-                ppo_epochs = self._ppo_update(
-                    candidate, optimizer, circuit, decisions)
-                record = self._record(
-                    circuit, index, number, metrics, elapsed, trace,
-                    decisions, reward_summary, ppo_epochs)
-                self._write_circuit(number, index, record, decisions)
+                rollouts = []
+                for index in range(batch_start, batch_end):
+                    circuit = self.circuits[index]
+                    with torch.no_grad():
+                        metrics, elapsed, decisions, trace = self._run_policy(
+                            circuit, candidate, self.config.temperature, True,
+                            self.environment)
+                    reward_summary = self._finish_trajectory(
+                        circuit, metrics, decisions, self.states[circuit.name])
+                    rollouts.append({
+                        "circuit": circuit,
+                        "circuit_index": index,
+                        "metrics": metrics,
+                        "elapsed": elapsed,
+                        "decisions": decisions,
+                        "trace": trace,
+                        "reward_summary": reward_summary,
+                    })
+                ppo_summary = self._ppo_update(candidate, optimizer, rollouts)
+                rollout_batch_index = (
+                    batch_start // self.config.circuit_batch_size) + 1
+                batch_records = [
+                    self._record(
+                        rollout["circuit"], rollout["circuit_index"], number,
+                        rollout["metrics"], rollout["elapsed"],
+                        rollout["trace"], rollout["decisions"],
+                        rollout["reward_summary"], ppo_summary,
+                        rollout_batch_index)
+                    for rollout in rollouts
+                ]
+                for rollout, record in zip(rollouts, batch_records):
+                    self._write_circuit(
+                        number, rollout["circuit_index"], record,
+                        rollout["decisions"])
                 payload = self._payload(
                     model=candidate, optimizer=optimizer,
-                    next_circuit_index=index + 1)
+                    next_circuit_index=batch_end)
                 save_checkpoint(self.output / "latest.pt", payload)
             except BaseException:
                 restore_rng(rng_before)
                 raise
             self.model = candidate
             self.optimizer = optimizer
-            self.next_circuit_index = index + 1
-            records.append(record)
+            self.next_circuit_index = batch_end
+            records.extend(batch_records)
+            progress(
+                "PPO", "rollout batch done",
+                circuits=ppo_summary["circuit_count"],
+                transition_count=ppo_summary["transition_count"],
+                minibatch_count=ppo_summary["minibatch_count"],
+                optimizer_steps=ppo_summary["optimizer_steps"],
+            )
 
         report, exports = self.evaluate_model(self.model, number)
         best = self._choose_best(self.best, self.model, report)
