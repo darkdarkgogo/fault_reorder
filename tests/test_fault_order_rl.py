@@ -504,6 +504,8 @@ def test_rollout_batch_ppo_uses_transition_minibatches_and_circuit_data(
     assert summary["transition_count"] == 350
     assert summary["minibatch_count"] == 3
     assert summary["optimizer_steps"] == 12
+    assert all(np.isfinite(summary[key]) for key in (
+        "approx_kl", "clip_fraction", "gradient_norm", "critic_loss"))
     assert len(permutation_calls) == 4
     assert [
         minibatch["sample_count"]
@@ -636,6 +638,10 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
         Trainer.resume(
             output / "legacy-latest.pt", environment=train_env,
             validation_environment=validation_env)
+    legacy_report = evaluate_checkpoint(
+        output / "legacy-latest.pt", tmp_path / "legacy-evaluation",
+        environment=validation_env)
+    assert legacy_report["checkpoint_kind"] == "latest"
     train_env.fail_once.add("train_b")
     with pytest.raises(RuntimeError, match="injected"):
         trainer.step()

@@ -621,6 +621,21 @@ class Trainer:
                        for key, value in details.items()},
                 })
             epochs.append({"epoch": epoch + 1, "minibatches": minibatches})
+        all_minibatches = [
+            minibatch
+            for epoch in epochs
+            for minibatch in epoch["minibatches"]
+        ]
+        observed_samples = sum(
+            minibatch["sample_count"] for minibatch in all_minibatches)
+        observed_metrics = {
+            key: sum(
+                minibatch[key] * minibatch["sample_count"]
+                for minibatch in all_minibatches
+            ) / observed_samples
+            for key in (
+                "approx_kl", "clip_fraction", "gradient_norm", "critic_loss")
+        }
         return {
             "circuits": [rollout["circuit"].name for rollout in rollouts],
             "circuit_count": len(rollouts),
@@ -628,6 +643,7 @@ class Trainer:
             "minibatch_count": minibatch_count,
             "optimizer_steps": self.config.ppo_epochs * minibatch_count,
             "epochs": epochs,
+            **observed_metrics,
         }
 
     def evaluate_model(self, model, round_number, circuits=None,
@@ -769,6 +785,10 @@ class Trainer:
                 transition_count=ppo_summary["transition_count"],
                 minibatch_count=ppo_summary["minibatch_count"],
                 optimizer_steps=ppo_summary["optimizer_steps"],
+                approx_kl="{:.6g}".format(ppo_summary["approx_kl"]),
+                clip_fraction="{:.6g}".format(ppo_summary["clip_fraction"]),
+                gradient_norm="{:.6g}".format(ppo_summary["gradient_norm"]),
+                critic_loss="{:.6g}".format(ppo_summary["critic_loss"]),
             )
 
         report, exports = self.evaluate_model(self.model, number)
