@@ -6,7 +6,8 @@ Primary 从完整 remaining set 中选择；DTC secondary 候选由 C++ 从 unkn
 
 ## 固定实验协议
 
-- 训练 5 轮，每个 circuit rollout 后立即执行 4 次 PPO epoch。
+- 训练 5 轮；同一冻结策略先收集最多 4 个 circuit，再执行 4 次 PPO epoch。
+- 每个 PPO epoch 重新打乱合并后的 transitions，并按最多 128 transitions 切 minibatch。
 - `gamma=1.0`、`GAE lambda=0.95`、`clip=0.2`。
 - value loss 系数 `0.5`，entropy 系数 `0.01`，Adam 学习率 `1e-4`。
 - step shaping `alpha=0.1`，覆盖短缺惩罚 `beta=10.0`。
@@ -45,7 +46,8 @@ python3 -m fault_order_rl train \
 ```
 
 恢复不能改变目标轮数或训练配置。Schema 1–4 与当前 BFS-filtered action mask、概率及
-回滚协议不兼容，必须重新训练。
+回滚协议不兼容；缺少 `multi_circuit_ppo_batch_v1` training protocol 的旧 schema 5
+checkpoint 也不能恢复，必须重新训练，但仍可用于独立评估。
 
 ## Primary、DTC 与缓存分数
 
@@ -97,17 +99,23 @@ GAE。一个 step 的 joint log probability 是 Primary categorical 项，加上
 实际执行前缀的 Plackett-Luce 项。Rollout 和 PPO replay 中每个 transition 都只调用一次
 模型。
 
+GAE 与 return 始终按 circuit 独立计算，不能跨 episode。最多 4 个 circuit 全部完成后，
+合并其 raw advantages 并统一标准化；transition 等权，不按 circuit 长度重新加权。每个
+PPO epoch 都产生新的随机排列，再按 `128/128/.../尾批` 切分，尾部不足 128 的 minibatch
+保留并独立执行一次 optimizer step。若本轮最后不足 4 个 circuit，也保留为一个 rollout
+batch。
+
 ## Checkpoint 与 artifacts
 
-- `latest.pt`：schema 5，可恢复；每完成一个 training circuit 就原子提交。
+- `latest.pt`：schema 5，可恢复；每完成一个最多 4-circuit rollout batch 就原子提交。
 - `best.pt`：独立验证集上的最佳模型，不含 optimizer 和 RNG。
 - `final.pt`：第 5 轮最终模型，不含 optimizer 和 RNG；可能与 best 来自不同轮。
 - `rounds/round-NNNNNN/circuit-NNNNNN.{json,npz}`：Primary rows、各 BFS batch 的
   candidate/requested/executed/embedded rows、奖励、GAE 与 PPO 指标。
 - `validation/round-NNNNNN/`：每轮确定性验证的排名、轨迹和 summary。
 
-若进程在某个 circuit 中断，恢复从上一个已提交 circuit 的下一索引继续，并恢复模型、
-optimizer 与 Python/NumPy/Torch RNG。
+若进程在 rollout batch 中任一 circuit 或 PPO update 中断，该 batch 不提交；恢复从上一个
+已提交 batch 的下一 circuit 索引继续，并恢复模型、optimizer 与 Python/NumPy/Torch RNG。
 
 ## 评估
 

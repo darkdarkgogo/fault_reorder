@@ -45,6 +45,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Dynamic BFS-filtered ranked-DTC actor-critic PPO: fixed 5 rounds, "
+            "4-circuit rollout batches, 128-transition PPO minibatches, "
             "Primary backtrack=100, DTC secondary backtrack=50, schema=5"
         ))
     commands = parser.add_subparsers(dest="command", required=True)

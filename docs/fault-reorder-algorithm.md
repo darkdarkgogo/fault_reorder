@@ -113,8 +113,11 @@ shortfall > 0 : -10 * shortfall / InitialEqv
 ```
 
 最后一步加入 terminal correction，使 `sum(r_t)` 严格等于目标回报。随后以
-`gamma=1.0`、`lambda=0.95` 计算 GAE，并标准化 advantage。每个 circuit rollout 后执行
-4 次 PPO epoch：clip `0.2`，value 系数 `0.5`，entropy 系数 `0.01`，gradient clip `1.0`。
+`gamma=1.0`、`lambda=0.95` 按 circuit 独立计算 GAE。使用同一冻结 old policy 收集最多
+4 个 circuit 后，合并所有 transitions 并统一标准化 advantage。Transition 等权；每个
+PPO epoch 独立 shuffle，再按最多 128 transitions 切 minibatch，尾部小 batch 不丢弃。
+随后执行 4 次 PPO epoch：clip `0.2`，value 系数 `0.5`，entropy 系数 `0.01`，gradient
+clip `1.0`。
 
 ## 7. Training、validation 与恢复
 
@@ -127,9 +130,12 @@ shortfall > 0 : -10 * shortfall / InitialEqv
 (sum(validation coverage shortfall), sum(validation patterns_after_stc))
 ```
 
-固定执行 5 轮。每个 training circuit 完成 rollout 和 4 次 PPO epoch 后，写入 circuit
-artifacts，并原子提交 schema 5 `latest.pt`。Checkpoint 保存模型、optimizer、RNG、两个
-manifest、provenance、两个 split 的 baseline、completed round 和 next circuit index。
+固定执行 5 轮。每个最多 4 个 training circuits 的 rollout batch 完成收集和 PPO update
+后，写入各 circuit artifacts，并原子提交 schema 5 `latest.pt`。最后不足 4 个 circuit 的
+batch 仍训练。Checkpoint 保存模型、optimizer、RNG、training protocol、两个 manifest、
+provenance、两个 split 的 baseline、completed round 和 next circuit index。Batch 中断时
+从该 batch 起点重跑，不暴露部分更新模型。
 
 每轮完成后只运行独立 validation 并更新 `best.pt`；第 5 轮结束发布 `final.pt`。Schema
-1–4 与新的 BFS action mask、joint probability 和 rollback protocol 不兼容，不能恢复。
+1–4 与新的 BFS action mask、joint probability 和 rollback protocol 不兼容，不能恢复；
+缺少 multi-circuit training protocol 的旧 schema 5 也不能恢复，但仍可独立评估。
