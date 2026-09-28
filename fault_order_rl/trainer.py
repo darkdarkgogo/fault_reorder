@@ -27,7 +27,7 @@ from .reward import (compute_gae, normalize_advantages, ppo_objective,
 
 
 POLICY_IDENTITY = "dynamic_bfs_ranked_dtc_actor_critic_ppo_v2"
-TRAINING_PROTOCOL = "multi_circuit_ppo_batch_v1"
+TRAINING_PROTOCOL = "shuffled_multi_circuit_ppo_batch_v1"
 SOLVER_PROTOCOL = {
     **PROTOCOL_CONFIG,
     "compression_algorithm_version": "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4",
@@ -239,6 +239,16 @@ class Trainer:
 
     def _optimizer(self, model):
         return torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
+
+    def _round_circuit_indices(self, round_number):
+        if (isinstance(round_number, bool)
+                or not isinstance(round_number, int)
+                or round_number <= 0):
+            raise ValueError("round_number must be a positive integer")
+        indices = list(range(len(self.circuits)))
+        round_seed = (self.config.seed << 32) | round_number
+        random.Random(round_seed).shuffle(indices)
+        return tuple(indices)
 
     @classmethod
     def create(cls, manifest, config, output, environment=None,
@@ -721,12 +731,13 @@ class Trainer:
         if self.round >= self.config.rounds:
             raise ValueError("training already reached the configured round target")
         number = self.round + 1
+        circuit_indices = self._round_circuit_indices(number)
         records = []
-        while self.next_circuit_index < len(self.circuits):
+        while self.next_circuit_index < len(circuit_indices):
             batch_start = self.next_circuit_index
             batch_end = min(
                 batch_start + self.config.circuit_batch_size,
-                len(self.circuits))
+                len(circuit_indices))
             rng_before = capture_rng()
             try:
                 candidate = copy.deepcopy(self.model)
@@ -735,7 +746,8 @@ class Trainer:
                     self.optimizer.state_dict()))
                 candidate.eval()
                 rollouts = []
-                for index in range(batch_start, batch_end):
+                for position in range(batch_start, batch_end):
+                    index = circuit_indices[position]
                     circuit = self.circuits[index]
                     with torch.no_grad():
                         metrics, elapsed, decisions, trace = self._run_policy(

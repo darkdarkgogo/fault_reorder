@@ -3,6 +3,7 @@
 import copy
 import json
 from pathlib import Path
+import random
 
 import numpy as np
 import pytest
@@ -107,7 +108,26 @@ def test_fixed_protocol_and_training_defaults():
             {"ppo_minibatch_size": 0}, {"ppo_minibatch_size": False}):
         with pytest.raises(ValueError, match="positive integer"):
             TrainConfig(**changes).validate()
-    assert TRAINING_PROTOCOL == "multi_circuit_ppo_batch_v1"
+    assert TRAINING_PROTOCOL == "shuffled_multi_circuit_ppo_batch_v1"
+
+
+def test_round_circuit_order_is_deterministic_distinct_and_rng_isolated():
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = TrainConfig(seed=14)
+    trainer.circuits = [object() for _ in range(7)]
+    rng_before = random.getstate()
+
+    first = trainer._round_circuit_indices(1)
+    second = trainer._round_circuit_indices(2)
+
+    assert sorted(first) == list(range(7))
+    assert sorted(second) == list(range(7))
+    assert first == trainer._round_circuit_indices(1)
+    assert first != second
+    assert random.getstate() == rng_before
+    for invalid in (0, -1, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            trainer._round_circuit_indices(invalid)
 
 
 def _step_summary(**changes):
@@ -538,6 +558,10 @@ def test_rollout_batch_collects_four_circuits_before_optimizer_update(
     trainer = Trainer.create(
         train_manifest, TrainConfig(), tmp_path / "run", train_env,
         validation_manifest, validation_env)
+    shuffled_names = [
+        train_circuits[index].name
+        for index in trainer._round_circuit_indices(1)
+    ]
     snapshots = []
     update_entries = []
     real_run_policy = trainer._run_policy
@@ -557,7 +581,7 @@ def test_rollout_batch_collects_four_circuits_before_optimizer_update(
     monkeypatch.setattr(trainer, "_ppo_update", capture_update)
     trainer.step()
 
-    assert update_entries == [(4, [circuit.name for circuit in train_circuits])]
+    assert update_entries == [(4, shuffled_names)]
     assert len(snapshots) == 4
     assert all(state_dict_equal(snapshots[0], snapshot)
                for snapshot in snapshots[1:])
@@ -632,7 +656,7 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
     assert initial["version"] == 5
     assert initial["training_protocol"] == TRAINING_PROTOCOL
     legacy = copy.deepcopy(initial)
-    legacy.pop("training_protocol")
+    legacy["training_protocol"] = "multi_circuit_ppo_batch_v1"
     save_checkpoint(output / "legacy-latest.pt", legacy)
     with pytest.raises(ValueError, match="training protocol"):
         Trainer.resume(
@@ -642,7 +666,9 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
         output / "legacy-latest.pt", tmp_path / "legacy-evaluation",
         environment=validation_env)
     assert legacy_report["checkpoint_kind"] == "latest"
-    train_env.fail_once.add("train_b")
+    round_order = trainer._round_circuit_indices(1)
+    ordered_names = [train_circuits[index].name for index in round_order]
+    train_env.fail_once.add(ordered_names[1])
     with pytest.raises(RuntimeError, match="injected"):
         trainer.step()
     committed = load_checkpoint(output / "latest.pt")
@@ -655,19 +681,22 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
         output / "latest.pt", environment=train_env,
         validation_environment=validation_env)
     assert resumed.next_circuit_index == 0
+    assert resumed._round_circuit_indices(1) == round_order
     assert all(torch.equal(initial_parameters[key], resumed.model.state_dict()[key])
                for key in initial_parameters)
-    train_env.fail_once.add("train_e")
+    train_env.fail_once.add(ordered_names[4])
     with pytest.raises(RuntimeError, match="injected"):
         resumed.step()
     first_batch = load_checkpoint(output / "latest.pt")
     assert first_batch["round"] == 0
     assert first_batch["next_circuit_index"] == 4
-    for index in range(4):
+    for index in round_order[:4]:
         assert (output / "rounds" / "round-000001"
                 / "circuit-{:06d}.json".format(index)).is_file()
-    assert not (output / "rounds" / "round-000001"
-                / "circuit-000004.json").exists()
+    assert not (
+        output / "rounds" / "round-000001"
+        / "circuit-{:06d}.json".format(round_order[4])
+    ).exists()
 
     resumed = Trainer.resume(
         output / "latest.pt", environment=train_env,
@@ -676,9 +705,9 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
     records = resumed.step()
     assert resumed.round == 1
     assert [record["circuit"] for record in records
-            if record["kind"] == "episode"] == ["train_e"]
+            if record["kind"] == "episode"] == [ordered_names[4]]
     episode = next(record for record in records if record["kind"] == "episode")
-    assert episode["rollout_batch_circuits"] == ["train_e"]
+    assert episode["rollout_batch_circuits"] == [ordered_names[4]]
     assert episode["rollout_batch_circuit_count"] == 1
     assert episode["rollout_batch_transition_count"] == 3
     assert episode["ppo_minibatch_count"] == 1
