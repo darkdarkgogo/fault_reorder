@@ -27,6 +27,7 @@ from .reward import (compute_gae, normalize_advantages, ppo_objective,
 
 
 POLICY_IDENTITY = "dynamic_bfs_ranked_dtc_actor_critic_ppo_v2"
+TRAINING_PROTOCOL = "multi_circuit_ppo_batch_v1"
 SOLVER_PROTOCOL = {
     **PROTOCOL_CONFIG,
     "compression_algorithm_version": "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4",
@@ -39,6 +40,8 @@ DEFAULT_VALIDATION_MANIFEST = (
 @dataclass
 class TrainConfig:
     rounds: int = 5
+    circuit_batch_size: int = 4
+    ppo_minibatch_size: int = 128
     learning_rate: float = 1e-4
     gradient_clip: float = 1.0
     alpha: float = 0.1
@@ -55,7 +58,9 @@ class TrainConfig:
     threads: int = 1
 
     def validate(self):
-        for key in ("rounds", "ppo_epochs", "backtrack_limit", "threads"):
+        for key in (
+                "rounds", "circuit_batch_size", "ppo_minibatch_size",
+                "ppo_epochs", "backtrack_limit", "threads"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(key + " must be a positive integer")
@@ -331,6 +336,8 @@ class Trainer:
              "checkpoint PyTorch version changed"),
             (saved.get("policy"), POLICY_IDENTITY,
              "checkpoint policy identity changed"),
+            (saved.get("training_protocol"), TRAINING_PROTOCOL,
+             "checkpoint training protocol changed"),
             (saved.get("solver_protocol"), SOLVER_PROTOCOL,
              "checkpoint solver protocol changed"),
         )
@@ -719,6 +726,7 @@ class Trainer:
             "kind": "latest",
             "run_id": self.run_id,
             "policy": POLICY_IDENTITY,
+            "training_protocol": TRAINING_PROTOCOL,
             "input_dimension": 515,
             "solver_protocol": copy.deepcopy(SOLVER_PROTOCOL),
             "manifest_path": str(self.manifest.path),

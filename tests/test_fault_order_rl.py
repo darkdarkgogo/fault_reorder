@@ -18,8 +18,8 @@ from fault_order_rl.reward import (compute_gae, normalize_advantages,
                                    ppo_objective, step_reward,
                                    target_return, terminal_correction)
 from fault_order_rl.trainer import (POLICY_IDENTITY, SOLVER_PROTOCOL,
-                                    TrainConfig, Trainer, evaluate_checkpoint,
-                                    evaluation_key)
+                                    TRAINING_PROTOCOL, TrainConfig, Trainer,
+                                    evaluate_checkpoint, evaluation_key)
 
 
 def test_actor_critic_shapes_and_dynamic_features():
@@ -95,10 +95,18 @@ def test_fixed_protocol_and_training_defaults():
     config = TrainConfig()
     config.validate()
     assert config.rounds == 5
+    assert config.circuit_batch_size == 4
+    assert config.ppo_minibatch_size == 128
     assert config.ppo_epochs == 4
     assert config.backtrack_limit == 100
     with pytest.raises(ValueError, match="100"):
         TrainConfig(backtrack_limit=200).validate()
+    for changes in (
+            {"circuit_batch_size": 0}, {"circuit_batch_size": True},
+            {"ppo_minibatch_size": 0}, {"ppo_minibatch_size": False}):
+        with pytest.raises(ValueError, match="positive integer"):
+            TrainConfig(**changes).validate()
+    assert TRAINING_PROTOCOL == "multi_circuit_ppo_batch_v1"
 
 
 def _step_summary(**changes):
@@ -477,7 +485,16 @@ def test_per_circuit_checkpoint_resume_validation_best_and_final(
     trainer = Trainer.create(
         train_manifest, TrainConfig(), output, train_env,
         validation_manifest, validation_env)
-    assert load_checkpoint(output / "latest.pt")["version"] == 5
+    initial = load_checkpoint(output / "latest.pt")
+    assert initial["version"] == 5
+    assert initial["training_protocol"] == TRAINING_PROTOCOL
+    legacy = copy.deepcopy(initial)
+    legacy.pop("training_protocol")
+    save_checkpoint(output / "legacy-latest.pt", legacy)
+    with pytest.raises(ValueError, match="training protocol"):
+        Trainer.resume(
+            output / "legacy-latest.pt", environment=train_env,
+            validation_environment=validation_env)
     train_env.fail_once.add("train_b")
     with pytest.raises(RuntimeError, match="injected"):
         trainer.step()
