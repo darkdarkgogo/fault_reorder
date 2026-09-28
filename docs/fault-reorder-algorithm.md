@@ -130,12 +130,15 @@ clip `1.0`。
 (sum(validation coverage shortfall), sum(validation patterns_after_stc))
 ```
 
-固定执行 5 轮。每个最多 4 个 training circuits 的 rollout batch 完成收集和 PPO update
-后，写入各 circuit artifacts，并原子提交 schema 5 `latest.pt`。最后不足 4 个 circuit 的
-batch 仍训练。Checkpoint 保存模型、optimizer、RNG、training protocol、两个 manifest、
-provenance、两个 split 的 baseline、completed round 和 next circuit index。Batch 中断时
-从该 batch 起点重跑，不暴露部分更新模型。
+固定执行 5 轮。每轮使用隔离 RNG，根据 training seed 和一基 round number 洗牌全部
+training circuits，再依次组成最多 4 个 circuits 的 rollout batch。该顺序可确定性重建，
+且不会消耗 rollout 的全局 RNG。每个 batch 完成收集和 PPO update 后，写入各 circuit
+artifacts，并原子提交 schema 5 `latest.pt`；artifact 文件仍使用 manifest index。最后不足
+4 个 circuit 的 batch 仍训练。Checkpoint 保存模型、optimizer、RNG、training protocol、
+两个 manifest、provenance、两个 split 的 baseline、completed round 和 shuffled-order
+offset。Batch 中断时从该 batch 起点重跑，不暴露部分更新模型。
 
 每轮完成后只运行独立 validation 并更新 `best.pt`；第 5 轮结束发布 `final.pt`。Schema
 1–4 与新的 BFS action mask、joint probability 和 rollback protocol 不兼容，不能恢复；
-缺少 multi-circuit training protocol 的旧 schema 5 也不能恢复，但仍可独立评估。
+training protocol 不是 `shuffled_multi_circuit_ppo_batch_v1` 的旧 schema 5 也不能恢复，
+但仍可独立评估。

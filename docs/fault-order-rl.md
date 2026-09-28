@@ -7,6 +7,7 @@ Primary 从完整 remaining set 中选择；DTC secondary 候选由 C++ 从 unkn
 ## 固定实验协议
 
 - 训练 5 轮；同一冻结策略先收集最多 4 个 circuit，再执行 4 次 PPO epoch。
+- 每个 round 根据 training seed 与 round number 独立 shuffle 全部 training circuits。
 - 每个 PPO epoch 重新打乱合并后的 transitions，并按最多 128 transitions 切 minibatch。
 - `gamma=1.0`、`GAE lambda=0.95`、`clip=0.2`。
 - value loss 系数 `0.5`，entropy 系数 `0.01`，Adam 学习率 `1e-4`。
@@ -46,8 +47,9 @@ python3 -m fault_order_rl train \
 ```
 
 恢复不能改变目标轮数或训练配置。Schema 1–4 与当前 BFS-filtered action mask、概率及
-回滚协议不兼容；缺少 `multi_circuit_ppo_batch_v1` training protocol 的旧 schema 5
-checkpoint 也不能恢复，必须重新训练，但仍可用于独立评估。
+回滚协议不兼容；training protocol 不是
+`shuffled_multi_circuit_ppo_batch_v1` 的旧 schema 5 checkpoint 也不能恢复，必须重新训练，
+但仍可用于独立评估。
 
 ## Primary、DTC 与缓存分数
 
@@ -105,6 +107,11 @@ PPO epoch 都产生新的随机排列，再按 `128/128/.../尾批` 切分，尾
 保留并独立执行一次 optimizer step。若本轮最后不足 4 个 circuit，也保留为一个 rollout
 batch。
 
+每轮 circuit 顺序使用隔离的 Python RNG，由固定 training seed 和一基 round number
+确定，因此同一轮可在恢复时精确重建，又不会消耗 rollout 的全局 RNG。Checkpoint 中的
+`next_circuit_index` 表示该轮随机排列内已完成的位置数；circuit JSON/NPZ 文件名仍使用
+manifest index，保证 artifact 身份稳定。
+
 ## Checkpoint 与 artifacts
 
 - `latest.pt`：schema 5，可恢复；每完成一个最多 4-circuit rollout batch 就原子提交。
@@ -115,7 +122,7 @@ batch。
 - `validation/round-NNNNNN/`：每轮确定性验证的排名、轨迹和 summary。
 
 若进程在 rollout batch 中任一 circuit 或 PPO update 中断，该 batch 不提交；恢复从上一个
-已提交 batch 的下一 circuit 索引继续，并恢复模型、optimizer 与 Python/NumPy/Torch RNG。
+已提交 batch 的下一随机排列位置继续，并恢复模型、optimizer 与 Python/NumPy/Torch RNG。
 
 ## 评估
 
