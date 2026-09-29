@@ -763,6 +763,23 @@ def test_validation_tensorboard_reduction_uses_ratio_of_totals():
     assert ("Validation/coverage_eligible", 0.0, 3) in trainer.writer.calls
 
 
+def test_train_closes_tensorboard_writer_when_step_raises():
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = TrainConfig()
+    trainer.round = 0
+    trainer.writer = _RecordingWriter()
+
+    def fail_step():
+        raise RuntimeError("injected train failure")
+
+    trainer.step = fail_step
+    writer = trainer.writer
+    with pytest.raises(RuntimeError, match="train failure"):
+        trainer.train()
+    assert writer.closed
+    assert trainer.writer is None
+
+
 def test_nested_dtc_trajectory_npz_uses_offsets_without_pickle(tmp_path):
     trainer = Trainer.__new__(Trainer)
     trainer.output = tmp_path
@@ -823,10 +840,16 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
     def fake_load_all(manifest, environment):
         return environment.circuits
 
+    writers = []
+
+    def create_writer(path):
+        writer = _RecordingWriter()
+        writers.append(writer)
+        return writer
+
     monkeypatch.setattr(trainer_module, "load_all_circuits", fake_load_all)
     monkeypatch.setattr(
-        trainer_module, "_create_summary_writer",
-        lambda path: _RecordingWriter())
+        trainer_module, "_create_summary_writer", create_writer)
     output = tmp_path / "run"
     trainer = Trainer.create(
         train_manifest, TrainConfig(), output, train_env,
@@ -840,7 +863,9 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
     legacy["version"] = 5
     legacy["config"]["entropy_coef"] = 0.01
     legacy["config"].pop("entropy_coef_normalized")
-    legacy["training_protocol"] = "multi_circuit_ppo_batch_v1"
+    legacy.pop("global_optimizer_step")
+    legacy.pop("global_rollout_batch_step")
+    legacy["training_protocol"] = "shuffled_multi_circuit_ppo_batch_v1"
     save_checkpoint(output / "legacy-latest.pt", legacy)
     with pytest.raises(ValueError, match="schema 6"):
         Trainer.resume(
@@ -914,6 +939,8 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
     for _ in range(4):
         resumed.step()
     report = resumed.train()
+    assert writers[-1].closed
+    assert resumed.writer is None
     final = load_checkpoint(output / "final.pt")
     assert resumed.round == 5
     assert final["kind"] == "final"
