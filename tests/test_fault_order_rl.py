@@ -14,6 +14,7 @@ from fault_order_rl.data import CircuitData, CircuitSpec
 from fault_order_rl.environment import PROTOCOL_CONFIG, PodemEnvironment, PodemSession
 from fault_order_rl.model import FaultActorCritic, build_dynamic_features
 from fault_order_rl.policy import (centered_logits, joint_action_stats,
+                                   joint_action_stats_from_scores,
                                    sample_candidate_ranking, sample_primary)
 from fault_order_rl.reward import (compute_gae, normalize_advantages,
                                    ppo_objective, step_reward,
@@ -22,6 +23,25 @@ from fault_order_rl.trainer import (POLICY_IDENTITY, SOLVER_PROTOCOL,
                                     TRAINING_PROTOCOL, TrainConfig, Trainer,
                                     evaluate_checkpoint, evaluation_key,
                                     state_dict_equal)
+
+
+class _RecordingWriter:
+    def __init__(self, operations=None):
+        self.calls = []
+        self.operations = operations
+        self.closed = False
+
+    def add_scalar(self, tag, value, step):
+        self.calls.append((tag, float(value), int(step)))
+        if self.operations is not None:
+            self.operations.append("event:" + tag)
+
+    def flush(self):
+        if self.operations is not None:
+            self.operations.append("flush")
+
+    def close(self):
+        self.closed = True
 
 
 def test_actor_critic_shapes_and_dynamic_features():
@@ -54,17 +74,51 @@ def test_primary_and_bfs_batch_joint_probability_have_gradients():
         "requested_rows": (2, 3),
         "executed_prefix_rows": (2,),
     },)
-    log_prob, entropy, value = joint_action_stats(
+    log_prob, entropy_raw, entropy_normalized, value = joint_action_stats(
         model, embeddings, rows, 0, batches, 1.0)
     replay_scores, _ = model(build_dynamic_features(embeddings, rows))
     logits = centered_logits(replay_scores, 1.0)
     manual = (torch.log_softmax(logits, 0)[1]
               + torch.log_softmax(logits[[0, 2]], 0)[1])
     assert torch.allclose(log_prob, manual)
-    loss = -(log_prob + 0.01 * entropy) + value.square()
+    assert 0.0 <= float(entropy_normalized) <= 1.0
+    loss = -(log_prob + 0.05 * entropy_normalized) + value.square()
     loss.backward()
     assert torch.isfinite(loss)
     assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_entropy_is_normalized_per_conditional_action_space():
+    scores = torch.zeros(4, requires_grad=True)
+    value = scores.sum() * 0.0
+    batches = ({
+        "bfs_candidate_rows": (1, 2, 3),
+        "requested_rows": (1, 2, 3),
+        "executed_prefix_rows": (1, 2, 3),
+    },)
+
+    _, entropy_raw, entropy_normalized, _ = joint_action_stats_from_scores(
+        scores, value, (0, 1, 2, 3), 0, batches, 1.0)
+
+    expected_raw = (
+        np.log(4.0) + np.log(3.0) + np.log(2.0)
+    ) / 4.0
+    assert float(entropy_raw) == pytest.approx(expected_raw)
+    assert float(entropy_normalized) == pytest.approx(1.0)
+
+
+def test_normalized_entropy_handles_singleton_and_concentrated_choices():
+    singleton = torch.tensor([0.0], requires_grad=True)
+    _, singleton_raw, singleton_normalized, _ = joint_action_stats_from_scores(
+        singleton, singleton.sum() * 0.0, (0,), 0, (), 1.0)
+    assert float(singleton_raw) == 0.0
+    assert float(singleton_normalized) == 0.0
+    assert torch.isfinite(singleton_normalized)
+
+    concentrated = torch.tensor([20.0, 0.0, -20.0], requires_grad=True)
+    _, _, concentrated_normalized, _ = joint_action_stats_from_scores(
+        concentrated, concentrated.sum() * 0.0, (0, 1, 2), 0, (), 1.0)
+    assert 0.0 <= float(concentrated_normalized) < 1e-6
 
 
 def test_reward_terminal_target_gae_and_ppo_are_finite():
@@ -79,10 +133,34 @@ def test_reward_terminal_target_gae_and_ppo_are_finite():
     values = torch.tensor([0.1, 0.2], requires_grad=True)
     loss, details = ppo_objective(
         new_log_probs, torch.tensor([-0.35, -0.45]), normalized,
-        values, returns, torch.tensor([0.5, 0.4]))
+        values, returns, torch.tensor([0.5, 0.4]),
+        torch.tensor([0.8, 0.6]))
     loss.backward()
     assert torch.isfinite(loss)
     assert all(torch.isfinite(value) for value in details.values())
+
+
+def test_ppo_objective_uses_only_normalized_entropy_for_bonus():
+    common = (
+        torch.zeros(2), torch.zeros(2), torch.zeros(2),
+        torch.zeros(2), torch.zeros(2),
+    )
+    first, first_details = ppo_objective(
+        *common, torch.tensor([0.0, 10.0]), torch.tensor([0.25, 0.75]),
+        entropy_coef_normalized=0.05)
+    second, second_details = ppo_objective(
+        *common, torch.tensor([100.0, 200.0]), torch.tensor([0.25, 0.75]),
+        entropy_coef_normalized=0.05)
+    third, _ = ppo_objective(
+        *common, torch.tensor([0.0, 10.0]), torch.tensor([0.0, 0.0]),
+        entropy_coef_normalized=0.05)
+
+    assert float(first) == pytest.approx(-0.025)
+    assert torch.equal(first, second)
+    assert float(third) == 0.0
+    assert float(first_details["entropy_raw"]) == pytest.approx(5.0)
+    assert float(second_details["entropy_raw"]) == pytest.approx(150.0)
+    assert float(first_details["entropy_normalized"]) == pytest.approx(0.5)
 
 
 def test_fixed_protocol_and_training_defaults():
@@ -100,6 +178,7 @@ def test_fixed_protocol_and_training_defaults():
     assert config.circuit_batch_size == 4
     assert config.ppo_minibatch_size == 128
     assert config.ppo_epochs == 4
+    assert config.entropy_coef_normalized == pytest.approx(0.05)
     assert config.backtrack_limit == 100
     with pytest.raises(ValueError, match="100"):
         TrainConfig(backtrack_limit=200).validate()
@@ -108,7 +187,8 @@ def test_fixed_protocol_and_training_defaults():
             {"ppo_minibatch_size": 0}, {"ppo_minibatch_size": False}):
         with pytest.raises(ValueError, match="positive integer"):
             TrainConfig(**changes).validate()
-    assert TRAINING_PROTOCOL == "shuffled_multi_circuit_ppo_batch_v1"
+    assert TRAINING_PROTOCOL == (
+        "normalized_entropy_shuffled_multi_circuit_ppo_batch_v2")
 
 
 def test_round_circuit_order_is_deterministic_distinct_and_rng_isolated():
@@ -504,11 +584,12 @@ def test_rollout_batch_ppo_uses_transition_minibatches_and_circuit_data(
     real_objective = ppo_objective
 
     def capture_objective(new_log_probs, old_log_probs, advantages, values,
-                          returns, entropies, *args, **kwargs):
+                          returns, raw_entropies, normalized_entropies,
+                          *args, **kwargs):
         captured_advantages.append(advantages.detach().clone())
         return real_objective(
             new_log_probs, old_log_probs, advantages, values, returns,
-            entropies, *args, **kwargs)
+            raw_entropies, normalized_entropies, *args, **kwargs)
 
     monkeypatch.setattr(torch, "randperm", fake_randperm)
     monkeypatch.setattr(trainer_module, "ppo_objective", capture_objective)
@@ -525,7 +606,11 @@ def test_rollout_batch_ppo_uses_transition_minibatches_and_circuit_data(
     assert summary["minibatch_count"] == 3
     assert summary["optimizer_steps"] == 12
     assert all(np.isfinite(summary[key]) for key in (
-        "approx_kl", "clip_fraction", "gradient_norm", "critic_loss"))
+        "approx_kl", "clip_fraction", "gradient_norm_pre_clip",
+        "critic_loss", "entropy_raw", "entropy_normalized",
+        "choice_transition_fraction"))
+    assert [minibatch["optimizer_offset"]
+            for minibatch in summary["flat_minibatches"]] == list(range(1, 13))
     assert len(permutation_calls) == 4
     assert [
         minibatch["sample_count"]
@@ -552,12 +637,25 @@ def test_rollout_batch_collects_four_circuits_before_optimizer_update(
     validation_manifest = _manifest(
         tmp_path / "validation.json", ["validation"])
     from fault_order_rl import trainer as trainer_module
+    operations = []
+    writer = _RecordingWriter(operations)
+    real_save_checkpoint = trainer_module.save_checkpoint
+
+    def recording_save_checkpoint(path, state):
+        operations.append("checkpoint:" + Path(path).name)
+        return real_save_checkpoint(path, state)
+
     monkeypatch.setattr(
         trainer_module, "load_all_circuits",
         lambda manifest, environment: environment.circuits)
+    monkeypatch.setattr(
+        trainer_module, "_create_summary_writer", lambda path: writer)
+    monkeypatch.setattr(
+        trainer_module, "save_checkpoint", recording_save_checkpoint)
     trainer = Trainer.create(
         train_manifest, TrainConfig(), tmp_path / "run", train_env,
         validation_manifest, validation_env)
+    operations.clear()
     shuffled_names = [
         train_circuits[index].name
         for index in trainer._round_circuit_indices(1)
@@ -585,6 +683,84 @@ def test_rollout_batch_collects_four_circuits_before_optimizer_update(
     assert len(snapshots) == 4
     assert all(state_dict_equal(snapshots[0], snapshot)
                for snapshot in snapshots[1:])
+    ppo_calls = [call for call in writer.calls if call[0].startswith("PPO/")]
+    assert sorted({step for _, _, step in ppo_calls}) == [1, 2, 3, 4]
+    assert ("Rollout/transition_count", 12.0, 1) in writer.calls
+    assert all(step == 1 for tag, _, step in writer.calls
+               if tag.startswith("Validation/"))
+    first_ppo_event = next(
+        index for index, item in enumerate(operations)
+        if item.startswith("event:PPO/"))
+    first_validation_event = next(
+        index for index, item in enumerate(operations)
+        if item.startswith("event:Validation/"))
+    latest_checkpoints = [
+        index for index, item in enumerate(operations)
+        if item == "checkpoint:latest.pt"]
+    assert first_ppo_event > latest_checkpoints[0]
+    assert first_validation_event > latest_checkpoints[1]
+
+
+def test_checkpoint_failure_writes_no_tensorboard_events(tmp_path, monkeypatch):
+    train_circuit = _circuit(tmp_path, "transaction_train", "train-digest")
+    validation_circuit = _circuit(
+        tmp_path, "transaction_validation", "validation-digest")
+    train_env = _FakeEnvironment([train_circuit])
+    validation_env = _FakeEnvironment([validation_circuit])
+    train_manifest = _manifest(tmp_path / "train.json", [train_circuit.name])
+    validation_manifest = _manifest(
+        tmp_path / "validation.json", [validation_circuit.name])
+    from fault_order_rl import trainer as trainer_module
+
+    writer = _RecordingWriter()
+    monkeypatch.setattr(
+        trainer_module, "load_all_circuits",
+        lambda manifest, environment: environment.circuits)
+    monkeypatch.setattr(
+        trainer_module, "_create_summary_writer", lambda path: writer)
+    output = tmp_path / "run"
+    trainer = Trainer.create(
+        train_manifest, TrainConfig(), output, train_env,
+        validation_manifest, validation_env)
+
+    def fail_checkpoint(path, state):
+        raise OSError("injected checkpoint failure")
+
+    monkeypatch.setattr(trainer_module, "save_checkpoint", fail_checkpoint)
+    with pytest.raises(OSError, match="checkpoint failure"):
+        trainer.step()
+
+    assert writer.calls == []
+    assert trainer.global_optimizer_step == 0
+    assert trainer.global_rollout_batch_step == 0
+    committed = load_checkpoint(output / "latest.pt")
+    assert committed["global_optimizer_step"] == 0
+    assert committed["global_rollout_batch_step"] == 0
+
+
+def test_validation_tensorboard_reduction_uses_ratio_of_totals():
+    trainer = Trainer.__new__(Trainer)
+    trainer.writer = _RecordingWriter()
+    trainer.validation_native_metrics = {
+        "small": {"pattern_count": 10},
+        "large": {"pattern_count": 30},
+    }
+    report = {
+        "totals": {
+            "pattern_count": 20,
+            "fault_coverage": 0.975,
+            "covered_equivalent_faults": 390,
+        },
+        "coverage_shortfall": 2,
+        "eligible": False,
+    }
+
+    trainer._write_validation_events(report, 3)
+
+    assert ("Validation/pattern_reduction_pct_total", 50.0, 3) in (
+        trainer.writer.calls)
+    assert ("Validation/coverage_shortfall", 2.0, 3) in trainer.writer.calls
+    assert ("Validation/coverage_eligible", 0.0, 3) in trainer.writer.calls
 
 
 def test_nested_dtc_trajectory_npz_uses_offsets_without_pickle(tmp_path):
@@ -648,17 +824,25 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
         return environment.circuits
 
     monkeypatch.setattr(trainer_module, "load_all_circuits", fake_load_all)
+    monkeypatch.setattr(
+        trainer_module, "_create_summary_writer",
+        lambda path: _RecordingWriter())
     output = tmp_path / "run"
     trainer = Trainer.create(
         train_manifest, TrainConfig(), output, train_env,
         validation_manifest, validation_env)
     initial = load_checkpoint(output / "latest.pt")
-    assert initial["version"] == 5
+    assert initial["version"] == 6
+    assert initial["global_optimizer_step"] == 0
+    assert initial["global_rollout_batch_step"] == 0
     assert initial["training_protocol"] == TRAINING_PROTOCOL
     legacy = copy.deepcopy(initial)
+    legacy["version"] = 5
+    legacy["config"]["entropy_coef"] = 0.01
+    legacy["config"].pop("entropy_coef_normalized")
     legacy["training_protocol"] = "multi_circuit_ppo_batch_v1"
     save_checkpoint(output / "legacy-latest.pt", legacy)
-    with pytest.raises(ValueError, match="training protocol"):
+    with pytest.raises(ValueError, match="schema 6"):
         Trainer.resume(
             output / "legacy-latest.pt", environment=train_env,
             validation_environment=validation_env)
@@ -690,6 +874,8 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
     first_batch = load_checkpoint(output / "latest.pt")
     assert first_batch["round"] == 0
     assert first_batch["next_circuit_index"] == 4
+    assert first_batch["global_optimizer_step"] == 4
+    assert first_batch["global_rollout_batch_step"] == 1
     for index in round_order[:4]:
         assert (output / "rounds" / "round-000001"
                 / "circuit-{:06d}.json".format(index)).is_file()
@@ -702,6 +888,8 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
         output / "latest.pt", environment=train_env,
         validation_environment=validation_env)
     assert resumed.next_circuit_index == 4
+    assert resumed.global_optimizer_step == 4
+    assert resumed.global_rollout_batch_step == 1
     records = resumed.step()
     assert resumed.round == 1
     assert [record["circuit"] for record in records
@@ -712,6 +900,9 @@ def test_rollout_batch_checkpoint_resume_validation_best_and_final(
     assert episode["rollout_batch_transition_count"] == 3
     assert episode["ppo_minibatch_count"] == 1
     assert episode["optimizer_steps"] == 4
+    committed_round = load_checkpoint(output / "latest.pt")
+    assert committed_round["global_optimizer_step"] == 8
+    assert committed_round["global_rollout_batch_step"] == 2
     assert (output / "best.pt").is_file()
     best = load_checkpoint(output / "best.pt")
     assert best["kind"] == "best"

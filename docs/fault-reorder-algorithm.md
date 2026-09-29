@@ -76,9 +76,11 @@ log P(action_t)
 ```
 
 未进入 `C_t,b` 的 remaining faults 不参与该 batch softmax；PO 已知后未执行的 requested
-尾部也不产生梯度。Primary 和所有 batch 的实际条件选择 entropy 合并后取均值。PPO
-replay 使用保存的 `remaining_rows`、`primary_row` 和嵌套 batch rows，一次 forward 重建
-joint log probability、mean entropy 和 value。
+尾部也不产生梯度。Primary 和所有 batch 的实际条件选择 raw entropy 合并后取均值。
+Normalized entropy 则对每个候选数 `N>1` 的 conditional selection 单独计算
+`H/log(N)` 后取均值；`N=1` 被排除，若没有非平凡选择则定义为 0。PPO replay 使用保存的
+`remaining_rows`、`primary_row` 和嵌套 batch rows，一次 forward 重建 joint log
+probability、raw/normalized entropy 和 value。
 
 ## 5. 固定求解协议
 
@@ -116,8 +118,8 @@ shortfall > 0 : -10 * shortfall / InitialEqv
 `gamma=1.0`、`lambda=0.95` 按 circuit 独立计算 GAE。使用同一冻结 old policy 收集最多
 4 个 circuit 后，合并所有 transitions 并统一标准化 advantage。Transition 等权；每个
 PPO epoch 独立 shuffle，再按最多 128 transitions 切 minibatch，尾部小 batch 不丢弃。
-随后执行 4 次 PPO epoch：clip `0.2`，value 系数 `0.5`，entropy 系数 `0.01`，gradient
-clip `1.0`。
+随后执行 4 次 PPO epoch：clip `0.2`，value 系数 `0.5`，normalized entropy 系数
+`0.05`，gradient clip `1.0`。Raw entropy 只作诊断，不进入 loss。
 
 ## 7. Training、validation 与恢复
 
@@ -133,12 +135,18 @@ clip `1.0`。
 固定执行 5 轮。每轮使用隔离 RNG，根据 training seed 和一基 round number 洗牌全部
 training circuits，再依次组成最多 4 个 circuits 的 rollout batch。该顺序可确定性重建，
 且不会消耗 rollout 的全局 RNG。每个 batch 完成收集和 PPO update 后，写入各 circuit
-artifacts，并原子提交 schema 5 `latest.pt`；artifact 文件仍使用 manifest index。最后不足
+artifacts，并原子提交 schema 6 `latest.pt`；artifact 文件仍使用 manifest index。最后不足
 4 个 circuit 的 batch 仍训练。Checkpoint 保存模型、optimizer、RNG、training protocol、
 两个 manifest、provenance、两个 split 的 baseline、completed round 和 shuffled-order
-offset。Batch 中断时从该 batch 起点重跑，不暴露部分更新模型。
+offset，以及全局 optimizer/rollout batch step。Batch 中断时从该 batch 起点重跑，不暴露
+部分更新模型。
 
 每轮完成后只运行独立 validation 并更新 `best.pt`；第 5 轮结束发布 `final.pt`。Schema
 1–4 与新的 BFS action mask、joint probability 和 rollback protocol 不兼容，不能恢复；
-training protocol 不是 `shuffled_multi_circuit_ppo_batch_v1` 的旧 schema 5 也不能恢复，
-但仍可独立评估。
+使用 raw-entropy objective 的 schema 5 不能恢复，但仍可独立评估。当前可恢复协议为
+`normalized_entropy_shuffled_multi_circuit_ppo_batch_v2`。
+
+TensorBoard 在 rollout checkpoint 成功后才写入。`PPO/*` 使用一基 optimizer step，
+`Rollout/*` 使用一基 rollout batch step，`Validation/*` 使用 round；checkpoint 失败不会写
+对应事件。Validation pattern reduction 先汇总 native/model pattern 数再计算总比例，coverage
+指标保持 coverage-first best-model 的总 shortfall 与 per-circuit eligibility 语义。

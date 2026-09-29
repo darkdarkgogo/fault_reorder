@@ -27,7 +27,7 @@ from .reward import (compute_gae, normalize_advantages, ppo_objective,
 
 
 POLICY_IDENTITY = "dynamic_bfs_ranked_dtc_actor_critic_ppo_v2"
-TRAINING_PROTOCOL = "shuffled_multi_circuit_ppo_batch_v1"
+TRAINING_PROTOCOL = "normalized_entropy_shuffled_multi_circuit_ppo_batch_v2"
 SOLVER_PROTOCOL = {
     **PROTOCOL_CONFIG,
     "compression_algorithm_version": "stuck_at_podemx_bfs_ranked_dtc_monotonic_v4",
@@ -35,6 +35,11 @@ SOLVER_PROTOCOL = {
 DEFAULT_VALIDATION_MANIFEST = (
     Path(__file__).resolve().parents[1] / "configs" / "anchor_validation_5.json"
 )
+
+
+def _create_summary_writer(log_dir):
+    from torch.utils.tensorboard import SummaryWriter
+    return SummaryWriter(log_dir=str(log_dir))
 
 
 @dataclass
@@ -50,7 +55,7 @@ class TrainConfig:
     gae_lambda: float = 0.95
     ppo_clip: float = 0.2
     value_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef_normalized: float = 0.05
     ppo_epochs: int = 4
     temperature: float = 1.0
     seed: int = 14
@@ -67,7 +72,7 @@ class TrainConfig:
         for key in ("learning_rate", "gradient_clip", "beta", "temperature"):
             if not math.isfinite(getattr(self, key)) or getattr(self, key) <= 0:
                 raise ValueError(key + " must be finite and positive")
-        for key in ("alpha", "value_coef", "entropy_coef"):
+        for key in ("alpha", "value_coef", "entropy_coef_normalized"):
             if not math.isfinite(getattr(self, key)) or getattr(self, key) < 0:
                 raise ValueError(key + " must be finite and non-negative")
         for key in ("gamma", "gae_lambda", "ppo_clip"):
@@ -236,6 +241,9 @@ class Trainer:
         self.validation_native_metrics = {}
         self.best = None
         self.run_id = uuid.uuid4().hex
+        self.global_optimizer_step = 0
+        self.global_rollout_batch_step = 0
+        self.writer = None
 
     def _optimizer(self, model):
         return torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
@@ -291,6 +299,7 @@ class Trainer:
                     "covered_equivalent_faults"]
             }
         save_checkpoint(self.output / "latest.pt", self._payload())
+        self.writer = _create_summary_writer(self.output / "tensorboard")
         return self
 
     @classmethod
@@ -300,6 +309,10 @@ class Trainer:
         saved = load_checkpoint(checkpoint)
         if saved.get("kind") != "latest":
             raise ValueError("resume requires a latest training checkpoint")
+        if saved.get("version") != 6:
+            raise ValueError(
+                "resume requires schema 6 normalized-entropy training; "
+                "older checkpoints remain evaluation-only")
         config = TrainConfig(**saved["config"])
         if rounds is not None:
             if rounds != config.rounds:
@@ -318,11 +331,14 @@ class Trainer:
         self.validation_native_metrics = saved["validation_native_metrics"]
         self.best = saved["best"]
         self.run_id = saved["run_id"]
+        self.global_optimizer_step = saved["global_optimizer_step"]
+        self.global_rollout_batch_step = saved["global_rollout_batch_step"]
         restore_rng(saved["rng"])
         if self.best is not None:
             self._publish_best()
         if self.round == self.config.rounds and self.next_circuit_index == 0:
             self._publish_final()
+        self.writer = _create_summary_writer(self.output / "tensorboard")
         return self
 
     def _check_compatibility(self, saved):
@@ -486,8 +502,10 @@ class Trainer:
                 "visited_wire_count": batch["visited_wire_count"],
             } for batch in step["dtc_batches"])
             with torch.no_grad():
-                old_log_prob, entropy, cached_value = joint_action_stats_from_scores(
-                    scores, value, rows, primary_row, dtc_batches, temperature)
+                (old_log_prob, entropy_raw, entropy_normalized,
+                 cached_value) = joint_action_stats_from_scores(
+                    scores, value, rows, primary_row, dtc_batches,
+                    temperature)
             pattern_increment = step["current_pattern_count"] - previous_patterns
             newly_detected_eqv = sum(
                 eqv_by_id[identifier]
@@ -502,7 +520,8 @@ class Trainer:
                 "dtc_batches": dtc_batches,
                 "old_log_prob": float(old_log_prob),
                 "old_value": float(cached_value),
-                "entropy": float(entropy),
+                "entropy_raw": float(entropy_raw),
+                "entropy_normalized": float(entropy_normalized),
                 "reward": reward,
                 "pattern_increment": pattern_increment,
                 "newly_detected_eqv": newly_detected_eqv,
@@ -595,21 +614,26 @@ class Trainer:
                                self.config.ppo_minibatch_size):
                 indices = permutation[
                     start:start + self.config.ppo_minibatch_size]
-                new_log_probs, entropies, values = [], [], []
+                new_log_probs, raw_entropies = [], []
+                normalized_entropies, values = [], []
                 for index in indices.tolist():
                     circuit, decision = samples[index]
-                    log_prob, entropy, value = joint_action_stats(
+                    (log_prob, entropy_raw,
+                     entropy_normalized, value) = joint_action_stats(
                         model, circuit.embeddings, decision["remaining_rows"],
                         decision["primary_row"], decision["dtc_batches"],
                         self.config.temperature)
                     new_log_probs.append(log_prob)
-                    entropies.append(entropy)
+                    raw_entropies.append(entropy_raw)
+                    normalized_entropies.append(entropy_normalized)
                     values.append(value)
                 loss, details = ppo_objective(
                     torch.stack(new_log_probs), old_log_probs[indices],
                     advantages[indices], torch.stack(values), returns[indices],
-                    torch.stack(entropies), self.config.ppo_clip,
-                    self.config.value_coef, self.config.entropy_coef)
+                    torch.stack(raw_entropies),
+                    torch.stack(normalized_entropies), self.config.ppo_clip,
+                    self.config.value_coef,
+                    self.config.entropy_coef_normalized)
                 if not torch.isfinite(loss):
                     raise RuntimeError("non-finite PPO loss")
                 optimizer.zero_grad()
@@ -626,7 +650,11 @@ class Trainer:
                     "minibatch": len(minibatches) + 1,
                     "sample_count": int(indices.numel()),
                     "loss": float(loss.detach()),
-                    "gradient_norm": float(grad_norm),
+                    "gradient_norm_pre_clip": float(grad_norm),
+                    "choice_transition_fraction": float(torch.tensor([
+                        len(samples[index][1]["remaining_rows"]) > 1
+                        for index in indices.tolist()
+                    ], dtype=torch.float32).mean()),
                     **{key: float(value.detach())
                        for key, value in details.items()},
                 })
@@ -644,8 +672,12 @@ class Trainer:
                 for minibatch in all_minibatches
             ) / observed_samples
             for key in (
-                "approx_kl", "clip_fraction", "gradient_norm", "critic_loss")
+                "loss", "actor_loss", "critic_loss", "entropy_raw",
+                "entropy_normalized", "choice_transition_fraction",
+                "approx_kl", "clip_fraction", "gradient_norm_pre_clip")
         }
+        for offset, minibatch in enumerate(all_minibatches, start=1):
+            minibatch["optimizer_offset"] = offset
         return {
             "circuits": [rollout["circuit"].name for rollout in rollouts],
             "circuit_count": len(rollouts),
@@ -653,6 +685,7 @@ class Trainer:
             "minibatch_count": minibatch_count,
             "optimizer_steps": self.config.ppo_epochs * minibatch_count,
             "epochs": epochs,
+            "flat_minibatches": all_minibatches,
             **observed_metrics,
         }
 
@@ -727,6 +760,62 @@ class Trainer:
             **metrics,
         }
 
+    def _write_rollout_events(self, ppo_summary, rollouts, optimizer_base,
+                              rollout_step):
+        if self.writer is None:
+            return
+        ppo_tags = {
+            "loss": "PPO/total_loss",
+            "actor_loss": "PPO/actor_loss",
+            "critic_loss": "PPO/critic_loss",
+            "entropy_raw": "PPO/entropy_raw",
+            "entropy_normalized": "PPO/entropy_normalized",
+            "choice_transition_fraction": "PPO/choice_transition_fraction",
+            "approx_kl": "PPO/approx_kl",
+            "clip_fraction": "PPO/clip_fraction",
+            "gradient_norm_pre_clip": "PPO/gradient_norm_pre_clip",
+        }
+        for minibatch in ppo_summary["flat_minibatches"]:
+            step = optimizer_base + minibatch["optimizer_offset"]
+            for key, tag in ppo_tags.items():
+                self.writer.add_scalar(tag, minibatch[key], step)
+        self.writer.add_scalar(
+            "Rollout/transition_count", ppo_summary["transition_count"],
+            rollout_step)
+        self.writer.add_scalar(
+            "Rollout/episode_return_mean",
+            float(np.mean([
+                rollout["reward_summary"]["target_return"]
+                for rollout in rollouts
+            ])), rollout_step)
+        self.writer.add_scalar(
+            "Rollout/episode_steps_mean",
+            float(np.mean([len(rollout["decisions"]) for rollout in rollouts])),
+            rollout_step)
+        self.writer.flush()
+
+    def _write_validation_events(self, report, round_number):
+        if self.writer is None:
+            return
+        native_patterns = sum(
+            metrics["pattern_count"]
+            for metrics in self.validation_native_metrics.values())
+        model_patterns = report["totals"]["pattern_count"]
+        reduction_pct = (
+            100.0 * (native_patterns - model_patterns) / native_patterns
+            if native_patterns else 0.0)
+        metrics = {
+            "Validation/pattern_reduction_pct_total": reduction_pct,
+            "Validation/fault_coverage": report["totals"]["fault_coverage"],
+            "Validation/covered_equivalent_faults": report["totals"][
+                "covered_equivalent_faults"],
+            "Validation/coverage_shortfall": report["coverage_shortfall"],
+            "Validation/coverage_eligible": float(report["eligible"]),
+        }
+        for tag, value in metrics.items():
+            self.writer.add_scalar(tag, value, round_number)
+        self.writer.flush()
+
     def step(self):
         if self.round >= self.config.rounds:
             raise ValueError("training already reached the configured round target")
@@ -739,6 +828,8 @@ class Trainer:
                 batch_start + self.config.circuit_batch_size,
                 len(circuit_indices))
             rng_before = capture_rng()
+            optimizer_base = self.global_optimizer_step
+            rollout_base = self.global_rollout_batch_step
             try:
                 candidate = copy.deepcopy(self.model)
                 optimizer = self._optimizer(candidate)
@@ -765,6 +856,9 @@ class Trainer:
                         "reward_summary": reward_summary,
                     })
                 ppo_summary = self._ppo_update(candidate, optimizer, rollouts)
+                proposed_optimizer_step = (
+                    optimizer_base + ppo_summary["optimizer_steps"])
+                proposed_rollout_step = rollout_base + 1
                 rollout_batch_index = (
                     batch_start // self.config.circuit_batch_size) + 1
                 batch_records = [
@@ -782,7 +876,9 @@ class Trainer:
                         rollout["decisions"])
                 payload = self._payload(
                     model=candidate, optimizer=optimizer,
-                    next_circuit_index=batch_end)
+                    next_circuit_index=batch_end,
+                    global_optimizer_step=proposed_optimizer_step,
+                    global_rollout_batch_step=proposed_rollout_step)
                 save_checkpoint(self.output / "latest.pt", payload)
             except BaseException:
                 restore_rng(rng_before)
@@ -790,7 +886,12 @@ class Trainer:
             self.model = candidate
             self.optimizer = optimizer
             self.next_circuit_index = batch_end
+            self.global_optimizer_step = proposed_optimizer_step
+            self.global_rollout_batch_step = proposed_rollout_step
             records.extend(batch_records)
+            self._write_rollout_events(
+                ppo_summary, rollouts, optimizer_base,
+                proposed_rollout_step)
             progress(
                 "PPO", "rollout batch done",
                 circuits=ppo_summary["circuit_count"],
@@ -799,7 +900,8 @@ class Trainer:
                 optimizer_steps=ppo_summary["optimizer_steps"],
                 approx_kl="{:.6g}".format(ppo_summary["approx_kl"]),
                 clip_fraction="{:.6g}".format(ppo_summary["clip_fraction"]),
-                gradient_norm="{:.6g}".format(ppo_summary["gradient_norm"]),
+                gradient_norm_pre_clip="{:.6g}".format(
+                    ppo_summary["gradient_norm_pre_clip"]),
                 critic_loss="{:.6g}".format(ppo_summary["critic_loss"]),
             )
 
@@ -812,15 +914,18 @@ class Trainer:
         self.round = number
         self.next_circuit_index = 0
         self.best = best
+        self._write_validation_events(report, number)
         self._publish_best()
         return records + [{"kind": "validation", "report": report}]
 
     def _payload(self, model=None, optimizer=None, round_number=None,
-                 next_circuit_index=None, best=None):
+                  next_circuit_index=None, best=None,
+                  global_optimizer_step=None,
+                  global_rollout_batch_step=None):
         model = self.model if model is None else model
         optimizer = self.optimizer if optimizer is None else optimizer
         return {
-            "version": 5,
+            "version": 6,
             "kind": "latest",
             "run_id": self.run_id,
             "policy": POLICY_IDENTITY,
@@ -845,6 +950,13 @@ class Trainer:
             "next_circuit_index": (
                 self.next_circuit_index if next_circuit_index is None
                 else next_circuit_index),
+            "global_optimizer_step": (
+                self.global_optimizer_step
+                if global_optimizer_step is None else global_optimizer_step),
+            "global_rollout_batch_step": (
+                self.global_rollout_batch_step
+                if global_rollout_batch_step is None
+                else global_rollout_batch_step),
             "training_circuit_order": [
                 circuit.name for circuit in self.circuits],
             "validation_circuit_order": [
@@ -950,25 +1062,31 @@ class Trainer:
         save_checkpoint(self.output / "final.pt", payload)
 
     def train(self):
-        while self.round < self.config.rounds:
-            records = self.step()
-            episodes = [record for record in records
-                        if record["kind"] == "episode"]
-            validation = records[-1]["report"]
-            print(
-                "round {}/{}: train_patterns={}, validation_shortfall={}, "
-                "validation_patterns={}".format(
-                    self.round, self.config.rounds,
-                    sum(record["pattern_count"] for record in episodes),
-                    validation["coverage_shortfall"],
-                    validation["totals"]["pattern_count"]),
-                flush=True)
-        final_report, _ = self.evaluate_model(self.model, self.round)
-        self._publish_final(final_report)
-        best_report = copy.deepcopy(self.best["report"])
-        return _complete_report(
-            best_report, self.output / "best.pt",
-            self.validation_native_metrics, self.validation_states, "best")
+        try:
+            while self.round < self.config.rounds:
+                records = self.step()
+                episodes = [record for record in records
+                            if record["kind"] == "episode"]
+                validation = records[-1]["report"]
+                print(
+                    "round {}/{}: train_patterns={}, validation_shortfall={}, "
+                    "validation_patterns={}".format(
+                        self.round, self.config.rounds,
+                        sum(record["pattern_count"] for record in episodes),
+                        validation["coverage_shortfall"],
+                        validation["totals"]["pattern_count"]),
+                    flush=True)
+            final_report, _ = self.evaluate_model(self.model, self.round)
+            self._publish_final(final_report)
+            best_report = copy.deepcopy(self.best["report"])
+            return _complete_report(
+                best_report, self.output / "best.pt",
+                self.validation_native_metrics, self.validation_states, "best")
+        finally:
+            if self.writer is not None:
+                self.writer.flush()
+                self.writer.close()
+                self.writer = None
 
 
 def _add_native_comparison(report, native_metrics, states, checkpoint_kind):
@@ -1059,8 +1177,11 @@ def _write_evaluation(output, report, exports):
 
 
 def _standalone_evaluator(saved, output, manifest, environment):
+    config_values = dict(saved["config"])
+    if saved.get("version") == 5:
+        config_values.pop("entropy_coef", None)
     trainer = Trainer(
-        manifest, TrainConfig(**saved["config"]), output, environment,
+        manifest, TrainConfig(**config_values), output, environment,
         validation_manifest=None)
     if saved["solver_digest"] != trainer.solver_digest:
         raise ValueError("checkpoint PODEM binary changed")

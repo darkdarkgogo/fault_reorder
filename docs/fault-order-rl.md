@@ -10,7 +10,7 @@ Primary 从完整 remaining set 中选择；DTC secondary 候选由 C++ 从 unkn
 - 每个 round 根据 training seed 与 round number 独立 shuffle 全部 training circuits。
 - 每个 PPO epoch 重新打乱合并后的 transitions，并按最多 128 transitions 切 minibatch。
 - `gamma=1.0`、`GAE lambda=0.95`、`clip=0.2`。
-- value loss 系数 `0.5`，entropy 系数 `0.01`，Adam 学习率 `1e-4`。
+- value loss 系数 `0.5`，normalized entropy 系数 `0.05`，Adam 学习率 `1e-4`。
 - step shaping `alpha=0.1`，覆盖短缺惩罚 `beta=10.0`。
 - Primary backtrack limit 固定为 `100`；DTC secondary limit 固定为 `50`。
 - 每个 unknown PO 的 `select_fault_try` 统一为 `1`。
@@ -46,10 +46,9 @@ python3 -m fault_order_rl train \
   --resume runs/anchor_train_1024/latest.pt
 ```
 
-恢复不能改变目标轮数或训练配置。Schema 1–4 与当前 BFS-filtered action mask、概率及
-回滚协议不兼容；training protocol 不是
-`shuffled_multi_circuit_ppo_batch_v1` 的旧 schema 5 checkpoint 也不能恢复，必须重新训练，
-但仍可用于独立评估。
+恢复不能改变目标轮数或训练配置。只有 schema 6 且 training protocol 为
+`normalized_entropy_shuffled_multi_circuit_ppo_batch_v2` 的 `latest.pt` 可以恢复训练。
+Schema 1–4 不兼容；schema 5 使用旧的 raw-entropy objective，不能恢复，但仍可用于独立评估。
 
 ## Primary、DTC 与缓存分数
 
@@ -101,6 +100,10 @@ GAE。一个 step 的 joint log probability 是 Primary categorical 项，加上
 实际执行前缀的 Plackett-Luce 项。Rollout 和 PPO replay 中每个 transition 都只调用一次
 模型。
 
+每次 conditional selection 按当时的候选数 `N` 计算 `H/log(N)`；`N=1` 没有选择自由度，
+不进入 normalized entropy 的平均。如果整个 transition 都没有 `N>1` 的选择，其
+normalized entropy 为 0。Raw entropy 只作诊断，PPO loss 使用 normalized entropy。
+
 GAE 与 return 始终按 circuit 独立计算，不能跨 episode。最多 4 个 circuit 全部完成后，
 合并其 raw advantages 并统一标准化；transition 等权，不按 circuit 长度重新加权。每个
 PPO epoch 都产生新的随机排列，再按 `128/128/.../尾批` 切分，尾部不足 128 的 minibatch
@@ -114,15 +117,26 @@ manifest index，保证 artifact 身份稳定。
 
 ## Checkpoint 与 artifacts
 
-- `latest.pt`：schema 5，可恢复；每完成一个最多 4-circuit rollout batch 就原子提交。
+- `latest.pt`：schema 6，可恢复；每完成一个最多 4-circuit rollout batch 就原子提交。
 - `best.pt`：独立验证集上的最佳模型，不含 optimizer 和 RNG。
 - `final.pt`：第 5 轮最终模型，不含 optimizer 和 RNG；可能与 best 来自不同轮。
 - `rounds/round-NNNNNN/circuit-NNNNNN.{json,npz}`：Primary rows、各 BFS batch 的
   candidate/requested/executed/embedded rows、奖励、GAE 与 PPO 指标。
 - `validation/round-NNNNNN/`：每轮确定性验证的排名、轨迹和 summary。
+- `tensorboard/`：PPO、rollout batch 与 validation 的 TensorBoard event files。
 
 若进程在 rollout batch 中任一 circuit 或 PPO update 中断，该 batch 不提交；恢复从上一个
 已提交 batch 的下一随机排列位置继续，并恢复模型、optimizer 与 Python/NumPy/Torch RNG。
+Checkpoint 还保存 `global_optimizer_step` 与 `global_rollout_batch_step`。TensorBoard 事件只在
+对应 `latest.pt` 成功提交后写入，因此失败更新不会产生幽灵事件；checkpoint 已提交但日志尚未
+写入时退出，只会留下可接受的日志缺口。
+
+TensorBoard 横轴按语义分开：`PPO/*` 使用 optimizer step，`Rollout/*` 使用 rollout batch
+step，`Validation/*` 使用 round。启动监控示例：
+
+```bash
+tensorboard --logdir runs/anchor_train_1024/tensorboard
+```
 
 ## 评估
 

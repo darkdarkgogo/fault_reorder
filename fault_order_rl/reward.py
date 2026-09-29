@@ -87,30 +87,35 @@ def normalize_advantages(advantages, eps=1e-8):
 
 
 def ppo_objective(new_log_probs, old_log_probs, advantages, values, returns,
-                  entropies, clip_epsilon=0.2, value_coef=0.5,
-                  entropy_coef=0.01):
+                  raw_entropies, normalized_entropies, clip_epsilon=0.2,
+                  value_coef=0.5, entropy_coef_normalized=0.05):
     tensors = [torch.as_tensor(value, dtype=torch.float32) for value in (
-        new_log_probs, old_log_probs, advantages, values, returns, entropies)]
+        new_log_probs, old_log_probs, advantages, values, returns,
+        raw_entropies, normalized_entropies)]
     if any(tensor.ndim != 1 for tensor in tensors):
         raise ValueError("PPO inputs must be vectors")
     if len({tensor.numel() for tensor in tensors}) != 1 or not tensors[0].numel():
         raise ValueError("PPO inputs must have the same non-zero length")
     if any(not torch.isfinite(tensor).all() for tensor in tensors):
         raise ValueError("PPO inputs must be finite")
-    new_log_probs, old_log_probs, advantages, values, returns, entropies = tensors
+    (new_log_probs, old_log_probs, advantages, values, returns,
+     raw_entropies, normalized_entropies) = tensors
     log_ratio = new_log_probs - old_log_probs
     ratio = torch.exp(log_ratio)
     clipped = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
     actor_loss = -torch.minimum(ratio * advantages, clipped * advantages).mean()
     critic_loss = torch.mean((values - returns) ** 2)
-    entropy = entropies.mean()
-    total = actor_loss + value_coef * critic_loss - entropy_coef * entropy
+    entropy_raw = raw_entropies.mean()
+    entropy_normalized = normalized_entropies.mean()
+    total = (actor_loss + value_coef * critic_loss
+             - entropy_coef_normalized * entropy_normalized)
     approx_kl = torch.mean((ratio - 1.0) - log_ratio)
     clip_fraction = torch.mean((torch.abs(ratio - 1.0) > clip_epsilon).float())
     return total, {
         "actor_loss": actor_loss,
         "critic_loss": critic_loss,
-        "entropy": entropy,
+        "entropy_raw": entropy_raw,
+        "entropy_normalized": entropy_normalized,
         "approx_kl": approx_kl,
         "clip_fraction": clip_fraction,
     }

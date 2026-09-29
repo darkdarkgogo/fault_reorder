@@ -46,7 +46,8 @@ def main(argv=None):
         description=(
             "Dynamic BFS-filtered ranked-DTC actor-critic PPO: fixed 5 rounds, "
             "4-circuit rollout batches, 128-transition PPO minibatches, "
-            "Primary backtrack=100, DTC secondary backtrack=50, schema=5"
+            "normalized entropy, TensorBoard monitoring, Primary backtrack=100, "
+            "DTC secondary backtrack=50, schema=6"
         ))
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate", help="Validate all artifacts without ATPG episodes")

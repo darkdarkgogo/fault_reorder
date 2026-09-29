@@ -1,5 +1,6 @@
 """Primary selection and BFS-filtered DTC ranking statistics."""
 
+import math
 import numpy as np
 import torch
 
@@ -81,7 +82,8 @@ def _conditional_prefix_stats(logits, available_rows, executed_rows):
     if len(executed) != len(set(executed)):
         raise ValueError("executed prefix must contain unique rows")
     log_probs = []
-    entropies = []
+    raw_entropies = []
+    normalized_entropies = []
     row_to_logit = {
         int(row): logits[index] for index, row in enumerate(available_rows.tolist())
     }
@@ -93,9 +95,17 @@ def _conditional_prefix_stats(logits, available_rows, executed_rows):
         conditional_probs = torch.exp(conditional_log_probs)
         selected_position = available.index(selected)
         log_probs.append(conditional_log_probs[selected_position])
-        entropies.append(-(conditional_probs * conditional_log_probs).sum())
+        entropy = -(conditional_probs * conditional_log_probs).sum()
+        raw_entropies.append(entropy)
+        candidate_count = len(available)
+        if candidate_count > 1:
+            normalized = entropy / math.log(candidate_count)
+            if (not torch.isfinite(normalized)
+                    or normalized < -1e-6 or normalized > 1.0 + 1e-6):
+                raise ValueError("normalized entropy is outside its finite range")
+            normalized_entropies.append(normalized)
         available.remove(selected)
-    return log_probs, entropies
+    return log_probs, raw_entropies, normalized_entropies
 
 
 def joint_action_stats_from_scores(scores, value, remaining_rows, primary_row,
@@ -107,8 +117,10 @@ def joint_action_stats_from_scores(scores, value, remaining_rows, primary_row,
         raise ValueError("remaining rows must match scores")
     primary = torch.as_tensor(
         [primary_row], device=scores.device, dtype=torch.long)
-    primary_log_probs, entropies = _conditional_prefix_stats(
+    primary_log_probs, raw_entropies, normalized_entropies = (
+        _conditional_prefix_stats(
         logits, remaining, primary)
+    )
     log_probs = list(primary_log_probs)
     attempted = set()
     for batch in dtc_batches:
@@ -133,17 +145,27 @@ def joint_action_stats_from_scores(scores, value, remaining_rows, primary_row,
         if attempted & set(executed.tolist()):
             raise ValueError("DTC executed rows repeat across batches")
         attempted.update(executed.tolist())
-        batch_log_probs, batch_entropies = _conditional_prefix_stats(
-            logits[candidate_positions], candidates, executed)
+        batch_log_probs, batch_raw_entropies, batch_normalized_entropies = (
+            _conditional_prefix_stats(
+                logits[candidate_positions], candidates, executed)
+        )
         log_probs.extend(batch_log_probs)
-        entropies.extend(batch_entropies)
+        raw_entropies.extend(batch_raw_entropies)
+        normalized_entropies.extend(batch_normalized_entropies)
     joint_log_probability = torch.stack(log_probs).sum()
-    mean_entropy = torch.stack(entropies).mean()
+    mean_raw_entropy = torch.stack(raw_entropies).mean()
+    mean_normalized_entropy = (
+        torch.stack(normalized_entropies).mean()
+        if normalized_entropies
+        else mean_raw_entropy.new_zeros(())
+    )
     if (not torch.isfinite(joint_log_probability)
-            or not torch.isfinite(mean_entropy)
+            or not torch.isfinite(mean_raw_entropy)
+            or not torch.isfinite(mean_normalized_entropy)
             or not torch.isfinite(value)):
         raise ValueError("joint policy statistics must be finite")
-    return joint_log_probability, mean_entropy, value
+    return (joint_log_probability, mean_raw_entropy,
+            mean_normalized_entropy, value)
 
 
 def joint_action_stats(model, embeddings, remaining_rows, primary_row,
