@@ -1,0 +1,912 @@
+{
+  "schema": "anchor_aig_map_v1",
+  "converter": "generate_anchor_aig_v1",
+  "source_bench": "E:\\桌面\\fault-reorder\\reorderATPG\\datasets\\train\\train_0285_small_iscas89_s35932_WX1457.bench",
+  "source_bench_sha256": "27486dff03cf04490e8b3bb08777fdc3a995e3ea617e71cf224797eecc5f3713",
+  "aig_bench": "E:\\桌面\\fault-reorder\\reorderATPG\\datasets\\train_AIG\\train_0285_small_iscas89_s35932_WX1457.bench",
+  "aig_bench_sha256": "c1d87b87a439972313eb86250310fa91c6f3f8e95b4c28d70967d564c6fdf361",
+  "aig_graph_sha256": "391970adb3ee48620a00e854d853159e270844e6567f01c6e8ef50d3b30d608a",
+  "feature_node_count": 170,
+  "inputs": [
+    "CRC_OUT_8_22",
+    "TM0",
+    "TM1",
+    "WX1796",
+    "WX1956",
+    "WX2020",
+    "WX2084",
+    "WX2148",
+    "WX3089",
+    "WX3249",
+    "WX3313",
+    "WX3377",
+    "WX3441"
+  ],
+  "outputs": [
+    "WX1457",
+    "WX2294",
+    "WX2296",
+    "WX2297",
+    "WX2298",
+    "WX2368",
+    "WX3587",
+    "WX3591",
+    "WX3661"
+  ],
+  "signals": {
+    "CRC_OUT_8_22": {
+      "anchor_name": "CRC_OUT_8_22",
+      "anchor_node": 0,
+      "origin_kind": "INPUT"
+    },
+    "TM0": {
+      "anchor_name": "TM0",
+      "anchor_node": 1,
+      "origin_kind": "INPUT"
+    },
+    "TM1": {
+      "anchor_name": "TM1",
+      "anchor_node": 2,
+      "origin_kind": "INPUT"
+    },
+    "WX1796": {
+      "anchor_name": "WX1796",
+      "anchor_node": 3,
+      "origin_kind": "INPUT"
+    },
+    "WX1956": {
+      "anchor_name": "WX1956",
+      "anchor_node": 4,
+      "origin_kind": "INPUT"
+    },
+    "WX2020": {
+      "anchor_name": "WX2020",
+      "anchor_node": 5,
+      "origin_kind": "INPUT"
+    },
+    "WX2084": {
+      "anchor_name": "WX2084",
+      "anchor_node": 6,
+      "origin_kind": "INPUT"
+    },
+    "WX2148": {
+      "anchor_name": "WX2148",
+      "anchor_node": 7,
+      "origin_kind": "INPUT"
+    },
+    "WX3089": {
+      "anchor_name": "WX3089",
+      "anchor_node": 8,
+      "origin_kind": "INPUT"
+    },
+    "WX3249": {
+      "anchor_name": "WX3249",
+      "anchor_node": 9,
+      "origin_kind": "INPUT"
+    },
+    "WX3313": {
+      "anchor_name": "WX3313",
+      "anchor_node": 10,
+      "origin_kind": "INPUT"
+    },
+    "WX3377": {
+      "anchor_name": "WX3377",
+      "anchor_node": 11,
+      "origin_kind": "INPUT"
+    },
+    "WX3441": {
+      "anchor_name": "WX3441",
+      "anchor_node": 12,
+      "origin_kind": "INPUT"
+    },
+    "I10292": {
+      "anchor_name": "I10292",
+      "anchor_node": 14,
+      "origin_kind": "NAND"
+    },
+    "I10293": {
+      "anchor_name": "I10293",
+      "anchor_node": 16,
+      "origin_kind": "NAND"
+    },
+    "I10294": {
+      "anchor_name": "I10294",
+      "anchor_node": 18,
+      "origin_kind": "NAND"
+    },
+    "I10291": {
+      "anchor_name": "I10291",
+      "anchor_node": 20,
+      "origin_kind": "NAND"
+    },
+    "I6287": {
+      "anchor_name": "I6287",
+      "anchor_node": 22,
+      "origin_kind": "NAND"
+    },
+    "I6288": {
+      "anchor_name": "I6288",
+      "anchor_node": 24,
+      "origin_kind": "NAND"
+    },
+    "I6289": {
+      "anchor_name": "I6289",
+      "anchor_node": 26,
+      "origin_kind": "NAND"
+    },
+    "I6286": {
+      "anchor_name": "I6286",
+      "anchor_node": 28,
+      "origin_kind": "NAND"
+    },
+    "WX2289": {
+      "anchor_name": "WX2289",
+      "anchor_node": 29,
+      "origin_kind": "NOT"
+    },
+    "WX2290": {
+      "anchor_name": "WX2290",
+      "anchor_node": 30,
+      "origin_kind": "NOT"
+    },
+    "WX2292": {
+      "anchor_name": "WX2292",
+      "anchor_node": 31,
+      "origin_kind": "NOT"
+    },
+    "WX2293": {
+      "anchor_name": "WX2293",
+      "anchor_node": 32,
+      "origin_kind": "NOT"
+    },
+    "WX2294": {
+      "anchor_name": "WX2294",
+      "anchor_node": 33,
+      "origin_kind": "NOT"
+    },
+    "I6272": {
+      "anchor_name": "I6272",
+      "anchor_node": 35,
+      "origin_kind": "NAND"
+    },
+    "I6273": {
+      "anchor_name": "I6273",
+      "anchor_node": 37,
+      "origin_kind": "NAND"
+    },
+    "I6274": {
+      "anchor_name": "I6274",
+      "anchor_node": 39,
+      "origin_kind": "NAND"
+    },
+    "I6271": {
+      "anchor_name": "I6271",
+      "anchor_node": 41,
+      "origin_kind": "NAND"
+    },
+    "I6279": {
+      "anchor_name": "I6279",
+      "anchor_node": 43,
+      "origin_kind": "NAND"
+    },
+    "I6280": {
+      "anchor_name": "I6280",
+      "anchor_node": 45,
+      "origin_kind": "NAND"
+    },
+    "I6281": {
+      "anchor_name": "I6281",
+      "anchor_node": 47,
+      "origin_kind": "NAND"
+    },
+    "I6270": {
+      "anchor_name": "I6270",
+      "anchor_node": 49,
+      "origin_kind": "NAND"
+    },
+    "I6294": {
+      "anchor_name": "I6294",
+      "anchor_node": 51,
+      "origin_kind": "NAND"
+    },
+    "I6295": {
+      "anchor_name": "I6295",
+      "anchor_node": 53,
+      "origin_kind": "NAND"
+    },
+    "I6296": {
+      "anchor_name": "I6296",
+      "anchor_node": 55,
+      "origin_kind": "NAND"
+    },
+    "WX2202": {
+      "anchor_name": "WX2202",
+      "anchor_node": 57,
+      "origin_kind": "NAND"
+    },
+    "WX2275": {
+      "anchor_name": "WX2275",
+      "anchor_node": 58,
+      "origin_kind": "NOT"
+    },
+    "WX2276": {
+      "anchor_name": "WX2276",
+      "anchor_node": 59,
+      "origin_kind": "NOT"
+    },
+    "WX1850": {
+      "anchor_name": "WX1850",
+      "anchor_node": 60,
+      "origin_kind": "NOT"
+    },
+    "WX1882": {
+      "anchor_name": "WX1882",
+      "anchor_node": 61,
+      "origin_kind": "NOT"
+    },
+    "I7174": {
+      "anchor_name": "I7174",
+      "anchor_node": 63,
+      "origin_kind": "NAND"
+    },
+    "I7175": {
+      "anchor_name": "I7175",
+      "anchor_node": 65,
+      "origin_kind": "NAND"
+    },
+    "I7176": {
+      "anchor_name": "I7176",
+      "anchor_node": 67,
+      "origin_kind": "NAND"
+    },
+    "WX2296": {
+      "anchor_name": "WX2296",
+      "anchor_node": 68,
+      "origin_kind": "NOT"
+    },
+    "WX1456": {
+      "anchor_name": "WX1456",
+      "anchor_node": 69,
+      "origin_kind": "NOT"
+    },
+    "WX2297": {
+      "anchor_name": "WX2297",
+      "anchor_node": 70,
+      "origin_kind": "NOT"
+    },
+    "WX1458": {
+      "anchor_name": "WX1458",
+      "anchor_node": 71,
+      "origin_kind": "AND"
+    },
+    "WX1460": {
+      "anchor_name": "WX1460",
+      "anchor_node": 72,
+      "origin_kind": "NOT"
+    },
+    "WX1462": {
+      "anchor_name": "WX1462",
+      "anchor_node": 73,
+      "origin_kind": "AND"
+    },
+    "WX1464": {
+      "anchor_name": "WX1464",
+      "anchor_node": 74,
+      "origin_kind": "NOT"
+    },
+    "WX2298": {
+      "anchor_name": "WX2298",
+      "anchor_node": 75,
+      "origin_kind": "NOT"
+    },
+    "WX2362": {
+      "anchor_name": "WX2362",
+      "anchor_node": 77,
+      "origin_kind": "NAND"
+    },
+    "WX2363": {
+      "anchor_name": "WX2363",
+      "anchor_node": 78,
+      "origin_kind": "AND"
+    },
+    "WX2365": {
+      "anchor_name": "WX2365",
+      "anchor_node": 79,
+      "origin_kind": "NOT"
+    },
+    "WX2364": {
+      "anchor_name": "WX2364",
+      "anchor_node": 80,
+      "origin_kind": "AND"
+    },
+    "WX2366": {
+      "anchor_name": "WX2366",
+      "anchor_node": 84,
+      "origin_kind": "OR"
+    },
+    "WX2367": {
+      "anchor_name": "WX2367",
+      "anchor_node": 85,
+      "origin_kind": "NOT"
+    },
+    "WX2368": {
+      "anchor_name": "WX2368",
+      "anchor_node": 86,
+      "origin_kind": "NOT"
+    },
+    "WX1463": {
+      "anchor_name": "WX1463",
+      "anchor_node": 87,
+      "origin_kind": "AND"
+    },
+    "WX1465": {
+      "anchor_name": "WX1465",
+      "anchor_node": 91,
+      "origin_kind": "OR"
+    },
+    "WX1454": {
+      "anchor_name": "WX1454",
+      "anchor_node": 92,
+      "origin_kind": "AND"
+    },
+    "WX3582": {
+      "anchor_name": "WX3582",
+      "anchor_node": 93,
+      "origin_kind": "NOT"
+    },
+    "WX3586": {
+      "anchor_name": "WX3586",
+      "anchor_node": 94,
+      "origin_kind": "NOT"
+    },
+    "WX3587": {
+      "anchor_name": "WX3587",
+      "anchor_node": 95,
+      "origin_kind": "NOT"
+    },
+    "I10277": {
+      "anchor_name": "I10277",
+      "anchor_node": 97,
+      "origin_kind": "NAND"
+    },
+    "I10278": {
+      "anchor_name": "I10278",
+      "anchor_node": 99,
+      "origin_kind": "NAND"
+    },
+    "I10279": {
+      "anchor_name": "I10279",
+      "anchor_node": 101,
+      "origin_kind": "NAND"
+    },
+    "I10276": {
+      "anchor_name": "I10276",
+      "anchor_node": 103,
+      "origin_kind": "NAND"
+    },
+    "I10284": {
+      "anchor_name": "I10284",
+      "anchor_node": 105,
+      "origin_kind": "NAND"
+    },
+    "I10285": {
+      "anchor_name": "I10285",
+      "anchor_node": 107,
+      "origin_kind": "NAND"
+    },
+    "I10286": {
+      "anchor_name": "I10286",
+      "anchor_node": 109,
+      "origin_kind": "NAND"
+    },
+    "I10275": {
+      "anchor_name": "I10275",
+      "anchor_node": 111,
+      "origin_kind": "NAND"
+    },
+    "I10299": {
+      "anchor_name": "I10299",
+      "anchor_node": 113,
+      "origin_kind": "NAND"
+    },
+    "I10300": {
+      "anchor_name": "I10300",
+      "anchor_node": 115,
+      "origin_kind": "NAND"
+    },
+    "I10301": {
+      "anchor_name": "I10301",
+      "anchor_node": 117,
+      "origin_kind": "NAND"
+    },
+    "WX3495": {
+      "anchor_name": "WX3495",
+      "anchor_node": 119,
+      "origin_kind": "NAND"
+    },
+    "WX3568": {
+      "anchor_name": "WX3568",
+      "anchor_node": 120,
+      "origin_kind": "NOT"
+    },
+    "WX3569": {
+      "anchor_name": "WX3569",
+      "anchor_node": 121,
+      "origin_kind": "NOT"
+    },
+    "WX3143": {
+      "anchor_name": "WX3143",
+      "anchor_node": 122,
+      "origin_kind": "NOT"
+    },
+    "WX3175": {
+      "anchor_name": "WX3175",
+      "anchor_node": 123,
+      "origin_kind": "NOT"
+    },
+    "I11179": {
+      "anchor_name": "I11179",
+      "anchor_node": 125,
+      "origin_kind": "NAND"
+    },
+    "I11180": {
+      "anchor_name": "I11180",
+      "anchor_node": 127,
+      "origin_kind": "NAND"
+    },
+    "I11181": {
+      "anchor_name": "I11181",
+      "anchor_node": 129,
+      "origin_kind": "NAND"
+    },
+    "WX3591": {
+      "anchor_name": "WX3591",
+      "anchor_node": 130,
+      "origin_kind": "NOT"
+    },
+    "WX3655": {
+      "anchor_name": "WX3655",
+      "anchor_node": 132,
+      "origin_kind": "NAND"
+    },
+    "WX3656": {
+      "anchor_name": "WX3656",
+      "anchor_node": 133,
+      "origin_kind": "AND"
+    },
+    "WX3658": {
+      "anchor_name": "WX3658",
+      "anchor_node": 134,
+      "origin_kind": "NOT"
+    },
+    "WX3657": {
+      "anchor_name": "WX3657",
+      "anchor_node": 135,
+      "origin_kind": "AND"
+    },
+    "WX3659": {
+      "anchor_name": "WX3659",
+      "anchor_node": 139,
+      "origin_kind": "OR"
+    },
+    "WX3660": {
+      "anchor_name": "WX3660",
+      "anchor_node": 140,
+      "origin_kind": "NOT"
+    },
+    "WX3661": {
+      "anchor_name": "WX3661",
+      "anchor_node": 141,
+      "origin_kind": "NOT"
+    },
+    "WX1459": {
+      "anchor_name": "WX1459",
+      "anchor_node": 142,
+      "origin_kind": "AND"
+    },
+    "WX1461": {
+      "anchor_name": "WX1461",
+      "anchor_node": 146,
+      "origin_kind": "OR"
+    },
+    "WX1455": {
+      "anchor_name": "WX1455",
+      "anchor_node": 147,
+      "origin_kind": "AND"
+    },
+    "WX1457": {
+      "anchor_name": "WX1457",
+      "anchor_node": 151,
+      "origin_kind": "OR"
+    }
+  },
+  "helpers": [
+    {
+      "name": "__anchor_aig_00000000",
+      "node": 13,
+      "origin": "I10292"
+    },
+    {
+      "name": "__anchor_aig_00000001",
+      "node": 15,
+      "origin": "I10293"
+    },
+    {
+      "name": "__anchor_aig_00000002",
+      "node": 17,
+      "origin": "I10294"
+    },
+    {
+      "name": "__anchor_aig_00000003",
+      "node": 19,
+      "origin": "I10291"
+    },
+    {
+      "name": "__anchor_aig_00000004",
+      "node": 21,
+      "origin": "I6287"
+    },
+    {
+      "name": "__anchor_aig_00000005",
+      "node": 23,
+      "origin": "I6288"
+    },
+    {
+      "name": "__anchor_aig_00000006",
+      "node": 25,
+      "origin": "I6289"
+    },
+    {
+      "name": "__anchor_aig_00000007",
+      "node": 27,
+      "origin": "I6286"
+    },
+    {
+      "name": "__anchor_aig_00000008",
+      "node": 34,
+      "origin": "I6272"
+    },
+    {
+      "name": "__anchor_aig_00000009",
+      "node": 36,
+      "origin": "I6273"
+    },
+    {
+      "name": "__anchor_aig_00000010",
+      "node": 38,
+      "origin": "I6274"
+    },
+    {
+      "name": "__anchor_aig_00000011",
+      "node": 40,
+      "origin": "I6271"
+    },
+    {
+      "name": "__anchor_aig_00000012",
+      "node": 42,
+      "origin": "I6279"
+    },
+    {
+      "name": "__anchor_aig_00000013",
+      "node": 44,
+      "origin": "I6280"
+    },
+    {
+      "name": "__anchor_aig_00000014",
+      "node": 46,
+      "origin": "I6281"
+    },
+    {
+      "name": "__anchor_aig_00000015",
+      "node": 48,
+      "origin": "I6270"
+    },
+    {
+      "name": "__anchor_aig_00000016",
+      "node": 50,
+      "origin": "I6294"
+    },
+    {
+      "name": "__anchor_aig_00000017",
+      "node": 52,
+      "origin": "I6295"
+    },
+    {
+      "name": "__anchor_aig_00000018",
+      "node": 54,
+      "origin": "I6296"
+    },
+    {
+      "name": "__anchor_aig_00000019",
+      "node": 56,
+      "origin": "WX2202"
+    },
+    {
+      "name": "__anchor_aig_00000020",
+      "node": 62,
+      "origin": "I7174"
+    },
+    {
+      "name": "__anchor_aig_00000021",
+      "node": 64,
+      "origin": "I7175"
+    },
+    {
+      "name": "__anchor_aig_00000022",
+      "node": 66,
+      "origin": "I7176"
+    },
+    {
+      "name": "__anchor_aig_00000023",
+      "node": 76,
+      "origin": "WX2362"
+    },
+    {
+      "name": "__anchor_aig_00000024",
+      "node": 81,
+      "origin": "WX2366"
+    },
+    {
+      "name": "__anchor_aig_00000025",
+      "node": 82,
+      "origin": "WX2366"
+    },
+    {
+      "name": "__anchor_aig_00000026",
+      "node": 83,
+      "origin": "WX2366"
+    },
+    {
+      "name": "__anchor_aig_00000027",
+      "node": 88,
+      "origin": "WX1465"
+    },
+    {
+      "name": "__anchor_aig_00000028",
+      "node": 89,
+      "origin": "WX1465"
+    },
+    {
+      "name": "__anchor_aig_00000029",
+      "node": 90,
+      "origin": "WX1465"
+    },
+    {
+      "name": "__anchor_aig_00000030",
+      "node": 96,
+      "origin": "I10277"
+    },
+    {
+      "name": "__anchor_aig_00000031",
+      "node": 98,
+      "origin": "I10278"
+    },
+    {
+      "name": "__anchor_aig_00000032",
+      "node": 100,
+      "origin": "I10279"
+    },
+    {
+      "name": "__anchor_aig_00000033",
+      "node": 102,
+      "origin": "I10276"
+    },
+    {
+      "name": "__anchor_aig_00000034",
+      "node": 104,
+      "origin": "I10284"
+    },
+    {
+      "name": "__anchor_aig_00000035",
+      "node": 106,
+      "origin": "I10285"
+    },
+    {
+      "name": "__anchor_aig_00000036",
+      "node": 108,
+      "origin": "I10286"
+    },
+    {
+      "name": "__anchor_aig_00000037",
+      "node": 110,
+      "origin": "I10275"
+    },
+    {
+      "name": "__anchor_aig_00000038",
+      "node": 112,
+      "origin": "I10299"
+    },
+    {
+      "name": "__anchor_aig_00000039",
+      "node": 114,
+      "origin": "I10300"
+    },
+    {
+      "name": "__anchor_aig_00000040",
+      "node": 116,
+      "origin": "I10301"
+    },
+    {
+      "name": "__anchor_aig_00000041",
+      "node": 118,
+      "origin": "WX3495"
+    },
+    {
+      "name": "__anchor_aig_00000042",
+      "node": 124,
+      "origin": "I11179"
+    },
+    {
+      "name": "__anchor_aig_00000043",
+      "node": 126,
+      "origin": "I11180"
+    },
+    {
+      "name": "__anchor_aig_00000044",
+      "node": 128,
+      "origin": "I11181"
+    },
+    {
+      "name": "__anchor_aig_00000045",
+      "node": 131,
+      "origin": "WX3655"
+    },
+    {
+      "name": "__anchor_aig_00000046",
+      "node": 136,
+      "origin": "WX3659"
+    },
+    {
+      "name": "__anchor_aig_00000047",
+      "node": 137,
+      "origin": "WX3659"
+    },
+    {
+      "name": "__anchor_aig_00000048",
+      "node": 138,
+      "origin": "WX3659"
+    },
+    {
+      "name": "__anchor_aig_00000049",
+      "node": 143,
+      "origin": "WX1461"
+    },
+    {
+      "name": "__anchor_aig_00000050",
+      "node": 144,
+      "origin": "WX1461"
+    },
+    {
+      "name": "__anchor_aig_00000051",
+      "node": 145,
+      "origin": "WX1461"
+    },
+    {
+      "name": "__anchor_aig_00000052",
+      "node": 148,
+      "origin": "WX1457"
+    },
+    {
+      "name": "__anchor_aig_00000053",
+      "node": 149,
+      "origin": "WX1457"
+    },
+    {
+      "name": "__anchor_aig_00000054",
+      "node": 150,
+      "origin": "WX1457"
+    }
+  ],
+  "boundaries": {
+    "dummy_gate1": {
+      "kind": "INPUT",
+      "signal": "CRC_OUT_8_22",
+      "anchor_node": 0
+    },
+    "dummy_gate2": {
+      "kind": "INPUT",
+      "signal": "TM0",
+      "anchor_node": 1
+    },
+    "dummy_gate3": {
+      "kind": "INPUT",
+      "signal": "TM1",
+      "anchor_node": 2
+    },
+    "dummy_gate4": {
+      "kind": "INPUT",
+      "signal": "WX1796",
+      "anchor_node": 3
+    },
+    "dummy_gate5": {
+      "kind": "INPUT",
+      "signal": "WX1956",
+      "anchor_node": 4
+    },
+    "dummy_gate6": {
+      "kind": "INPUT",
+      "signal": "WX2020",
+      "anchor_node": 5
+    },
+    "dummy_gate7": {
+      "kind": "INPUT",
+      "signal": "WX2084",
+      "anchor_node": 6
+    },
+    "dummy_gate8": {
+      "kind": "INPUT",
+      "signal": "WX2148",
+      "anchor_node": 7
+    },
+    "dummy_gate9": {
+      "kind": "INPUT",
+      "signal": "WX3089",
+      "anchor_node": 8
+    },
+    "dummy_gate10": {
+      "kind": "INPUT",
+      "signal": "WX3249",
+      "anchor_node": 9
+    },
+    "dummy_gate11": {
+      "kind": "INPUT",
+      "signal": "WX3313",
+      "anchor_node": 10
+    },
+    "dummy_gate12": {
+      "kind": "INPUT",
+      "signal": "WX3377",
+      "anchor_node": 11
+    },
+    "dummy_gate13": {
+      "kind": "INPUT",
+      "signal": "WX3441",
+      "anchor_node": 12
+    },
+    "dummy_gate14": {
+      "kind": "OUTPUT",
+      "signal": "WX1457",
+      "anchor_node": 153
+    },
+    "dummy_gate15": {
+      "kind": "OUTPUT",
+      "signal": "WX2294",
+      "anchor_node": 155
+    },
+    "dummy_gate16": {
+      "kind": "OUTPUT",
+      "signal": "WX2296",
+      "anchor_node": 157
+    },
+    "dummy_gate17": {
+      "kind": "OUTPUT",
+      "signal": "WX2297",
+      "anchor_node": 159
+    },
+    "dummy_gate18": {
+      "kind": "OUTPUT",
+      "signal": "WX2298",
+      "anchor_node": 161
+    },
+    "dummy_gate19": {
+      "kind": "OUTPUT",
+      "signal": "WX2368",
+      "anchor_node": 163
+    },
+    "dummy_gate20": {
+      "kind": "OUTPUT",
+      "signal": "WX3587",
+      "anchor_node": 165
+    },
+    "dummy_gate21": {
+      "kind": "OUTPUT",
+      "signal": "WX3591",
+      "anchor_node": 167
+    },
+    "dummy_gate22": {
+      "kind": "OUTPUT",
+      "signal": "WX3661",
+      "anchor_node": 169
+    }
+  }
+}
